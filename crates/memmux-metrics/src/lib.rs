@@ -19,6 +19,8 @@
 
 pub mod attribution;
 pub mod sample;
+pub mod sweep;
+pub mod terminate;
 pub mod tree;
 
 mod platform;
@@ -26,4 +28,6 @@ mod platform;
 pub use attribution::{attribute, Attribution, AttributionReport, Owner, RootSpec, ServiceId};
 pub use platform::default_sampler;
 pub use sample::{ProcessSample, ProcessSampler, Snapshot};
+pub use sweep::{reconcile, reconcile_tree, FlaggedProcess, ReconciliationReport};
+pub use terminate::{terminate_subtree, termination_targets, TerminationReport};
 pub use tree::ProcessTree;

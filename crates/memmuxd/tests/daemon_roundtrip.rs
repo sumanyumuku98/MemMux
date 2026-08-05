@@ -48,6 +48,13 @@ fn client_round_trips_create_and_list_over_the_socket() {
     }
     assert!(socket.exists(), "daemon socket never appeared");
 
+    // Least-privilege local socket (SUM-78): 0600 socket under a 0700 directory.
+    use std::os::unix::fs::PermissionsExt;
+    let sock_mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(sock_mode, 0o600, "socket mode was {sock_mode:o}");
+    let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "socket dir mode was {dir_mode:o}");
+
     let client = Client::new(&socket);
 
     // Handshake.

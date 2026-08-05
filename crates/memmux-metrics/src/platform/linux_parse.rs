@@ -13,8 +13,18 @@ pub struct StatInfo {
     pub pid: Pid,
     /// The command name (`comm`), without surrounding parentheses.
     pub comm: String,
+    /// The process state character (`R`, `S`, `D`, `Z` for zombie, `T`, …).
+    pub state: char,
     /// The parent process id.
     pub ppid: Pid,
+}
+
+impl StatInfo {
+    /// Whether the process is a zombie (defunct, pending reap) — holds no memory and is
+    /// effectively gone for MemMux accounting/termination purposes.
+    pub fn is_zombie(&self) -> bool {
+        self.state == 'Z'
+    }
 }
 
 /// Parse the parts of `/proc/<pid>/stat` MemMux needs: pid, `comm`, and ppid.
@@ -32,9 +42,14 @@ pub fn parse_stat(content: &str) -> Option<StatInfo> {
     let comm = content[open + 1..close].to_string();
     let rest = content[close + 1..].trim();
     let mut fields = rest.split_whitespace();
-    let _state = fields.next()?;
+    let state = fields.next()?.chars().next()?;
     let ppid: Pid = fields.next()?.parse().ok()?;
-    Some(StatInfo { pid, comm, ppid })
+    Some(StatInfo {
+        pid,
+        comm,
+        state,
+        ppid,
+    })
 }
 
 /// Parse a `SIZE:` style field (in kB) from a `/proc/<pid>/status` file, returning **bytes**.
@@ -79,6 +94,16 @@ mod tests {
         assert_eq!(info.pid, 1234);
         assert_eq!(info.comm, "bash");
         assert_eq!(info.ppid, 1000);
+        assert_eq!(info.state, 'S');
+        assert!(!info.is_zombie());
+    }
+
+    #[test]
+    fn parse_stat_detects_zombie() {
+        let line = "999 (defunct) Z 1 999 999 0 -1 0 0";
+        let info = parse_stat(line).unwrap();
+        assert_eq!(info.state, 'Z');
+        assert!(info.is_zombie());
     }
 
     #[test]
