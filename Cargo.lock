@@ -330,6 +330,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmux-adapters"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "memmux-core",
+ "memmux-pty",
+ "memmux-sched",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "memmux-bench"
 version = "0.1.0"
 dependencies = [

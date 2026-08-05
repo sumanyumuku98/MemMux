@@ -1,0 +1,19 @@
+[package]
+name = "memmux-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider adapter runtime for MemMux: capability negotiation + generic/Claude/Codex adapters (Phase 1)."
+
+[dependencies]
+memmux-core = { workspace = true }
+memmux-pty = { workspace = true }
+memmux-sched = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
