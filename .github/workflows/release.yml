@@ -79,10 +79,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Pre-1.0 tags (v0.*) are published as pre-releases; v1.0.0+ are stable.
+          case "${{ github.ref_name }}" in
+            v0.*) prerelease="--prerelease" ;;
+            *)    prerelease="" ;;
+          esac
           gh release create "${{ github.ref_name }}" \
             dist/*.tar.gz dist/*.sha256 dist/install.sh dist/memmux.rb \
             --title "MemMux ${{ github.ref_name }}" \
-            --generate-notes
+            --generate-notes $prerelease
       - name: Publish formula to Homebrew tap (only if HOMEBREW_TAP_TOKEN is set)
         if: env.HAS_TAP == 'true'
         env:
