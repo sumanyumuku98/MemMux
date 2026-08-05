@@ -7,6 +7,7 @@
 
 use crate::capabilities::ProviderCapabilities;
 use memmux_core::{Provider, ResourceClass, TaskState};
+use memmux_lifecycle::SecretRef;
 use memmux_pty::PtySpec;
 use memmux_sched::{class_reservation, Reservation};
 use std::path::PathBuf;
@@ -64,6 +65,25 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// Build the PTY command for a launch (§12.1 `launch`).
     fn command(&self, spec: &LaunchSpec) -> PtySpec;
+
+    /// Build the PTY command that resumes a prior session via the provider's *native* resume
+    /// mechanism, given the session handle recorded in a checkpoint (§13.2 / SUM-92).
+    ///
+    /// Returns `None` when the provider has no native resume (the runtime then falls back to a
+    /// reconstructed session — SUM-93). The default is `None`; only adapters whose
+    /// [`capabilities`](Self::capabilities) report [`ResumeFidelity::Native`] should override it.
+    ///
+    /// [`ResumeFidelity::Native`]: crate::capabilities::ResumeFidelity::Native
+    fn resume_command(&self, _spec: &LaunchSpec, _session_ref: &str) -> Option<PtySpec> {
+        None
+    }
+
+    /// The secret *references* this provider needs at launch (SUM-79). These are names/sources,
+    /// never values; the isolation layer resolves only those a task's grant allows. The default
+    /// is none (e.g. the generic adapter needs no secrets).
+    fn secret_refs(&self) -> Vec<SecretRef> {
+        Vec::new()
+    }
 
     /// Classify the current task sub-state from a window of recent output (§12.1 `classify`).
     ///

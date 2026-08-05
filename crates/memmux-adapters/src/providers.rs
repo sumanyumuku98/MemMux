@@ -1,4 +1,5 @@
-//! Concrete provider adapters (SUM-70 generic, SUM-71 Claude Code, SUM-72 Codex).
+//! Concrete provider adapters (SUM-70 generic, SUM-71 Claude Code, SUM-72 Codex,
+//! SUM-73 Gemini CLI, SUM-74 OpenCode).
 
 use crate::adapter::{LaunchSpec, ProviderAdapter};
 use crate::capabilities::{
@@ -6,6 +7,7 @@ use crate::capabilities::{
     SafePointSignal, SubagentVisibility, ToolVisibility,
 };
 use memmux_core::Provider;
+use memmux_lifecycle::SecretRef;
 use memmux_pty::PtySpec;
 
 const DEFAULT_ROWS: u16 = 24;
@@ -64,7 +66,8 @@ impl ProviderAdapter for ClaudeCodeAdapter {
     }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            resume: ResumeFidelity::Reconstructed,
+            // Claude Code carries a resumable session id (`claude --resume <id>`).
+            resume: ResumeFidelity::Native,
             output: OutputMode::Hybrid,
             safe_point: SafePointSignal::Inferred,
             tools: ToolVisibility::ProcessDerived,
@@ -75,6 +78,12 @@ impl ProviderAdapter for ClaudeCodeAdapter {
     }
     fn command(&self, spec: &LaunchSpec) -> PtySpec {
         pty_spec("claude", &[], spec)
+    }
+    fn resume_command(&self, spec: &LaunchSpec, session_ref: &str) -> Option<PtySpec> {
+        Some(pty_spec("claude", &["--resume", session_ref], spec))
+    }
+    fn secret_refs(&self) -> Vec<SecretRef> {
+        vec![SecretRef::env("ANTHROPIC_API_KEY")]
     }
     fn waiting_markers(&self) -> &[&str] {
         &["Do you want", "(y/n)", "Press enter", "approve", "❯", "? "]
@@ -103,8 +112,77 @@ impl ProviderAdapter for CodexAdapter {
     fn command(&self, spec: &LaunchSpec) -> PtySpec {
         pty_spec("codex", &[], spec)
     }
+    fn secret_refs(&self) -> Vec<SecretRef> {
+        vec![SecretRef::env("OPENAI_API_KEY")]
+    }
     fn waiting_markers(&self) -> &[&str] {
         &["allow", "(y/n)", "approve", "?"]
+    }
+}
+
+/// Gemini CLI adapter (SUM-73).
+#[derive(Debug, Default)]
+pub struct GeminiCliAdapter;
+
+impl ProviderAdapter for GeminiCliAdapter {
+    fn provider(&self) -> Provider {
+        Provider::GeminiCli
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            // Gemini CLI has no session handle we can drive for a lossless resume, so we resume
+            // by reconstructing context rather than claiming a native resume we can't deliver.
+            resume: ResumeFidelity::Reconstructed,
+            output: OutputMode::TerminalText,
+            safe_point: SafePointSignal::Inferred,
+            tools: ToolVisibility::ProcessDerived,
+            subagents: SubagentVisibility::Unsupported,
+            context_compaction: ContextCompaction::RuntimeSummary,
+            permissions: Permissions::WrapperEnforced,
+        }
+    }
+    fn command(&self, spec: &LaunchSpec) -> PtySpec {
+        pty_spec("gemini", &[], spec)
+    }
+    fn secret_refs(&self) -> Vec<SecretRef> {
+        vec![SecretRef::env("GEMINI_API_KEY")]
+    }
+    fn waiting_markers(&self) -> &[&str] {
+        &["(y/n)", "approve", "allow", "? "]
+    }
+}
+
+/// OpenCode adapter (SUM-74).
+#[derive(Debug, Default)]
+pub struct OpenCodeAdapter;
+
+impl ProviderAdapter for OpenCodeAdapter {
+    fn provider(&self) -> Provider {
+        Provider::OpenCode
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            // OpenCode persists sessions and can reopen one by id (`opencode --session <id>`).
+            resume: ResumeFidelity::Native,
+            output: OutputMode::TerminalText,
+            safe_point: SafePointSignal::Inferred,
+            tools: ToolVisibility::ProcessDerived,
+            subagents: SubagentVisibility::Unsupported,
+            context_compaction: ContextCompaction::RuntimeSummary,
+            permissions: Permissions::WrapperEnforced,
+        }
+    }
+    fn command(&self, spec: &LaunchSpec) -> PtySpec {
+        pty_spec("opencode", &[], spec)
+    }
+    fn resume_command(&self, spec: &LaunchSpec, session_ref: &str) -> Option<PtySpec> {
+        Some(pty_spec("opencode", &["--session", session_ref], spec))
+    }
+    fn secret_refs(&self) -> Vec<SecretRef> {
+        vec![SecretRef::env("ANTHROPIC_API_KEY")]
+    }
+    fn waiting_markers(&self) -> &[&str] {
+        &["(y/n)", "approve", "allow", "? "]
     }
 }
 
@@ -113,9 +191,9 @@ pub fn adapter_for(provider: Provider) -> Box<dyn ProviderAdapter> {
     match provider {
         Provider::ClaudeCode => Box::new(ClaudeCodeAdapter),
         Provider::Codex => Box::new(CodexAdapter),
+        Provider::GeminiCli => Box::new(GeminiCliAdapter),
+        Provider::OpenCode => Box::new(OpenCodeAdapter),
         Provider::Generic => Box::new(GenericTerminalAdapter),
-        // Gemini CLI and OpenCode adapters arrive in Phase 2 (SUM-73/74); fall back to generic.
-        Provider::GeminiCli | Provider::OpenCode => Box::new(GenericTerminalAdapter),
     }
 }
 
@@ -150,6 +228,10 @@ mod tests {
         // Capabilities are provider-specific and honest.
         assert_eq!(
             ClaudeCodeAdapter.capabilities().resume,
+            ResumeFidelity::Native
+        );
+        assert_eq!(
+            CodexAdapter.capabilities().resume,
             ResumeFidelity::Reconstructed
         );
         assert_eq!(
@@ -194,14 +276,55 @@ mod tests {
     }
 
     #[test]
-    fn adapter_for_maps_providers() {
+    fn adapter_for_maps_every_provider_to_its_own_adapter() {
+        for p in [
+            Provider::ClaudeCode,
+            Provider::Codex,
+            Provider::GeminiCli,
+            Provider::OpenCode,
+            Provider::Generic,
+        ] {
+            assert_eq!(adapter_for(p).provider(), p);
+        }
+    }
+
+    #[test]
+    fn native_resume_adapters_build_a_resume_command() {
+        use crate::capabilities::ResumeFidelity;
+        let spec = LaunchSpec::in_dir("/wt");
+
+        // Claude: native `--resume <id>`.
+        let claude = ClaudeCodeAdapter;
+        assert_eq!(claude.capabilities().resume, ResumeFidelity::Native);
+        let rc = claude
+            .resume_command(&spec, "sess_42")
+            .expect("native resume");
+        assert_eq!(rc.program, "claude");
+        assert_eq!(rc.args, vec!["--resume".to_string(), "sess_42".to_string()]);
+
+        // OpenCode: native `--session <id>`.
+        let oc = OpenCodeAdapter;
+        assert_eq!(oc.capabilities().resume, ResumeFidelity::Native);
         assert_eq!(
-            adapter_for(Provider::ClaudeCode).provider(),
-            Provider::ClaudeCode
+            oc.resume_command(&spec, "s1").unwrap().args,
+            vec!["--session".to_string(), "s1".to_string()]
         );
-        assert_eq!(
-            adapter_for(Provider::GeminiCli).provider(),
-            Provider::Generic
-        );
+    }
+
+    #[test]
+    fn non_native_adapters_have_no_resume_command() {
+        let spec = LaunchSpec::in_dir("/wt");
+        assert!(CodexAdapter.resume_command(&spec, "x").is_none());
+        assert!(GeminiCliAdapter.resume_command(&spec, "x").is_none());
+        assert!(GenericTerminalAdapter.resume_command(&spec, "x").is_none());
+    }
+
+    #[test]
+    fn adapters_declare_their_secret_refs() {
+        assert_eq!(ClaudeCodeAdapter.secret_refs()[0].name, "ANTHROPIC_API_KEY");
+        assert_eq!(CodexAdapter.secret_refs()[0].name, "OPENAI_API_KEY");
+        assert_eq!(GeminiCliAdapter.secret_refs()[0].name, "GEMINI_API_KEY");
+        // The generic "run anything" adapter needs no secrets.
+        assert!(GenericTerminalAdapter.secret_refs().is_empty());
     }
 }

@@ -6,8 +6,10 @@
 //!
 //! * [`capabilities`] — the capability matrix providers negotiate (SUM-69 / §12.2).
 //! * [`adapter`] — the [`ProviderAdapter`] contract (SUM-69 / §12.1).
-//! * [`providers`] — generic / Claude Code / Codex adapters (SUM-70, SUM-71, SUM-72).
-//! * [`isolation`] — least-privilege capability grants (SUM-75 / §12.3).
+//! * [`providers`] — generic / Claude Code / Codex / Gemini CLI / OpenCode adapters
+//!   (SUM-70, SUM-71, SUM-72, SUM-73, SUM-74).
+//! * [`isolation`] — least-privilege capability grants + capability-scoped secret resolution
+//!   (SUM-75, SUM-79 / §12.3).
 //! * [`runtime`] — a launched PTY-backed provider instance.
 
 #![forbid(unsafe_code)]
@@ -22,5 +24,8 @@ pub mod runtime;
 pub use adapter::{EventWindow, LaunchSpec, ProviderAdapter, ResourceEstimate};
 pub use capabilities::ProviderCapabilities;
 pub use isolation::CapabilityGrant;
-pub use providers::{adapter_for, ClaudeCodeAdapter, CodexAdapter, GenericTerminalAdapter};
+pub use providers::{
+    adapter_for, ClaudeCodeAdapter, CodexAdapter, GeminiCliAdapter, GenericTerminalAdapter,
+    OpenCodeAdapter,
+};
 pub use runtime::RuntimeInstance;

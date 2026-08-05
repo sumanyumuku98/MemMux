@@ -11,6 +11,7 @@ description = "Provider adapter runtime for MemMux: capability negotiation + gen
 memmux-core = { workspace = true }
 memmux-pty = { workspace = true }
 memmux-sched = { workspace = true }
+memmux-lifecycle = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
