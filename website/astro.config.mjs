@@ -16,6 +16,8 @@ export default defineConfig({
     starlight({
       title: 'MemMux',
       description: 'The memory-aware local runtime for parallel AI coding agents.',
+      logo: { src: './src/assets/icon.png', alt: 'MemMux' },
+      favicon: '/favicon.png',
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/sumanyumuku98/MemMux' },
       ],
