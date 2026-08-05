@@ -1,0 +1,17 @@
+[package]
+name = "memmux-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable SQLite (WAL) metadata store for MemMux: tasks, transitions, events, decisions (Phase 1)."
+
+[dependencies]
+memmux-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# rusqlite 0.40.1 (2026-06-06) verified > 7 days old. "bundled" compiles SQLite via cc so no
+# system libsqlite3 is required (self-contained CI).
+rusqlite = { version = "0.40", features = ["bundled"] }
