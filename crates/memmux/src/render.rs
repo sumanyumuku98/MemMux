@@ -215,10 +215,15 @@ fn render_timeline(f: &mut Frame, area: Rect, model: &Model) {
         .iter()
         .skip(model.scroll)
         .map(|e| {
-            format!(
+            let base = format!(
                 "#{:<5} {:<20} {:<10} {}",
                 e.seq, e.event_type, e.category, e.source
-            )
+            );
+            // Surface the recycle ledger inline (SUM-97): reclaimed memory + resume mode.
+            match recycle_ledger_summary(e) {
+                Some(summary) => format!("{base}  — {summary}"),
+                None => base,
+            }
         })
         .collect();
     render_term_pane(
@@ -228,6 +233,23 @@ fn render_timeline(f: &mut Frame, area: Rect, model: &Model) {
         &lines,
         0,
     );
+}
+
+/// If `e` is a `runtime_recycled` event, format its ledger payload as a compact summary
+/// (reclaimed MiB + resume mode). Returns `None` for other events or unparsable payloads.
+fn recycle_ledger_summary(e: &memmux_proto::EventView) -> Option<String> {
+    if e.event_type != "runtime_recycled" {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(e.payload_json.as_deref()?).ok()?;
+    let reclaimed = v.get("reclaimed_bytes")?.as_i64()?;
+    let mode = v.get("resume_mode").and_then(|m| m.as_str()).unwrap_or("?");
+    let mib = reclaimed / (1024 * 1024);
+    if reclaimed > 0 {
+        Some(format!("reclaimed {mib} MiB, resume={mode}"))
+    } else {
+        Some(format!("no measurable reclamation, resume={mode}"))
+    }
 }
 
 fn render_new_task(f: &mut Frame, area: Rect, model: &Model) {
@@ -420,15 +442,31 @@ mod tests {
                 task_count: 1,
                 agent_budget_bytes: 20 * 1024 * 1024 * 1024,
             }),
-            events: vec![EventView {
-                seq: 1,
-                task_id: Some("task_abc".into()),
-                ts_ms: 0,
-                category: "lifecycle".into(),
-                event_type: "task_created".into(),
-                severity: "info".into(),
-                source: "daemon".into(),
-            }],
+            events: vec![
+                EventView {
+                    seq: 1,
+                    task_id: Some("task_abc".into()),
+                    ts_ms: 0,
+                    category: "lifecycle".into(),
+                    event_type: "task_created".into(),
+                    severity: "info".into(),
+                    source: "daemon".into(),
+                    payload_json: None,
+                },
+                EventView {
+                    seq: 2,
+                    task_id: Some("task_abc".into()),
+                    ts_ms: 0,
+                    category: "lifecycle".into(),
+                    event_type: "runtime_recycled".into(),
+                    severity: "info".into(),
+                    source: "daemon".into(),
+                    payload_json: Some(
+                        r#"{"rss_before":3221225472,"rss_after":1073741824,"reclaimed_bytes":2147483648,"resume_mode":"native","resume_latency_ms":120,"git_patch_hash":"abcd"}"#
+                            .into(),
+                    ),
+                },
+            ],
         });
         m
     }
@@ -454,6 +492,15 @@ mod tests {
         let text = buffer_text(&sample_model(View::Queue));
         assert!(text.contains("QUEUE"));
         assert!(text.contains("waiting: admission"));
+    }
+
+    #[test]
+    fn timeline_surfaces_the_recycle_ledger() {
+        let text = buffer_text(&sample_model(View::Timeline));
+        assert!(text.contains("runtime_recycled"));
+        // The reclaimed memory + resume mode are surfaced inline (SUM-97).
+        assert!(text.contains("reclaimed 2048 MiB"));
+        assert!(text.contains("resume=native"));
     }
 
     #[test]

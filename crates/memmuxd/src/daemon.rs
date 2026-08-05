@@ -257,6 +257,7 @@ impl DaemonState {
                         event_type: e.event_type,
                         severity: e.severity,
                         source: e.source,
+                        payload_json: e.payload_json,
                     })
                     .collect(),
             ),

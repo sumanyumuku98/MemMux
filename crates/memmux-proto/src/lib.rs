@@ -257,6 +257,9 @@ pub struct EventView {
     pub severity: String,
     /// Emitting component.
     pub source: String,
+    /// Bounded JSON payload/summary (e.g. the `runtime_recycled` ledger record), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<String>,
 }
 
 /// Response to a client handshake, letting a client verify daemon/protocol compatibility.
