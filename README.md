@@ -1,0 +1,96 @@
+<div align="center">
+  <img src="assets/icon.png" alt="MemMux" width="128" height="128" />
+
+  # MemMux
+
+  **The memory-aware local runtime for parallel AI coding agents.**
+
+  [![CI](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml/badge.svg)](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml)
+  [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+</div>
+
+---
+
+## What is MemMux?
+
+Existing tools multiplex terminals, panes, and Git worktrees. **MemMux multiplexes
+constrained execution resources**: memory, processes, repository services, tool servers,
+workspaces, and agent execution slots. It keeps many *logical* tasks available while
+controlling how many *physical* workloads remain resident.
+
+Run several coding agents (Claude Code, Codex, Gemini CLI, OpenCode, …) each in its own Git
+worktree, without letting session age or parallelism drive your workstation into swap.
+
+The category MemMux defines is **enforcement, not just observability**: showing memory usage
+is useful, but controlling admission, resident state, process lifecycles, and active-session
+footprint is the product.
+
+## Architecture
+
+```
+ Clients: TUI | Desktop shell | VS Code bridge | CLI | SDK
+                      │ local gRPC / Unix domain socket
+ ┌────────────────────▼─────────────────────────────────┐
+ │                  MemMux Daemon (memmuxd)              │
+ │  Scheduler │ Lifecycle │ Memory Optimizer │ Audit     │
+ └──────┬───────────┬──────────────────┬────────────────┘
+   Provider     Worktree           Shared Services
+   Adapters     Manager            (repo index, MCP GW)
+        │           │                    │
+ ┌──────▼───────────▼────────────────────▼──────────────┐
+ │      Owned process groups / cgroups / PTYs           │
+ └───────────────────────────────────────────────────────┘
+```
+
+- **`memmuxd`** — authoritative Rust + Tokio daemon (state, scheduling, lifecycle, audit).
+- **`memmux`** — dense Ratatui/Crossterm TUI client.
+- **`memmux-metrics`** — cross-platform process accounting & attribution (Phase 0 core).
+- **`memmux-bench`** — competitive benchmark harness (stub agent, scenarios, reports).
+- **`memmux-core`** — shared domain types (tasks, state machine, events).
+- **`memmux-proto`** — versioned client/daemon protocol types.
+
+## Non-functional launch gates
+
+| Gate | Threshold |
+| --- | --- |
+| Idle footprint | daemon + TUI < **180 MB** idle RSS |
+| Sampling overhead | < **2% CPU** at 20 managed tasks |
+| UI latency | < **250 ms** p95 update latency |
+| No lost work | **zero** Git-state loss across crashes / kills / reboot |
+| Cleanup | **≥ 99.5%** of owned descendants gone within 10 s of termination |
+| Resume | **≥ 99%** native-resume success for supported providers |
+| Attribution | **≥ 95%** of sampled private RSS mapped to a task or shared service |
+
+## Roadmap
+
+MemMux is built in seven phases (tracked in Linear, mirrored here):
+
+| Phase | Scope | Exit criterion |
+| --- | --- | --- |
+| **0 — Instrumentation prototype** | Process accounting, attribution, bounded terminal capture, benchmark harness | Accurate attribution on macOS/Linux for two providers |
+| 1 — Memory-safe multiplexer | TUI, tasks, worktrees, process groups, global budget, queue, cleanup | Three active worktrees without uncontrolled growth |
+| 2 — Lifecycle runtime | Checkpoint, hibernate, native resume, pressure ladder | Reliable resume, no lost dirty state under faults |
+| 3 — Active optimization | Incremental transcripts, MCP leases, lazy services, recycling | Measured active-session memory reduction vs Phase 1 |
+| 4 — Shared repository services | Base index, per-worktree overlays, search/symbol APIs | Lower baseline across three worktrees |
+| 5 — Ecosystem | VS Code bridge, SDK, policy hierarchy, desktop shell | Third party adds a provider without daemon changes |
+| 6 — Distributed extension | Optional remote workers, resource placement | Local product proven, protocol stable |
+
+See [`docs/`](./docs) for per-phase design notes and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+
+## Building
+
+```bash
+# Requires a stable Rust toolchain (1.82+)
+cargo build --workspace
+cargo test  --workspace
+cargo fmt   --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+## Status
+
+🚧 Early development. Phase 0 is under active construction. APIs are unstable.
+
+## License
+
+MIT © 2026 Sumanyu Muku. See [LICENSE](./LICENSE).

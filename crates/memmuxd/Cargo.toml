@@ -1,0 +1,21 @@
+[package]
+name = "memmuxd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MemMux control-plane daemon (skeleton; scheduler/lifecycle land in Phase 1)."
+
+[[bin]]
+name = "memmuxd"
+path = "src/main.rs"
+
+[dependencies]
+memmux-core = { workspace = true }
+memmux-proto = { workspace = true }
+memmux-metrics = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

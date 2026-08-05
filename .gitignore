@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# MemMux runtime state (never commit local runtime data)
+/.memmux/
+**/.memmux/
+
+# Benchmark outputs
+/bench-out/
+*.jsonl.tmp
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# dmux / coordination scaffolding (managed outside this project)
+/.dmux/
+/.claude/

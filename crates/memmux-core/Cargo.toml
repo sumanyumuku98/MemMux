@@ -1,0 +1,15 @@
+[package]
+name = "memmux-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared domain types for MemMux (tasks, state machine, events, identifiers)."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

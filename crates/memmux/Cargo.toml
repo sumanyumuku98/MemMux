@@ -1,0 +1,17 @@
+[package]
+name = "memmux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MemMux terminal UI client (skeleton; Ratatui TUI lands in Phase 1)."
+
+[[bin]]
+name = "memmux"
+path = "src/main.rs"
+
+[dependencies]
+memmux-proto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

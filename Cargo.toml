@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/sumanyumuku98/MemMux"
+homepage = "https://github.com/sumanyumuku98/MemMux"
+authors = ["Sumanyu Muku"]
+description = "MemMux — the memory-aware local runtime for parallel AI coding agents."
+
+[workspace.dependencies]
+# Internal crates
+memmux-core = { path = "crates/memmux-core", version = "0.1.0" }
+memmux-metrics = { path = "crates/memmux-metrics", version = "0.1.0" }
+memmux-proto = { path = "crates/memmux-proto", version = "0.1.0" }
+
+# External (all pinned to mature, long-published minor lines; see ORG dependency policy)
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
+# NOTE (org dependency policy): versions pinned to releases published > 7 days ago.
+# `tracing-subscriber` deliberately omits the `env-filter` feature so we don't pull the
+# regex/aho-corasick stack (several of whose releases are < 7 days old).
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "=4.6.4", features = ["derive"] }
+libc = "0.2"
+ratatui = "0.28"
+crossterm = "0.28"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
