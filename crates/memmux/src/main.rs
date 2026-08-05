@@ -11,11 +11,15 @@ use crossterm::terminal::{
 use memmux::app::{update, Effect, Key, Model};
 use memmux::client::Client;
 use memmux::render::render;
-use memmux_proto::Request;
-use ratatui::backend::CrosstermBackend;
+use memmux_proto::{AttachClientMsg, AttachServerMsg, Request};
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
-use std::io::stdout;
+use std::io::{stdout, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -69,8 +73,17 @@ fn run<B: ratatui::backend::Backend>(
                 if key.kind != KeyEventKind::Release {
                     if let Some(k) = map_key(key.code, key.modifiers) {
                         let effects = update(model, k);
+                        let mut attach = None;
                         for effect in effects {
-                            apply_effect(client, model, effect);
+                            if let Some(id) = apply_effect(client, model, effect) {
+                                attach = Some(id);
+                            }
+                        }
+                        if let Some(id) = attach {
+                            if let Err(e) = attach_passthrough(terminal, client, &id) {
+                                model.status = format!("attach ended: {e}");
+                            }
+                            model.view = memmux::app::View::Term;
                         }
                     }
                 }
@@ -80,8 +93,14 @@ fn run<B: ratatui::backend::Backend>(
         if model.should_quit {
             break;
         }
-        if last_refresh.elapsed() >= Duration::from_secs(1) {
+        if last_refresh.elapsed() >= Duration::from_millis(1000) {
             refresh(client, model);
+            // Keep the live terminal view fresh while it's open.
+            if model.view == memmux::app::View::Term {
+                if let Some(id) = model.focused_task.clone() {
+                    load_screen(client, model, &id);
+                }
+            }
             last_refresh = Instant::now();
         }
     }
@@ -106,13 +125,34 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
     })
 }
 
-fn apply_effect(client: &Client, model: &mut Model, effect: Effect) {
+/// Apply one effect. Returns `Some(task_id)` if an attach passthrough should be entered (the
+/// runtime must own the terminal for that, so it can't happen inside this function).
+fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<String> {
     match effect {
         Effect::Refresh => refresh(client, model),
         Effect::CreateTask(req) => match client.call(&Request::CreateTask(req)) {
             Ok(_) => refresh(client, model),
             Err(e) => model.status = format!("create failed: {e}"),
         },
+        Effect::StartTask(id) => match client.start(&id) {
+            Ok(()) => model.status = format!("started {id}"),
+            Err(e) => model.status = format!("start failed: {e}"),
+        },
+        Effect::LoadScreen(id) => load_screen(client, model, &id),
+        Effect::LoadHistory { id, cursor } => match client.read_history(&id, cursor, 500) {
+            Ok(page) => model.history_rows = page.lines,
+            Err(e) => model.status = format!("history failed: {e}"),
+        },
+        Effect::Attach(id) => return Some(id),
+    }
+    None
+}
+
+fn load_screen(client: &Client, model: &mut Model, id: &str) {
+    match client.get_screen(id) {
+        Ok(Some(s)) => model.screen_rows = s.rows,
+        Ok(None) => {}
+        Err(e) => model.status = format!("screen failed: {e}"),
     }
 }
 
@@ -124,4 +164,120 @@ fn refresh(client: &Client, model: &mut Model) {
         }
         Err(e) => model.status = format!("daemon unreachable: {e}"),
     }
+}
+
+/// Interactive attach: full-screen raw passthrough to a task's PTY until Ctrl-a d (SUM-86).
+fn attach_passthrough<B: Backend>(
+    terminal: &mut Terminal<B>,
+    client: &Client,
+    id: &str,
+) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(client.socket())?;
+    send_frame(
+        &mut stream,
+        &serde_json::to_vec(&Request::Attach { id: id.to_string() })?,
+    )?;
+
+    // Read screen frames on a background thread.
+    let mut reader_stream = stream.try_clone()?;
+    let (tx, rx) = mpsc::channel::<AttachServerMsg>();
+    let reader = std::thread::spawn(move || {
+        while let Ok(Some(bytes)) = recv_frame(&mut reader_stream) {
+            if let Ok(msg) = serde_json::from_slice::<AttachServerMsg>(&bytes) {
+                let exited = matches!(msg, AttachServerMsg::Exited);
+                if tx.send(msg).is_err() || exited {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut rows: Vec<String> = vec!["(attached — press Ctrl-a then d to detach)".to_string()];
+    let mut prefix = false;
+    let result = loop {
+        terminal.draw(|f| {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" ATTACH {id} — Ctrl-a d to detach "));
+            let text: Vec<Line> = rows.iter().map(|r| Line::from(r.clone())).collect();
+            f.render_widget(Paragraph::new(text).block(block), f.area());
+        })?;
+
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                AttachServerMsg::Screen(sv) => rows = sv.rows,
+                AttachServerMsg::Exited => break,
+            }
+        }
+
+        if event::poll(Duration::from_millis(30))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind == KeyEventKind::Release {
+                    continue;
+                }
+                if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('a') {
+                    prefix = true;
+                    continue;
+                }
+                if prefix {
+                    prefix = false;
+                    if k.code == KeyCode::Char('d') {
+                        let _ =
+                            send_frame(&mut stream, &serde_json::to_vec(&AttachClientMsg::Detach)?);
+                        break Ok(());
+                    }
+                }
+                if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
+                    send_frame(
+                        &mut stream,
+                        &serde_json::to_vec(&AttachClientMsg::Input { data: bytes })?,
+                    )?;
+                }
+            }
+        }
+    };
+
+    drop(stream);
+    let _ = reader.join();
+    result
+}
+
+/// Encode a key event as the bytes a PTY expects.
+fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
+    Some(match code {
+        KeyCode::Char(c) => {
+            if mods.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() {
+                vec![(c.to_ascii_lowercase() as u8) & 0x1f]
+            } else {
+                c.to_string().into_bytes()
+            }
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => vec![0x1b, b'[', b'A'],
+        KeyCode::Down => vec![0x1b, b'[', b'B'],
+        KeyCode::Right => vec![0x1b, b'[', b'C'],
+        KeyCode::Left => vec![0x1b, b'[', b'D'],
+        _ => return None,
+    })
+}
+
+fn send_frame(s: &mut UnixStream, body: &[u8]) -> std::io::Result<()> {
+    s.write_all(&(body.len() as u32).to_be_bytes())?;
+    s.write_all(body)?;
+    s.flush()
+}
+
+fn recv_frame(s: &mut UnixStream) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    match s.read_exact(&mut len) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    s.read_exact(&mut body)?;
+    Ok(Some(body))
 }

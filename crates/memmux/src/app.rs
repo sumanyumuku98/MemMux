@@ -20,6 +20,8 @@ pub enum View {
     Timeline,
     /// New-task form with provider picker (SUM-87).
     NewTask,
+    /// Live terminal view of one task: screen grid + scrollback (SUM-84/85/86).
+    Term,
     /// Help / keymap (SUM-89).
     Help,
 }
@@ -111,6 +113,7 @@ impl NewTaskForm {
             },
             resource_class: None,
             priority: None,
+            command: None,
         })
     }
 }
@@ -135,6 +138,19 @@ pub enum Effect {
     Refresh,
     /// Create a task.
     CreateTask(CreateTaskRequest),
+    /// Admit and launch a task's provider.
+    StartTask(String),
+    /// Load the current screen grid for a task.
+    LoadScreen(String),
+    /// Load a page of scrollback history for a task.
+    LoadHistory {
+        /// Task id.
+        id: String,
+        /// Starting line index.
+        cursor: u64,
+    },
+    /// Enter interactive attach passthrough for a task (SUM-86; runtime handles the raw loop).
+    Attach(String),
 }
 
 /// The full application model.
@@ -150,6 +166,14 @@ pub struct Model {
     pub scroll: usize,
     /// New-task form.
     pub form: NewTaskForm,
+    /// The task whose terminal is being viewed (Term view).
+    pub focused_task: Option<String>,
+    /// Current screen grid rows for the focused task.
+    pub screen_rows: Vec<String>,
+    /// Scrollback history lines for the focused task.
+    pub history_rows: Vec<String>,
+    /// Whether the Term view shows scrollback history rather than the live screen.
+    pub show_history: bool,
     /// Status line message.
     pub status: String,
     /// Whether to exit.
@@ -164,6 +188,10 @@ impl Default for Model {
             selected: 0,
             scroll: 0,
             form: NewTaskForm::default(),
+            focused_task: None,
+            screen_rows: Vec::new(),
+            history_rows: Vec::new(),
+            show_history: false,
             status: "connected".to_string(),
             should_quit: false,
         }
@@ -187,9 +215,12 @@ impl Model {
 
 /// The pure state transition. Returns effects the runtime should execute.
 pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
-    // In the form, most keys edit text; handle it first.
+    // Modal views handle their own keys.
     if model.view == View::NewTask {
         return update_form(model, key);
+    }
+    if model.view == View::Term {
+        return update_term(model, key);
     }
 
     match key {
@@ -207,6 +238,46 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
         Key::Esc => model.view = View::Dashboard,
         Key::Up | Key::Char('k') => move_selection(model, -1),
         Key::Down | Key::Char('j') => move_selection(model, 1),
+        // Enter opens (and starts) the selected task's terminal view.
+        Key::Enter => {
+            if matches!(model.view, View::Dashboard | View::Tasks) {
+                if let Some(id) = model.selected_task().map(|t| t.id.clone()) {
+                    model.focused_task = Some(id.clone());
+                    model.screen_rows.clear();
+                    model.history_rows.clear();
+                    model.show_history = false;
+                    model.view = View::Term;
+                    return vec![Effect::StartTask(id.clone()), Effect::LoadScreen(id)];
+                }
+            }
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Keys for the live terminal view (SUM-84/85/86).
+fn update_term(model: &mut Model, key: Key) -> Vec<Effect> {
+    let Some(id) = model.focused_task.clone() else {
+        model.view = View::Tasks;
+        return Vec::new();
+    };
+    match key {
+        Key::Esc | Key::Char('q') => {
+            model.view = View::Tasks;
+            model.focused_task = None;
+        }
+        // Attach: hand off to the runtime's raw passthrough loop (SUM-86).
+        Key::Char('a') => return vec![Effect::Attach(id)],
+        // Toggle scrollback history (SUM-85).
+        Key::Char('h') => {
+            model.show_history = !model.show_history;
+            if model.show_history {
+                return vec![Effect::LoadHistory { id, cursor: 0 }];
+            }
+        }
+        // Refresh the live screen.
+        Key::Char('r') => return vec![Effect::LoadScreen(id)],
         _ => {}
     }
     Vec::new()
@@ -398,5 +469,45 @@ mod tests {
         }
         update(&mut m, Key::Backspace);
         assert_eq!(m.form.title, "ab");
+    }
+
+    #[test]
+    fn enter_opens_term_starts_task_and_streams() {
+        let mut m = Model {
+            view: View::Tasks,
+            ..Model::default()
+        };
+        m.set_data(Data {
+            tasks: vec![task("t1")],
+            ..Default::default()
+        });
+
+        let effects = update(&mut m, Key::Enter);
+        assert_eq!(m.view, View::Term);
+        assert_eq!(m.focused_task.as_deref(), Some("t1"));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::StartTask(id) if id == "t1")));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::LoadScreen(id) if id == "t1")));
+
+        // 'h' toggles scrollback and requests a history page (SUM-85).
+        let e2 = update(&mut m, Key::Char('h'));
+        assert!(m.show_history);
+        assert!(e2
+            .iter()
+            .any(|e| matches!(e, Effect::LoadHistory { id, .. } if id == "t1")));
+
+        // 'a' requests attach passthrough (SUM-86).
+        let e3 = update(&mut m, Key::Char('a'));
+        assert!(e3
+            .iter()
+            .any(|e| matches!(e, Effect::Attach(id) if id == "t1")));
+
+        // Esc returns to the task list.
+        update(&mut m, Key::Esc);
+        assert_eq!(m.view, View::Tasks);
+        assert!(m.focused_task.is_none());
     }
 }

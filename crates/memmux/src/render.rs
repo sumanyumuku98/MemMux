@@ -31,6 +31,7 @@ pub fn render(f: &mut Frame, model: &Model) {
         View::Queue => render_queue(f, chunks[1], model),
         View::Timeline => render_timeline(f, chunks[1], model),
         View::NewTask => render_new_task(f, chunks[1], model),
+        View::Term => render_term(f, chunks[1], model),
         View::Help => render_help(f, chunks[1]),
     }
     render_status(f, chunks[2], model);
@@ -321,6 +322,23 @@ fn render_help(f: &mut Frame, area: Rect) {
     );
 }
 
+/// Live terminal view of the focused task: screen grid or scrollback history (SUM-84/85/86).
+fn render_term(f: &mut Frame, area: Rect, model: &Model) {
+    let id = model.focused_task.as_deref().unwrap_or("—");
+    if model.show_history {
+        let title = format!(" {id} — SCROLLBACK (h:live  a:attach  Esc:back) ");
+        render_term_pane(f, area, &title, &model.history_rows, 0);
+    } else {
+        let title = format!(" {id} — LIVE (h:history  a:attach  r:refresh  Esc:back) ");
+        let rows = if model.screen_rows.is_empty() {
+            vec!["(starting… no output yet)".to_string()]
+        } else {
+            model.screen_rows.clone()
+        };
+        render_term_pane(f, area, &title, &rows, 0);
+    }
+}
+
 /// The terminal-pane widget (SUM-84): renders `lines` in a bordered block starting at `scroll`.
 fn render_term_pane(f: &mut Frame, area: Rect, title: &str, lines: &[String], scroll: usize) {
     let visible: Vec<Line> = lines
@@ -453,5 +471,26 @@ mod tests {
         let text = buffer_text(&sample_model(View::Help));
         assert!(text.contains("HELP"));
         assert!(text.contains("new task"));
+    }
+
+    #[test]
+    fn term_view_renders_live_screen() {
+        let mut m = sample_model(View::Term);
+        m.focused_task = Some("task_abc".into());
+        m.screen_rows = vec!["hello from the pty".into()];
+        let text = buffer_text(&m);
+        assert!(text.contains("LIVE"));
+        assert!(text.contains("hello from the pty"));
+    }
+
+    #[test]
+    fn term_view_renders_scrollback() {
+        let mut m = sample_model(View::Term);
+        m.focused_task = Some("task_abc".into());
+        m.show_history = true;
+        m.history_rows = vec!["old-line-1".into()];
+        let text = buffer_text(&m);
+        assert!(text.contains("SCROLLBACK"));
+        assert!(text.contains("old-line-1"));
     }
 }

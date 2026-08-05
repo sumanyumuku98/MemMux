@@ -43,6 +43,14 @@ enum Command {
         /// Base branch.
         #[arg(long, default_value = "main")]
         base: String,
+        /// Command for the generic provider (everything after `--`).
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Admit and launch a task's provider over the socket.
+    Start {
+        /// Task id.
+        id: String,
     },
     /// List tasks over the socket.
     List,
@@ -91,6 +99,7 @@ fn main() -> anyhow::Result<()> {
             repo,
             provider,
             base,
+            cmd,
         } => {
             let req = Request::CreateTask(CreateTaskRequest {
                 title,
@@ -99,8 +108,12 @@ fn main() -> anyhow::Result<()> {
                 base_branch: base,
                 resource_class: None,
                 priority: None,
+                command: if cmd.is_empty() { None } else { Some(cmd) },
             });
             print_response(Client::new(&socket).call(&req)?);
+        }
+        Command::Start { id } => {
+            print_response(Client::new(&socket).call(&Request::StartTask { id })?)
         }
         Command::List => print_response(Client::new(&socket).call(&Request::ListTasks)?),
         Command::Pressure => print_response(Client::new(&socket).call(&Request::SystemPressure)?),
@@ -114,7 +127,11 @@ fn run_serve(root: &std::path::Path, socket: &std::path::Path) -> anyhow::Result
     std::fs::create_dir_all(root)?;
     let store = Store::open(root.join("state.db")).context("open durable store")?;
     let envelope = ResourceEnvelope::with_default_reserves(detect_physical_bytes());
-    let state = Arc::new(Mutex::new(DaemonState::boot(store, envelope)?));
+    let state = Arc::new(Mutex::new(DaemonState::boot(
+        store,
+        envelope,
+        root.to_path_buf(),
+    )?));
     tracing::info!(
         tasks = state.lock().unwrap().task_count(),
         "recovered state on boot"
@@ -187,6 +204,30 @@ fn print_response(resp: Response) {
                 println!("#{} {} {} ({})", e.seq, e.event_type, e.source, e.category);
             }
         }
+        Response::Screen(s) => {
+            println!(
+                "[{} rows, cursor {},{}, running={}]",
+                s.rows.len(),
+                s.cursor_row,
+                s.cursor_col,
+                s.running
+            );
+            for row in s.rows {
+                println!("{row}");
+            }
+        }
+        Response::History(h) => {
+            println!(
+                "[history {} lines, next_cursor {}, total {}]",
+                h.lines.len(),
+                h.next_cursor,
+                h.total
+            );
+            for line in h.lines {
+                println!("{line}");
+            }
+        }
+        Response::Ok => println!("ok"),
         Response::Error { message } => eprintln!("error: {message}"),
     }
 }

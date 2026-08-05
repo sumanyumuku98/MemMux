@@ -1,26 +1,37 @@
 //! Daemon state: durable-store-backed task registry, request handlers, crash recovery, and the
 //! explainable-audit trail (SUM-66, SUM-67 wiring; serves the SUM-63 API).
 
+use memmux_adapters::{adapter_for, LaunchSpec, RuntimeInstance};
 use memmux_core::{Priority, Provider, ResourceClass, Task, TaskSpec, TaskState};
 use memmux_proto::{
-    CreateTaskRequest, DaemonInfo, EventView, PressureView, Request, Response, TaskView,
-    PROTOCOL_VERSION,
+    CreateTaskRequest, DaemonInfo, EventView, HistoryPage, PressureView, Request, Response,
+    ScreenView, TaskView, PROTOCOL_VERSION,
 };
+use memmux_pty::ChunkStore;
 use memmux_sched::{class_reservation, pressure::PressureStage, ResourceEnvelope};
 use memmux_store::{Decision, EventInput, Store};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+
+/// Lines per history chunk file.
+const HISTORY_CHUNK_LINES: usize = 500;
 
 /// The authoritative in-memory + durable daemon state.
 pub struct DaemonState {
     store: Store,
     tasks: BTreeMap<String, Task>,
     envelope: ResourceEnvelope,
+    root: PathBuf,
+    /// Live provider processes, keyed by task id.
+    runtimes: HashMap<String, RuntimeInstance>,
+    /// Per-task scrollback history (evicted capture lines).
+    histories: HashMap<String, ChunkStore>,
     seq: u64,
 }
 
 impl DaemonState {
     /// Boot the daemon: open the store and reconstruct all tasks (crash recovery, SUM-66).
-    pub fn boot(store: Store, envelope: ResourceEnvelope) -> anyhow::Result<Self> {
+    pub fn boot(store: Store, envelope: ResourceEnvelope, root: PathBuf) -> anyhow::Result<Self> {
         let mut tasks = BTreeMap::new();
         for task in store.load_tasks()? {
             tasks.insert(task.spec.id.to_string(), task);
@@ -30,6 +41,9 @@ impl DaemonState {
             store,
             tasks,
             envelope,
+            root,
+            runtimes: HashMap::new(),
+            histories: HashMap::new(),
             seq: 0,
         };
         state.audit(
@@ -66,6 +80,19 @@ impl DaemonState {
             Request::TerminateTask { id } => self.terminate(&id),
             Request::SystemPressure => self.pressure(),
             Request::ReadEvents { after_seq, limit } => self.read_events(after_seq, limit),
+            Request::StartTask { id } => self.start_task(&id),
+            Request::GetScreen { id } => match self.screen_view(&id) {
+                Some(sv) => Response::Screen(sv),
+                None => Response::Error {
+                    message: format!("task not running: {id}"),
+                },
+            },
+            Request::ReadHistory { id, cursor, limit } => self.read_history(&id, cursor, limit),
+            // Attach is intercepted by the server (it needs the raw connection); reaching here
+            // means it was mis-dispatched.
+            Request::Attach { .. } => Response::Error {
+                message: "attach must be handled as a stream".to_string(),
+            },
         }
     }
 
@@ -97,6 +124,7 @@ impl DaemonState {
         if let Some(pr) = req.priority.as_deref().and_then(parse_priority) {
             spec.priority = pr;
         }
+        spec.command = req.command.clone();
 
         let mut task = Task::new(spec, now);
         // Created -> Queued: durable, awaiting admission (provider launch lands with adapters).
@@ -152,11 +180,22 @@ impl DaemonState {
 
     fn terminate(&mut self, id: &str) -> Response {
         let now = now_ms();
-        let Some(task) = self.tasks.get_mut(id) else {
+        if !self.tasks.contains_key(id) {
             return Response::Error {
                 message: format!("no such task: {id}"),
             };
-        };
+        }
+
+        // Kill and reap the live provider process, if any, preserving its history.
+        if let Some(mut rt) = self.runtimes.remove(id) {
+            let _ = rt.stop();
+            if let Some(hist) = self.histories.get_mut(id) {
+                let _ = hist.append(rt.take_evicted());
+                let _ = hist.flush();
+            }
+        }
+
+        let task = self.tasks.get_mut(id).expect("checked above");
         // Drive ANY -> TERMINATING -> TERMINATED.
         if task.state != TaskState::Terminating && task.state != TaskState::Terminated {
             if let Ok(t) = task.transition(TaskState::Terminating, "operator terminate", now) {
@@ -174,8 +213,8 @@ impl DaemonState {
     }
 
     fn pressure(&mut self) -> Response {
-        // No provider processes are launched yet (adapters arrive in SUM-13), so managed usage
-        // is zero; the ladder reports Normal honestly rather than fabricating a figure.
+        // Per-task provider RSS sampling into the pressure figure is a Phase-3 concern; until
+        // then managed usage is reported as zero rather than fabricating a number.
         let used_bytes = 0u64;
         let utilization = self.envelope.utilization(used_bytes);
         let stage = PressureStage::classify(utilization, false, false);
@@ -206,6 +245,163 @@ impl DaemonState {
             Err(e) => Response::Error {
                 message: format!("store error: {e}"),
             },
+        }
+    }
+
+    /// Admit and launch a task's provider in a PTY (Queued → Admitting → Starting → Active).
+    fn start_task(&mut self, id: &str) -> Response {
+        let now = now_ms();
+        if self.runtimes.contains_key(id) {
+            return match self.tasks.get(id) {
+                Some(t) => Response::Task(view(t)),
+                None => Response::Error {
+                    message: format!("no such task: {id}"),
+                },
+            };
+        }
+        let Some(task) = self.tasks.get_mut(id) else {
+            return Response::Error {
+                message: format!("no such task: {id}"),
+            };
+        };
+        if task.state != TaskState::Queued {
+            return Response::Error {
+                message: format!("task {id} is not startable from {}", task.state),
+            };
+        }
+
+        let adapter = adapter_for(task.spec.provider);
+        let mut spec = LaunchSpec::in_dir(&task.spec.repository_path);
+        spec.command = task.spec.command.clone();
+
+        for (to, reason) in [
+            (TaskState::Admitting, "admitted: fits budget"),
+            (TaskState::Starting, "launching provider"),
+        ] {
+            if let Ok(t) = task.transition(to, reason, now) {
+                let _ = self.store.record_transition(id, &t);
+            }
+        }
+
+        match RuntimeInstance::launch(adapter.as_ref(), &spec, now) {
+            Ok(runtime) => {
+                if let Ok(t) = task.transition(TaskState::Active, "provider running", now) {
+                    let _ = self.store.record_transition(id, &t);
+                }
+                let _ = self.store.upsert_task(task);
+                let v = view(task);
+                self.runtimes.insert(id.to_string(), runtime);
+                let hist_dir = self.root.join("tasks").join(id).join("history");
+                if let Ok(store) = ChunkStore::new(&hist_dir, HISTORY_CHUNK_LINES) {
+                    self.histories.insert(id.to_string(), store);
+                }
+                self.event(Some(id), "lifecycle", "started", "info", "daemon");
+                self.audit(Some(id), "started", "provider launched in a PTY", None);
+                Response::Task(v)
+            }
+            Err(e) => {
+                if let Ok(t) = task.transition(TaskState::Failed, "launch failed", now) {
+                    let _ = self.store.record_transition(id, &t);
+                }
+                let _ = self.store.upsert_task(task);
+                self.audit(
+                    Some(id),
+                    "failed",
+                    &format!("provider launch failed: {e}"),
+                    None,
+                );
+                Response::Error {
+                    message: format!("launch failed: {e}"),
+                }
+            }
+        }
+    }
+
+    /// Pump all live runtimes: drain output into capture + screen, spill evicted scrollback to
+    /// the history store, and retire exited tasks. Called on a timer by the server.
+    pub fn pump(&mut self, now: u64) {
+        let mut exited = Vec::new();
+        for (id, rt) in self.runtimes.iter_mut() {
+            rt.pump(now);
+            if let Some(hist) = self.histories.get_mut(id) {
+                let _ = hist.append(rt.take_evicted());
+            }
+            if !rt.is_running() {
+                exited.push(id.clone());
+            }
+        }
+        for id in exited {
+            if let Some(mut rt) = self.runtimes.remove(&id) {
+                // Final drain + flush before dropping the runtime.
+                if let Some(hist) = self.histories.get_mut(&id) {
+                    let _ = hist.append(rt.take_evicted());
+                    let _ = hist.flush();
+                }
+            }
+            if let Some(task) = self.tasks.get_mut(&id) {
+                if !task.state.is_terminal() && task.state != TaskState::Terminating {
+                    if let Ok(t) = task.transition(TaskState::Terminating, "provider exited", now) {
+                        let _ = self.store.record_transition(&id, &t);
+                    }
+                    if let Ok(t) = task.transition(TaskState::Terminated, "provider exited", now) {
+                        let _ = self.store.record_transition(&id, &t);
+                    }
+                    let _ = self.store.upsert_task(task);
+                }
+            }
+            self.event(Some(&id), "process", "process_exited", "info", "daemon");
+        }
+    }
+
+    /// Current screen grid of a running task.
+    pub fn screen_view(&self, id: &str) -> Option<ScreenView> {
+        self.runtimes.get(id).map(|rt| {
+            let (row, col) = rt.cursor();
+            ScreenView {
+                rows: rt.screen_rows(),
+                cursor_row: row,
+                cursor_col: col,
+                running: true,
+            }
+        })
+    }
+
+    /// Whether a task's provider process is live.
+    pub fn is_running(&self, id: &str) -> bool {
+        self.runtimes.contains_key(id)
+    }
+
+    /// Forward bytes to a running task's stdin (attach input).
+    pub fn write_stdin(&mut self, id: &str, data: &[u8]) {
+        if let Some(rt) = self.runtimes.get_mut(id) {
+            let _ = rt.write_stdin(data);
+        }
+    }
+
+    /// Resize a running task's terminal (attach resize).
+    pub fn resize(&mut self, id: &str, rows: u16, cols: u16) {
+        if let Some(rt) = self.runtimes.get_mut(id) {
+            let _ = rt.resize(rows, cols);
+        }
+    }
+
+    fn read_history(&self, id: &str, cursor: u64, limit: u32) -> Response {
+        match self.histories.get(id) {
+            Some(store) => match store.read_history(cursor, limit as usize) {
+                Ok(lines) => Response::History(HistoryPage {
+                    lines: lines.iter().map(|l| l.render()).collect(),
+                    next_cursor: cursor + lines.len() as u64,
+                    total: store.total_lines(),
+                }),
+                Err(e) => Response::Error {
+                    message: format!("history error: {e}"),
+                },
+            },
+            None => Response::History(HistoryPage {
+                lines: Vec::new(),
+                next_cursor: cursor,
+                total: 0,
+            }),
         }
     }
 
@@ -326,7 +522,12 @@ mod tests {
     fn state() -> DaemonState {
         let store = Store::open_in_memory().unwrap();
         let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
-        DaemonState::boot(store, envelope).unwrap()
+        DaemonState::boot(
+            store,
+            envelope,
+            std::env::temp_dir().join("memmuxd-unit-test"),
+        )
+        .unwrap()
     }
 
     fn create(state: &mut DaemonState, title: &str) -> TaskView {
@@ -337,6 +538,7 @@ mod tests {
             base_branch: "main".into(),
             resource_class: None,
             priority: None,
+            command: None,
         })) {
             Response::Task(v) => v,
             other => panic!("expected Task, got {other:?}"),
@@ -372,6 +574,7 @@ mod tests {
             base_branch: "main".into(),
             resource_class: None,
             priority: None,
+            command: None,
         }));
         assert!(matches!(resp, Response::Error { .. }));
     }
@@ -411,11 +614,11 @@ mod tests {
         let env = ResourceEnvelope::with_default_reserves(32 * GIB);
 
         let id = {
-            let mut s = DaemonState::boot(Store::open(&db).unwrap(), env).unwrap();
+            let mut s = DaemonState::boot(Store::open(&db).unwrap(), env, dir.clone()).unwrap();
             create(&mut s, "persisted task").id
         };
         // Reboot: a fresh state on the same store must recover the task.
-        let s2 = DaemonState::boot(Store::open(&db).unwrap(), env).unwrap();
+        let s2 = DaemonState::boot(Store::open(&db).unwrap(), env, dir.clone()).unwrap();
         assert_eq!(s2.task_count(), 1);
         assert!(s2.tasks.contains_key(&id));
 
