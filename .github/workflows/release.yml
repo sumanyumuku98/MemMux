@@ -1,0 +1,83 @@
+name: Release
+
+# Tag-triggered release pipeline (SUM-25): builds per-target archives, a curl installer, and a
+# Homebrew formula, then publishes a GitHub Release. macOS code-signing/notarization (SUM-26)
+# runs only when the Apple secrets are configured; otherwise it is skipped.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # SUM-26: signing/notarization engages only when these repo secrets exist.
+  HAS_APPLE_CREDS: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_NOTARY_KEY != '' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-13, target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p memmux -p memmuxd
+      - name: Sign + notarize (macOS, only if Apple secrets are set — SUM-26)
+        if: runner.os == 'macOS' && env.HAS_APPLE_CREDS == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/macos-notarize.sh "target/${TARGET}/release/memmux" "target/${TARGET}/release/memmuxd"
+      - name: Package archive
+        shell: bash
+        run: bash scripts/package.sh "${{ github.ref_name }}" "${{ matrix.target }}"
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            memmux-*.tar.gz
+            memmux-*.tar.gz.sha256
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate installer + Homebrew formula
+        shell: bash
+        run: bash scripts/gen-release-assets.sh "${{ github.ref_name }}" dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/*.tar.gz dist/*.sha256 dist/install.sh dist/memmux.rb \
+            --title "MemMux ${{ github.ref_name }}" \
+            --generate-notes
