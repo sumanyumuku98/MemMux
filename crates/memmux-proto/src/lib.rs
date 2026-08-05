@@ -50,6 +50,18 @@ pub enum Request {
         /// Task id.
         id: String,
     },
+    /// Register a folder as a workspace (validates it is a git repo) (SUM-124).
+    AddWorkspace {
+        /// Filesystem path to the repository root (or anywhere inside it).
+        path: String,
+    },
+    /// List registered workspaces.
+    ListWorkspaces,
+    /// Remove a registered workspace (tasks are unaffected).
+    RemoveWorkspace {
+        /// Workspace id.
+        id: String,
+    },
     /// Report current system memory pressure.
     SystemPressure,
     /// Read events after a cursor.
@@ -130,6 +142,10 @@ pub enum Response {
     Screen(ScreenView),
     /// A page of scrollback history.
     History(HistoryPage),
+    /// A single workspace.
+    Workspace(WorkspaceView),
+    /// A list of workspaces.
+    Workspaces(Vec<WorkspaceView>),
     /// Acknowledgement with no payload (e.g. attach accepted; stream frames follow).
     Ok,
     /// An error with a message.
@@ -150,6 +166,21 @@ pub struct ScreenView {
     pub cursor_col: u16,
     /// Whether the provider process is still running.
     pub running: bool,
+}
+
+/// A client-facing view of a registered workspace (SUM-124).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceView {
+    /// Stable workspace id (matches the `repository` id of tasks created under it).
+    pub id: String,
+    /// Canonical repository root path.
+    pub path: String,
+    /// Display name.
+    pub name: String,
+    /// Registration time (ms since epoch).
+    pub created_at_ms: u64,
+    /// Number of tasks currently associated with this workspace.
+    pub task_count: u64,
 }
 
 /// A page of scrollback history lines.

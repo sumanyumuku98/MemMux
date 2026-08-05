@@ -10,11 +10,11 @@ use memmux_lifecycle::{
 };
 use memmux_proto::{
     CreateTaskRequest, DaemonInfo, EventView, HistoryPage, PressureView, Request, Response,
-    ScreenView, TaskView, PROTOCOL_VERSION,
+    ScreenView, TaskView, WorkspaceView, PROTOCOL_VERSION,
 };
 use memmux_pty::ChunkStore;
 use memmux_sched::{class_reservation, pressure::PressureStage, ResourceEnvelope};
-use memmux_store::{CheckpointRef, Decision, EventInput, Store};
+use memmux_store::{CheckpointRef, Decision, EventInput, Store, Workspace};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,6 +38,8 @@ pub struct DaemonState {
     runtimes: HashMap<String, RuntimeInstance>,
     /// Per-task scrollback history (evicted capture lines).
     histories: HashMap<String, ChunkStore>,
+    /// Registered workspaces, keyed by id (SUM-124).
+    workspaces: BTreeMap<String, Workspace>,
     /// Last time the pump checked running providers against their recycle threshold.
     last_recycle_check_ms: u64,
     seq: u64,
@@ -50,6 +52,10 @@ impl DaemonState {
         for task in store.load_tasks()? {
             tasks.insert(task.spec.id.to_string(), task);
         }
+        let mut workspaces = BTreeMap::new();
+        for w in store.load_workspaces()? {
+            workspaces.insert(w.id.clone(), w);
+        }
         let recovered = tasks.len();
         let state = Self {
             store,
@@ -58,6 +64,7 @@ impl DaemonState {
             root,
             runtimes: HashMap::new(),
             histories: HashMap::new(),
+            workspaces,
             last_recycle_check_ms: 0,
             seq: 0,
         };
@@ -96,6 +103,9 @@ impl DaemonState {
             Request::HibernateTask { id } => self.hibernate(&id),
             Request::ResumeTask { id } => self.resume(&id),
             Request::RecycleTask { id } => self.recycle(&id),
+            Request::AddWorkspace { path } => self.add_workspace(&path),
+            Request::ListWorkspaces => Response::Workspaces(self.workspace_views()),
+            Request::RemoveWorkspace { id } => self.remove_workspace(&id),
             Request::SystemPressure => self.pressure(),
             Request::ReadEvents { after_seq, limit } => self.read_events(after_seq, limit),
             Request::StartTask { id } => self.start_task(&id),
@@ -126,7 +136,7 @@ impl DaemonState {
         let now = now_ms();
         self.seq += 1;
         let task_id = format!("task_{now:x}{:04x}", self.seq & 0xffff);
-        let repo_id = format!("repo_{}", short_hash(&req.repository_path));
+        let repo_id = repo_id_for(&req.repository_path);
 
         let mut spec = TaskSpec::new(
             task_id.as_str(),
@@ -194,6 +204,85 @@ impl DaemonState {
         let v = view(&task);
         self.tasks.insert(task_id, task);
         Response::Task(v)
+    }
+
+    /// Register a folder as a workspace, validating it is a git repository (SUM-124). Idempotent:
+    /// re-adding the same repo returns the existing workspace.
+    fn add_workspace(&mut self, path: &str) -> Response {
+        let toplevel = match git_toplevel(std::path::Path::new(path)) {
+            Some(t) => t,
+            None => {
+                return Response::Error {
+                    message: format!("not a git repository: {path}"),
+                }
+            }
+        };
+        let id = repo_id_for(&toplevel);
+        let name = std::path::Path::new(&toplevel)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        // Preserve the original registration time if it already exists.
+        let created_at_ms = self
+            .workspaces
+            .get(&id)
+            .map(|w| w.created_at_ms)
+            .unwrap_or_else(now_ms);
+        let ws = Workspace {
+            id: id.clone(),
+            path: toplevel,
+            name,
+            created_at_ms,
+        };
+        if let Err(e) = self.store.save_workspace(&ws) {
+            return Response::Error {
+                message: format!("store error: {e}"),
+            };
+        }
+        self.workspaces.insert(id.clone(), ws.clone());
+        self.event(None, "workspace", "workspace_added", "info", "daemon");
+        self.audit(
+            None,
+            "workspace_added",
+            &format!("registered workspace {} at {}", ws.name, ws.path),
+            None,
+        );
+        Response::Workspace(self.workspace_view(&ws))
+    }
+
+    /// Remove a registered workspace. Tasks already created under it are unaffected.
+    fn remove_workspace(&mut self, id: &str) -> Response {
+        if self.workspaces.remove(id).is_none() {
+            return Response::Error {
+                message: format!("no such workspace: {id}"),
+            };
+        }
+        let _ = self.store.delete_workspace(id);
+        self.event(None, "workspace", "workspace_removed", "info", "daemon");
+        Response::Ok
+    }
+
+    fn workspace_views(&self) -> Vec<WorkspaceView> {
+        self.workspaces
+            .values()
+            .map(|w| self.workspace_view(w))
+            .collect()
+    }
+
+    fn workspace_view(&self, w: &Workspace) -> WorkspaceView {
+        let task_count = self
+            .tasks
+            .values()
+            .filter(|t| t.spec.repository.to_string() == w.id)
+            .count() as u64;
+        WorkspaceView {
+            id: w.id.clone(),
+            path: w.path.clone(),
+            name: w.name.clone(),
+            created_at_ms: w.created_at_ms,
+            task_count,
+        }
     }
 
     fn terminate(&mut self, id: &str) -> Response {
@@ -1025,6 +1114,19 @@ fn short_hash(s: &str) -> String {
     format!("{h:x}")
 }
 
+/// The stable repository/workspace id for a path (a task's `repository` matches its workspace).
+fn repo_id_for(path: &str) -> String {
+    format!("repo_{}", short_hash(path))
+}
+
+/// The git repository root containing `path`, or `None` if it isn't inside a git repo.
+fn git_toplevel(path: &std::path::Path) -> Option<String> {
+    memmux_worktree::gitcmd::git_ok(path, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn parse_provider(slug: &str) -> Option<Provider> {
     Some(match slug {
         "claude-code" | "claude" => Provider::ClaudeCode,
@@ -1210,6 +1312,67 @@ mod tests {
             Response::Error { message } => assert!(message.contains("not hibernated")),
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workspace_add_list_group_and_remove() {
+        let dir = std::env::temp_dir().join(format!("memmuxd-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+
+        let mut s = state();
+
+        // Add a workspace on the git repo.
+        let ws = match s.handle(Request::AddWorkspace {
+            path: dir.display().to_string(),
+        }) {
+            Response::Workspace(w) => w,
+            other => panic!("expected Workspace, got {other:?}"),
+        };
+        assert_eq!(ws.task_count, 0);
+
+        // A task created under the workspace path is grouped under it.
+        s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "t".into(),
+            repository_path: ws.path.clone(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: None,
+        }));
+        match s.handle(Request::ListWorkspaces) {
+            Response::Workspaces(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].task_count, 1, "task should group under its workspace");
+            }
+            other => panic!("expected Workspaces, got {other:?}"),
+        }
+
+        // Remove it; tasks remain but the workspace is gone.
+        assert!(matches!(
+            s.handle(Request::RemoveWorkspace { id: ws.id.clone() }),
+            Response::Ok
+        ));
+        match s.handle(Request::ListWorkspaces) {
+            Response::Workspaces(v) => assert!(v.is_empty()),
+            other => panic!("expected Workspaces, got {other:?}"),
+        }
+
+        // A non-git path is rejected.
+        assert!(matches!(
+            s.handle(Request::AddWorkspace {
+                path: "/definitely/not/a/repo".into()
+            }),
+            Response::Error { .. }
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
