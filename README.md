@@ -87,6 +87,19 @@ cargo fmt   --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Try it (Phase 0)
+
+```bash
+# One-shot process-attribution snapshot against a pid (defaults to self)
+cargo run -p memmuxd -- snapshot --root 1
+
+# Run the benchmark (raw baseline vs MemMux) and print a report
+cargo run -p memmux-bench -- run --scenario all --provider claude-code --out bench-out
+```
+
+See [`docs/phase-0.md`](./docs/phase-0.md) for what Phase 0 delivers and
+[`docs/benchmark-methodology.md`](./docs/benchmark-methodology.md) for benchmark fairness rules.
+
 ## Status
 
 🚧 Early development. Phase 0 is under active construction. APIs are unstable.

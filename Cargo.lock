@@ -162,6 +162,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmux-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "memmux-core",
+ "memmux-metrics",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memmux-core"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "memmux-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MemMux competitive benchmark harness: stub agent, scenarios, samplers, reports (Phase 0)."
+
+[[bin]]
+name = "memmux-bench"
+path = "src/main.rs"
+
+[dependencies]
+memmux-core = { workspace = true }
+memmux-metrics = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
