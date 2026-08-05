@@ -1,0 +1,15 @@
+[package]
+name = "memmux-sched"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Memory budget, reservation, admission scheduling, and pressure ladder for MemMux (Phase 1)."
+
+[dependencies]
+memmux-core = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -12,11 +12,13 @@
 
 pub mod event;
 pub mod ids;
+pub mod runtime;
 pub mod state;
 pub mod task;
 
 pub use event::{Event, EventCategory, EventSeverity, EventType};
 pub use ids::{Pid, RepositoryId, RuntimeInstanceId, TaskId};
+pub use runtime::{classify_substate, ActivitySignals, StateTransition, Task};
 pub use state::{IllegalTransition, TaskState};
 pub use task::{
     Isolation, McpProfile, Priority, Provider, ResourceClass, TaskPolicies, TaskSpec, ToolProfile,
