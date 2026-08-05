@@ -17,6 +17,10 @@ description = "MemMux — the memory-aware local runtime for parallel AI coding 
 memmux-core = { path = "crates/memmux-core", version = "0.1.0" }
 memmux-metrics = { path = "crates/memmux-metrics", version = "0.1.0" }
 memmux-proto = { path = "crates/memmux-proto", version = "0.1.0" }
+memmux-sched = { path = "crates/memmux-sched", version = "0.1.0" }
+memmux-pty = { path = "crates/memmux-pty", version = "0.1.0" }
+memmux-worktree = { path = "crates/memmux-worktree", version = "0.1.0" }
+memmux-store = { path = "crates/memmux-store", version = "0.1.0" }
 
 # External (all pinned to mature, long-published minor lines; see ORG dependency policy)
 anyhow = "1.0"

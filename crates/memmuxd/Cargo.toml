@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MemMux control-plane daemon (skeleton; scheduler/lifecycle land in Phase 1)."
+description = "MemMux control-plane daemon: durable state, UDS API, scheduling, recovery, audit."
 
 [[bin]]
 name = "memmuxd"
@@ -15,7 +15,16 @@ path = "src/main.rs"
 memmux-core = { workspace = true }
 memmux-proto = { workspace = true }
 memmux-metrics = { workspace = true }
+memmux-sched = { workspace = true }
+memmux-worktree = { workspace = true }
+memmux-store = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
