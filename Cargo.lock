@@ -634,6 +634,7 @@ dependencies = [
  "libc",
  "memmux-adapters",
  "memmux-core",
+ "memmux-lifecycle",
  "memmux-metrics",
  "memmux-proto",
  "memmux-pty",

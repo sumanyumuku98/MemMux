@@ -5,7 +5,7 @@
 
 use crate::adapter::{EventWindow, LaunchSpec, ProviderAdapter};
 use memmux_core::{Provider, TaskState};
-use memmux_pty::{CaptureBuffer, CaptureConfig, PtySession, Screen, StoredLine};
+use memmux_pty::{CaptureBuffer, CaptureConfig, PtySession, PtySpec, Screen, StoredLine};
 
 /// A launched provider session under MemMux management.
 pub struct RuntimeInstance {
@@ -23,11 +23,17 @@ impl RuntimeInstance {
         spec: &LaunchSpec,
         now_ms: u64,
     ) -> anyhow::Result<Self> {
-        let pty_spec = adapter.command(spec);
+        Self::spawn_pty(adapter.provider(), adapter.command(spec), now_ms)
+    }
+
+    /// Launch from an explicit [`PtySpec`] (e.g. a provider-native resume command built by
+    /// [`ProviderAdapter::resume_command`]). Lets the daemon choose the launch vs resume
+    /// invocation while reusing the same capture/screen wiring.
+    pub fn spawn_pty(provider: Provider, pty_spec: PtySpec, now_ms: u64) -> anyhow::Result<Self> {
         let (rows, cols) = (pty_spec.rows, pty_spec.cols);
         let session = PtySession::spawn(&pty_spec)?;
         Ok(Self {
-            provider: adapter.provider(),
+            provider,
             session,
             capture: CaptureBuffer::new(CaptureConfig::default()),
             screen: Screen::new(rows, cols, 1000),
@@ -38,6 +44,11 @@ impl RuntimeInstance {
     /// Provider this instance serves.
     pub fn provider(&self) -> Provider {
         self.provider
+    }
+
+    /// The provider process's OS pid, if available (drives RSS attribution for recycling).
+    pub fn pid(&self) -> Option<u32> {
+        self.session.pid()
     }
 
     /// Drain available output into the capture buffer and screen. Returns bytes ingested.

@@ -19,6 +19,7 @@ memmux-sched = { workspace = true }
 memmux-worktree = { workspace = true }
 memmux-store = { workspace = true }
 memmux-adapters = { workspace = true }
+memmux-lifecycle = { workspace = true }
 memmux-pty = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

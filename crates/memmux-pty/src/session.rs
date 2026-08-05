@@ -136,6 +136,12 @@ impl PtySession {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// The child's operating-system process id, if the platform reports one. Used to attribute
+    /// resident memory to a task's process subtree (recycling — SUM-94/97).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     /// Terminate the child process.
     pub fn kill(&mut self) -> std::io::Result<()> {
         self.child.kill()

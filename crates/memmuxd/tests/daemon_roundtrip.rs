@@ -205,6 +205,141 @@ fn start_streams_screen_and_pages_history() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Start a long-running generic task and return its id once ACTIVE.
+fn start_long_running(client: &Client, title: &str) -> String {
+    let created = match client
+        .call(&Request::CreateTask(CreateTaskRequest {
+            title: title.into(),
+            repository_path: "/tmp".into(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do echo tick; sleep 1; done".into(),
+            ]),
+        }))
+        .unwrap()
+    {
+        Response::Task(t) => t,
+        other => panic!("expected Task, got {other:?}"),
+    };
+    match client
+        .call(&Request::StartTask {
+            id: created.id.clone(),
+        })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "ACTIVE"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+    created.id
+}
+
+#[test]
+fn hibernate_checkpoints_and_resume_restores_the_task() {
+    let dir = tmp("hibernate");
+    let (client, _socket) = spawn_server(&dir);
+    let id = start_long_running(&client, "hibernator");
+
+    // Hibernate: the provider stops and the task freezes.
+    match client
+        .call(&Request::HibernateTask { id: id.clone() })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "HIBERNATED"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+
+    // A checkpoint artifact was persisted on disk (SUM-90) and it verifies its own integrity.
+    let cp_path = dir.join("tasks").join(&id).join("checkpoint.json");
+    assert!(
+        cp_path.exists(),
+        "checkpoint artifact missing at {cp_path:?}"
+    );
+    let cp: serde_json::Value = serde_json::from_slice(&std::fs::read(&cp_path).unwrap()).unwrap();
+    assert!(cp.get("integrity").and_then(|v| v.as_str()).is_some());
+    assert_eq!(cp["task_id"], serde_json::json!(id));
+
+    // The provider is no longer resident while hibernated.
+    match client.call(&Request::GetScreen { id: id.clone() }).unwrap() {
+        Response::Error { .. } => {}
+        other => panic!("expected no live screen while hibernated, got {other:?}"),
+    }
+
+    // Resume: the task comes back to ACTIVE with a live provider.
+    match client
+        .call(&Request::ResumeTask { id: id.clone() })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "ACTIVE"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+
+    // The resumed provider produces output again.
+    let mut alive = false;
+    for _ in 0..100 {
+        if let Response::Screen(s) = client.call(&Request::GetScreen { id: id.clone() }).unwrap() {
+            if s.running {
+                alive = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(alive, "resumed provider never came back to life");
+
+    client.call(&Request::TerminateTask { id }).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recycle_restarts_provider_and_ledgers_reclamation() {
+    let dir = tmp("recycle");
+    let (client, _socket) = spawn_server(&dir);
+    let id = start_long_running(&client, "recyclable");
+
+    // Recycle: checkpoint, restart at a safe point, resume.
+    match client
+        .call(&Request::RecycleTask { id: id.clone() })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "ACTIVE"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+
+    // A `runtime_recycled` ledger event was emitted (SUM-97).
+    let mut ledgered = false;
+    if let Response::Events(evs) = client
+        .call(&Request::ReadEvents {
+            after_seq: 0,
+            limit: 200,
+        })
+        .unwrap()
+    {
+        ledgered = evs.iter().any(|e| e.event_type == "runtime_recycled");
+    }
+    assert!(ledgered, "no runtime_recycled event was ledgered");
+
+    // The provider is live again after the recycle.
+    let mut alive = false;
+    for _ in 0..100 {
+        if let Response::Screen(s) = client.call(&Request::GetScreen { id: id.clone() }).unwrap() {
+            if s.running {
+                alive = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(alive, "recycled provider is not running");
+
+    client.call(&Request::TerminateTask { id }).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn attach_streams_screen_and_accepts_input() {
     let dir = tmp("attach");
