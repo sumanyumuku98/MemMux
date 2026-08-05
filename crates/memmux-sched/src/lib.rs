@@ -6,7 +6,7 @@
 //! * [`envelope`] — the global agent budget from host memory minus reserves (SUM-44).
 //! * [`reservation`] — per-task reservation model (SUM-45).
 //! * [`classes`] — resource-class priors and EWMA peak prediction (SUM-46).
-//! * [`score`] — scheduling score and admission queue (SUM-47).
+//! * [`mod@score`] — scheduling score and admission queue (SUM-47).
 //! * [`pressure`] — the pressure ladder (SUM-48).
 
 #![forbid(unsafe_code)]

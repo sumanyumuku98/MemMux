@@ -1,6 +1,6 @@
 //! Runtime task entity and sub-state classification (SUM-41, SUM-42, SUM-43).
 //!
-//! [`TaskSpec`](crate::TaskSpec) is the durable *description* of work; [`Task`] is its live
+//! [`TaskSpec`] is the durable *description* of work; [`Task`] is its live
 //! runtime record — current [`TaskState`], timestamps, and an audited history of transitions.
 //! Sub-state classification ([`classify_substate`]) turns raw provider/activity signals into
 //! the resident sub-state (`TOOL_RUNNING` / `WAITING_USER` / `BLOCKED` / `IDLE` / `ACTIVE`) the
