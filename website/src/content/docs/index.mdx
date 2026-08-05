@@ -5,10 +5,13 @@ template: splash
 hero:
   tagline: Run many coding agents in parallel without your machine falling over.
   actions:
-    - text: Read the architecture
-      link: design/architecture/
+    - text: Install MemMux
+      link: install/
       icon: right-arrow
       variant: primary
+    - text: Read the architecture
+      link: design/architecture/
+      icon: open-book
     - text: View on GitHub
       link: https://github.com/sumanyumuku98/MemMux
       icon: external
@@ -45,6 +48,7 @@ resident.
 ## Explore
 
 <CardGrid>
+  <LinkCard title="Installation" href="install/" description="Install the binaries on Linux or macOS." />
   <LinkCard title="Architecture" href="design/architecture/" description="The crate map and how the pieces fit together." />
   <LinkCard title="Threat model" href="design/threat-model/" description="The security boundaries MemMux enforces." />
   <LinkCard title="Phase 2 — Lifecycle runtime" href="phases/phase-2/" description="Checkpoint, hibernate, resume, and recycling." />
@@ -53,9 +57,11 @@ resident.
 
 ## Quick start
 
+[Install MemMux](install/), then:
+
 ```bash
-cargo build --workspace
 memmuxd serve &          # durable state under ~/.memmux (or set MEMMUX_ROOT)
 memmuxd create --title "Refactor auth" --repo ~/src/product --provider claude-code
+memmuxd start <task-id>
 memmux                   # open the terminal UI
 ```

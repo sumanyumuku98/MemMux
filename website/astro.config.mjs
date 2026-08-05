@@ -27,6 +27,7 @@ export default defineConfig({
       lastUpdated: true,
       sidebar: [
         { label: 'Introduction', link: '/' },
+        { label: 'Installation', link: '/install/' },
         {
           label: 'Design',
           items: [
