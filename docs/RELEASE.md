@@ -34,6 +34,22 @@ curl -fsSL https://github.com/sumanyumuku98/MemMux/releases/download/v0.1.0/inst
 brew install sumanyumuku98/tap/memmux
 ```
 
+## Running the daemon as a service
+
+Each archive includes optional service units under `packaging/` so `memmuxd` can run in the
+background and restart on failure:
+
+```bash
+# Linux (systemd --user)
+mkdir -p ~/.config/systemd/user
+cp packaging/systemd/memmuxd.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now memmuxd
+
+# macOS (launchd user agent)
+cp packaging/launchd/com.memmux.memmuxd.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.memmux.memmuxd.plist
+```
+
 ### Homebrew tap
 
 The generated `memmux.rb` is attached to each release. To serve it via Homebrew, create a
