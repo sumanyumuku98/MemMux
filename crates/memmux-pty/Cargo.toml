@@ -1,0 +1,20 @@
+[package]
+name = "memmux-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded terminal capture and PTY session management for MemMux (Phase 1)."
+
+[dependencies]
+memmux-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Verified > 7 days old (org dependency policy): portable-pty 0.9.0 (2025-02),
+# vt100 0.16.2 (2025-07), zstd 0.13.3 (2025-02).
+portable-pty = "0.9"
+vt100 = "0.16"
+zstd = "0.13"
