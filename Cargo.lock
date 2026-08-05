@@ -551,6 +551,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmux-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "memmux-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memmux-metrics"
 version = "0.1.0"
 dependencies = [
