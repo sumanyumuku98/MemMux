@@ -65,11 +65,35 @@ With the secret present, `brew install sumanyumuku98/tap/memmux` works after eac
 the secret exists, the publish step is skipped (the formula still ships as a release asset, so
 `brew install ./memmux.rb` from a downloaded formula continues to work).
 
-## Hosted API docs (GitHub Pages)
+## Hosted docs (GitHub Pages → memmux.ai)
 
-`.github/workflows/docs.yml` builds `cargo doc --workspace --no-deps` and deploys it to GitHub
-Pages on every push to `main`. Enable it once: **Settings → Pages → Source: "GitHub Actions"**.
-The published site redirects to the `memmuxd` crate docs; all workspace crates are browsable.
+`.github/workflows/docs.yml` builds the complete documentation site on every push to `main` and
+deploys it to GitHub Pages, served at **https://memmux.ai**:
+
+- an **mdBook** of the guides in `docs/` (architecture, phases, threat model, releasing);
+- the generated **rustdoc API reference** nested under **`/api/`** (`cargo doc --workspace
+  --no-deps`, built with `-D warnings`).
+
+One-time setup:
+
+1. Enable Pages: **Settings → Pages → Source: "GitHub Actions"** (already done via the API).
+2. Point DNS for `memmux.ai` at GitHub Pages (apex domain):
+
+   | Type | Name | Value |
+   | --- | --- | --- |
+   | A | `@` | `185.199.108.153` |
+   | A | `@` | `185.199.109.153` |
+   | A | `@` | `185.199.110.153` |
+   | A | `@` | `185.199.111.153` |
+   | AAAA | `@` | `2606:50c0:8000::153` |
+   | AAAA | `@` | `2606:50c0:8001::153` |
+   | AAAA | `@` | `2606:50c0:8002::153` |
+   | AAAA | `@` | `2606:50c0:8003::153` |
+
+   (Optionally add a `CNAME` record for `www` → `sumanyumuku98.github.io`.)
+
+The custom domain is written into the site via a `CNAME` file by the workflow; once DNS resolves,
+GitHub issues a TLS certificate and the `sumanyumuku98.github.io` URL redirects to `memmux.ai`.
 
 ## macOS code-signing & notarization (SUM-26 — pending your Apple credentials)
 
