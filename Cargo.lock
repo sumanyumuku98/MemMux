@@ -305,6 +305,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmux-worktree"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "memmux-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "memmuxd"
 version = "0.1.0"
 dependencies = [

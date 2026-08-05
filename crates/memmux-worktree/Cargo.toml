@@ -1,0 +1,17 @@
+[package]
+name = "memmux-worktree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git worktree orchestration for MemMux: creation, dirty-state protection, completion flows (Phase 1)."
+
+[dependencies]
+memmux-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
