@@ -6,6 +6,7 @@
   **The memory-aware local runtime for parallel AI coding agents.**
 
   [![CI](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml/badge.svg)](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml)
+  [![Docs](https://github.com/sumanyumuku98/MemMux/actions/workflows/docs.yml/badge.svg)](https://sumanyumuku98.github.io/MemMux/)
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 </div>
 
