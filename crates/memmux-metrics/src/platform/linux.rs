@@ -23,6 +23,13 @@ impl LinuxSampler {
         let stat = fs::read_to_string(format!("{base}/stat")).ok()?;
         let info = parse_stat(&stat)?;
 
+        // Skip zombies: they hold no memory and are pending reap, so they are effectively gone
+        // for accounting and termination (a killed child appears as `Z` in /proc until its
+        // parent reaps it).
+        if info.is_zombie() {
+            return None;
+        }
+
         // RSS from status (VmRSS) — avoids needing the page size.
         let rss_bytes = fs::read_to_string(format!("{base}/status"))
             .ok()

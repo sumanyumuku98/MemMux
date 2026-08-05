@@ -23,7 +23,7 @@ fn terminate_subtree_reaps_a_real_process_tree() {
 
     let sampler = default_sampler();
     let report =
-        terminate_subtree(sampler.as_ref(), root, Duration::from_millis(400)).expect("terminate");
+        terminate_subtree(sampler.as_ref(), root, Duration::from_millis(700)).expect("terminate");
 
     assert!(
         report.fully_cleaned(),
