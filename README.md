@@ -90,7 +90,7 @@ Prebuilt binaries for Linux (x86_64) and macOS (Apple Silicon + Intel) ship with
 **One-line installer** (installs `memmux` + `memmuxd` to `~/.local/bin`):
 
 ```bash
-curl -fsSL https://github.com/sumanyumuku98/MemMux/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sumanyumuku98/MemMux/main/install.sh | sh
 # then make sure ~/.local/bin is on your PATH:
 export PATH="$HOME/.local/bin:$PATH"
 memmuxd version
