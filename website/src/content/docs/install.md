@@ -12,7 +12,7 @@ installed: `memmuxd` (the control-plane daemon) and `memmux` (the terminal UI).
 Installs `memmux` and `memmuxd` to `~/.local/bin`:
 
 ```bash
-curl -fsSL https://github.com/sumanyumuku98/MemMux/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sumanyumuku98/MemMux/main/install.sh | sh
 ```
 
 Then make sure that directory is on your `PATH` (add the line to `~/.zshrc` or `~/.bashrc` to
@@ -27,7 +27,7 @@ The installer detects your OS/architecture, downloads the matching archive, and 
 binaries. Override the destination with `MEMMUX_BIN_DIR`, e.g.:
 
 ```bash
-curl -fsSL https://github.com/sumanyumuku98/MemMux/releases/latest/download/install.sh \
+curl -fsSL https://raw.githubusercontent.com/sumanyumuku98/MemMux/main/install.sh \
   | MEMMUX_BIN_DIR=/usr/local/bin sh
 ```
 
