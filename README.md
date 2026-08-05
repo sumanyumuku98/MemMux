@@ -48,6 +48,7 @@ footprint is the product.
 - **`memmux-metrics`** — cross-platform process accounting & attribution (Phase 0 core).
 - **`memmux-bench`** — competitive benchmark harness (stub agent, scenarios, reports).
 - **`memmux-core`** — shared domain types (tasks, state machine, events).
+- **`memmux-lifecycle`** — pure lifecycle logic (checkpoints, safe-points, recycling, resume).
 - **`memmux-proto`** — versioned client/daemon protocol types.
 
 ## Non-functional launch gates
@@ -69,8 +70,8 @@ MemMux is built in seven phases (tracked in Linear, mirrored here):
 | Phase | Scope | Exit criterion |
 | --- | --- | --- |
 | **0 — Instrumentation prototype** | Process accounting, attribution, bounded terminal capture, benchmark harness | Accurate attribution on macOS/Linux for two providers |
-| 1 — Memory-safe multiplexer | TUI, tasks, worktrees, process groups, global budget, queue, cleanup | Three active worktrees without uncontrolled growth |
-| 2 — Lifecycle runtime | Checkpoint, hibernate, native resume, pressure ladder | Reliable resume, no lost dirty state under faults |
+| **1 — Memory-safe multiplexer** | TUI, tasks, worktrees, process groups, global budget, queue, cleanup | Three active worktrees without uncontrolled growth |
+| **2 — Lifecycle runtime** | Checkpoint, hibernate, native resume, recycling, more adapters | Reliable resume, no lost dirty state under faults |
 | 3 — Active optimization | Incremental transcripts, MCP leases, lazy services, recycling | Measured active-session memory reduction vs Phase 1 |
 | 4 — Shared repository services | Base index, per-worktree overlays, search/symbol APIs | Lower baseline across three worktrees |
 | 5 — Ecosystem | VS Code bridge, SDK, policy hierarchy, desktop shell | Third party adds a provider without daemon changes |
@@ -114,9 +115,12 @@ See [`docs/phase-0.md`](./docs/phase-0.md), [`docs/phase-1.md`](./docs/phase-1.m
 
 ## Status
 
-🚧 Early development; APIs are unstable. **Phase 0 (instrumentation)** and **Phase 1
-(memory-safe multiplexer)** are complete — daemon, scheduler, bounded capture, worktrees,
-provider adapters, process ownership, and the TUI. Phase 2 (lifecycle runtime) is next.
+🚧 Early development; APIs are unstable. **Phases 0–2 are complete**: process accounting and
+attribution (Phase 0); the memory-safe multiplexer — daemon, scheduler, bounded capture,
+worktrees, provider adapters, process ownership, and the TUI (Phase 1); and the lifecycle
+runtime — checkpoint/hibernate, native + reconstructed resume, RSS-threshold recycling with a
+reclaimed-bytes ledger, and Gemini CLI + OpenCode adapters (Phase 2, see
+[`docs/phase-2.md`](./docs/phase-2.md)). Phase 3 (active optimization) is next.
 
 ## License
 
