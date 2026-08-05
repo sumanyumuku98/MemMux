@@ -1,4 +1,8 @@
-# Phase 2 — Lifecycle runtime
+---
+title: "Phase 2 — Lifecycle runtime"
+description: "Checkpoint/hibernate, native + reconstructed resume, and RSS-threshold recycling."
+---
+
 
 **Goal (§13, §8.7):** freeze idle tasks to near-zero resident memory and restore them
 losslessly, and recycle providers that grow too large — all without losing dirty Git state.

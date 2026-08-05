@@ -1,8 +1,8 @@
 name: Docs
 
-# Builds the complete project documentation site and publishes it to GitHub Pages (served at
-# https://memmux.ai) on every push to main. The site is an mdBook of the guides in docs/, with
-# the generated rustdoc API reference nested under /api/.
+# Builds the complete project documentation site and publishes it to GitHub Pages on every push
+# to main. The site is an Astro Starlight build of the guides in website/, with the generated
+# rustdoc API reference nested under /api/.
 # Requires Pages to be enabled once in repo Settings → Pages → Source: "GitHub Actions".
 
 on:
@@ -19,11 +19,6 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
-env:
-  # Pinned mature release (org dependency policy: > 7 days old). Prebuilt binary, so no cargo
-  # transitive dependencies are pulled.
-  MDBOOK_VERSION: "0.5.4"
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,15 +26,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
 
-      - name: Install mdBook (pinned prebuilt binary)
+      - name: Build the guide (Astro Starlight)
+        working-directory: website
         run: |
-          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          curl -sSL "$url" | tar -xz -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-
-      - name: Build the guide (mdBook)
-        run: mdbook build docs
+          npm ci
+          npm run build
 
       - name: Build the API reference (rustdoc)
         run: cargo doc --workspace --no-deps
@@ -49,13 +46,11 @@ jobs:
       - name: Assemble the site
         run: |
           rm -rf site
-          cp -r target/mdbook site
+          cp -r website/dist site
           # Nest the rustdoc API reference under /api/.
           cp -r target/doc site/api
           # Redirect bare /api to the daemon crate docs.
           printf '<!doctype html><meta http-equiv="refresh" content="0; url=memmuxd/index.html">\n' > site/api/index.html
-          # Custom domain for GitHub Pages.
-          echo 'memmux.ai' > site/CNAME
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

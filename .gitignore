@@ -20,3 +20,8 @@
 # dmux / coordination scaffolding (managed outside this project)
 /.dmux/
 /.claude/
+
+# Docs site (Astro Starlight)
+website/node_modules/
+website/dist/
+website/.astro/

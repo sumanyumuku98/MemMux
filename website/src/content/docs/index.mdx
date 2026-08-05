@@ -1,0 +1,61 @@
+---
+title: MemMux
+description: The memory-aware local runtime for parallel AI coding agents.
+template: splash
+hero:
+  tagline: Run many coding agents in parallel without your machine falling over.
+  actions:
+    - text: Read the architecture
+      link: design/architecture/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/sumanyumuku98/MemMux
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Existing tools multiplex terminals, panes, and Git worktrees. **MemMux multiplexes constrained
+execution resources** — memory, processes, repository services, tool servers, workspaces, and
+agent execution slots — so you can run several coding agents (Claude Code, Codex, Gemini CLI,
+OpenCode, …) each in its own Git worktree while it controls how many *physical* workloads stay
+resident.
+
+<CardGrid>
+  <Card title="Memory-aware" icon="rocket">
+    A global budget and admission scheduler keep resident memory under control; idle tasks
+    hibernate to a checkpoint and resume on demand.
+  </Card>
+  <Card title="Lossless lifecycle" icon="approve-check">
+    Checkpoint, hibernate, and resume — natively where the provider supports it — with a
+    reclaimed-bytes ledger for every recycle.
+  </Card>
+  <Card title="Provider-agnostic" icon="puzzle">
+    First-class adapters for Claude Code, Codex, Gemini CLI, and OpenCode, plus a generic
+    "run anything" provider.
+  </Card>
+  <Card title="Honest & bounded" icon="seti:rust">
+    Bounded PTY capture, recursive process ownership, and an explainable audit trail —
+    written in Rust.
+  </Card>
+</CardGrid>
+
+## Explore
+
+<CardGrid>
+  <LinkCard title="Architecture" href="design/architecture/" description="The crate map and how the pieces fit together." />
+  <LinkCard title="Threat model" href="design/threat-model/" description="The security boundaries MemMux enforces." />
+  <LinkCard title="Phase 2 — Lifecycle runtime" href="phases/phase-2/" description="Checkpoint, hibernate, resume, and recycling." />
+  <LinkCard title="API reference" href="api/" description="Generated rustdoc for every crate." />
+</CardGrid>
+
+## Quick start
+
+```bash
+cargo build --workspace
+memmuxd serve &          # durable state under ~/.memmux (or set MEMMUX_ROOT)
+memmuxd create --title "Refactor auth" --repo ~/src/product --provider claude-code
+memmux                   # open the terminal UI
+```

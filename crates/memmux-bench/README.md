@@ -33,4 +33,4 @@ don't invoke them directly.
 ## Fairness
 
 Competitor numbers are never fabricated. See
-[`docs/benchmark-methodology.md`](../../docs/benchmark-methodology.md).
+[benchmark methodology](https://sumanyumuku98.github.io/MemMux/design/benchmark-methodology/).

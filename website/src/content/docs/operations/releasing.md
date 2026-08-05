@@ -1,4 +1,8 @@
-# Releasing MemMux
+---
+title: "Releasing MemMux"
+description: "Packaging, signing, distribution, and hosting the docs."
+---
+
 
 MemMux ships as a single set of static-ish binaries (`memmux`, `memmuxd`) via a tag-triggered
 GitHub Actions pipeline (`.github/workflows/release.yml`, SUM-25).
@@ -71,38 +75,20 @@ the secret exists, the publish step is skipped (the formula still ships as a rel
 deploys it to GitHub Pages. It is live today at
 **https://sumanyumuku98.github.io/MemMux/** and comprises:
 
-- an **mdBook** of the guides in `docs/` (architecture, phases, threat model, releasing);
+- an **Astro Starlight** site built from the Markdown in `website/src/content/docs/` (this guide);
 - the generated **rustdoc API reference** nested under **`/api/`** (`cargo doc --workspace
   --no-deps`, built with `-D warnings`).
 
-Pages is already enabled (Source: "GitHub Actions").
+Pages is already enabled (Source: "GitHub Actions"). The Starlight toolchain (Astro + Starlight)
+is pinned to mature versions in `website/package.json` with a committed `package-lock.json`, and
+CI installs it with `npm ci` (org dependency policy).
 
-### Custom domain (`memmux.ai`) — when the domain is owned
+### Custom domain (optional, later)
 
-The workflow already writes a `CNAME` file for `memmux.ai`; the domain is **not yet activated**
-(it isn't owned). To switch over once you own it:
-
-1. Point DNS for `memmux.ai` at GitHub Pages (apex domain):
-
-   | Type | Name | Value |
-   | --- | --- | --- |
-   | A | `@` | `185.199.108.153` |
-   | A | `@` | `185.199.109.153` |
-   | A | `@` | `185.199.110.153` |
-   | A | `@` | `185.199.111.153` |
-   | AAAA | `@` | `2606:50c0:8000::153` |
-   | AAAA | `@` | `2606:50c0:8001::153` |
-   | AAAA | `@` | `2606:50c0:8002::153` |
-   | AAAA | `@` | `2606:50c0:8003::153` |
-
-   (Optionally add a `CNAME` record for `www` → `sumanyumuku98.github.io`.)
-
-2. Set the custom domain (either **Settings → Pages → Custom domain → `memmux.ai`**, or
-   `gh api --method PUT repos/sumanyumuku98/MemMux/pages -f cname=memmux.ai`).
-
-Once DNS resolves, GitHub issues a TLS certificate and the `sumanyumuku98.github.io` URL
-redirects to `memmux.ai`. Remember to repoint the README badge/link and the repo
-description/website back to `https://memmux.ai` at that point.
+To serve the docs from a custom domain instead of the `/MemMux` project path: point the domain's
+DNS at GitHub Pages, set it under **Settings → Pages → Custom domain**, and in
+`website/astro.config.mjs` set `site` to the domain and `base: '/'` (so the site serves at the
+domain root). Then repoint the README badge/link and the repo description/website accordingly.
 
 ## macOS code-signing & notarization (SUM-26 — pending your Apple credentials)
 
