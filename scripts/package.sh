@@ -11,6 +11,8 @@ bindir="target/${target}/release"
 mkdir -p "$name"
 cp "$bindir/memmux" "$bindir/memmuxd" "$name/"
 cp README.md LICENSE "$name/"
+# Ship the optional service units (launchd + systemd --user).
+cp -R packaging "$name/packaging"
 tar czf "${name}.tar.gz" "$name"
 
 if command -v shasum >/dev/null 2>&1; then

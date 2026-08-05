@@ -1,0 +1,19 @@
+# MemMux daemon as a systemd --user service.
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp memmuxd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now memmuxd
+[Unit]
+Description=MemMux — memory-aware local runtime for parallel AI coding agents
+Documentation=https://github.com/sumanyumuku98/MemMux
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/memmuxd serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
