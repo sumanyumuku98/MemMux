@@ -152,6 +152,10 @@ fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<St
             Ok(page) => model.history_rows = page.lines,
             Err(e) => model.status = format!("history failed: {e}"),
         },
+        Effect::AddWorkspace(path) => match client.add_workspace(&path) {
+            Ok(()) => refresh(client, model),
+            Err(e) => model.status = format!("open folder failed: {e}"),
+        },
         Effect::Attach(id) => return Some(id),
     }
     None
