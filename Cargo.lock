@@ -512,8 +512,12 @@ dependencies = [
  "clap",
  "crossterm",
  "memmux-proto",
+ "memmux-sched",
+ "memmux-store",
+ "memmuxd",
  "ratatui",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

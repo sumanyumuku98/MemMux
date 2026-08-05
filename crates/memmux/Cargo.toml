@@ -19,3 +19,10 @@ serde_json = { workspace = true }
 # ratatui/crossterm 0.28.1 (Aug 2024) verified > 7 days old.
 ratatui = "0.28"
 crossterm = "0.28"
+
+[dev-dependencies]
+# Spin up a real daemon in-process to test daemon reuse (SUM-118).
+memmuxd = { path = "../memmuxd" }
+memmux-store = { workspace = true }
+memmux-sched = { workspace = true }
+tokio = { workspace = true }

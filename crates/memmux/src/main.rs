@@ -43,8 +43,17 @@ fn main() -> anyhow::Result<()> {
         });
     let client = Client::new(root.join("memmux.sock"));
 
+    // Single-command startup (SUM-118): reuse a running daemon, else auto-start one.
+    let autostart =
+        memmux::supervisor::ensure_daemon(&root, &client, &memmux::supervisor::memmuxd_path());
+
     let mut model = Model::default();
     refresh(&client, &mut model);
+    match autostart {
+        Ok(true) => model.status = "started daemon".to_string(),
+        Ok(false) => {} // reused a running daemon; refresh already set the status
+        Err(e) => model.status = format!("daemon auto-start failed: {e}"),
+    }
 
     enable_raw_mode()?;
     let mut out = stdout();
