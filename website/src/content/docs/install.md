@@ -73,17 +73,24 @@ cargo build --release          # requires a stable Rust toolchain (1.82+)
 
 ## First run
 
-```bash
-memmuxd serve &                # daemon; durable state under ~/.memmux (or set MEMMUX_ROOT)
+Just run the UI — it **auto-starts the daemon** if one isn't already running (single command):
 
+```bash
+memmux                         # opens the TUI; starts memmuxd on demand (press ? for keys)
+```
+
+The daemon stores durable state under `~/.memmux` (override with `MEMMUX_ROOT`) and is left
+running in the background after you quit the UI. You can also drive it directly from the CLI:
+
+```bash
 # A task you can try with no agent CLI installed — the generic provider runs any command:
 memmuxd create --title "try it" --repo ~/some/git/repo \
   --provider generic -- sh -c 'for i in $(seq 1 50); do echo tick $i; sleep 1; done'
 memmuxd list                   # copy the task id
 memmuxd start <task-id>
-
-memmux                         # open the terminal UI (press ? for keybindings)
 ```
+
+`memmuxd serve` still runs the daemon in the foreground if you'd rather manage it yourself.
 
 If you have a provider CLI on your `PATH`, swap `--provider generic -- …` for
 `--provider claude-code` (or `codex`, `gemini-cli`, `opencode`).

@@ -128,16 +128,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```bash
 cargo build --workspace
 
-# Run the daemon (durable state under ~/.memmux; override with MEMMUX_ROOT)
-cargo run -p memmuxd -- serve &
+# One command: the TUI auto-starts the daemon if it isn't already running
+# (durable state under ~/.memmux; override with MEMMUX_ROOT). The daemon is left
+# running in the background after you quit the UI.
+cargo run -p memmux
 
-# Create and list tasks over the Unix socket
+# Or drive the daemon directly over the Unix socket:
 cargo run -p memmuxd -- create --title "Refactor auth" --repo ~/src/product --provider claude-code
 cargo run -p memmuxd -- list
 cargo run -p memmuxd -- pressure
-
-# Open the terminal UI
-cargo run -p memmux
 
 # Phase 0 tooling is still here too:
 cargo run -p memmuxd -- snapshot --root 1

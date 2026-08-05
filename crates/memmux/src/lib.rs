@@ -15,3 +15,7 @@ pub mod render;
 
 #[cfg(unix)]
 pub mod client;
+
+/// Daemon auto-start / reuse for single-command startup (SUM-118).
+#[cfg(unix)]
+pub mod supervisor;
