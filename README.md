@@ -87,22 +87,35 @@ cargo fmt   --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-## Try it (Phase 0)
+## Try it
 
 ```bash
-# One-shot process-attribution snapshot against a pid (defaults to self)
-cargo run -p memmuxd -- snapshot --root 1
+cargo build --workspace
 
-# Run the benchmark (raw baseline vs MemMux) and print a report
+# Run the daemon (durable state under ~/.memmux; override with MEMMUX_ROOT)
+cargo run -p memmuxd -- serve &
+
+# Create and list tasks over the Unix socket
+cargo run -p memmuxd -- create --title "Refactor auth" --repo ~/src/product --provider claude-code
+cargo run -p memmuxd -- list
+cargo run -p memmuxd -- pressure
+
+# Open the terminal UI
+cargo run -p memmux
+
+# Phase 0 tooling is still here too:
+cargo run -p memmuxd -- snapshot --root 1
 cargo run -p memmux-bench -- run --scenario all --provider claude-code --out bench-out
 ```
 
-See [`docs/phase-0.md`](./docs/phase-0.md) for what Phase 0 delivers and
-[`docs/benchmark-methodology.md`](./docs/benchmark-methodology.md) for benchmark fairness rules.
+See [`docs/phase-0.md`](./docs/phase-0.md), [`docs/phase-1.md`](./docs/phase-1.md),
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), and [`docs/threat-model.md`](./docs/threat-model.md).
 
 ## Status
 
-🚧 Early development. Phase 0 is under active construction. APIs are unstable.
+🚧 Early development; APIs are unstable. **Phase 0 (instrumentation)** and **Phase 1
+(memory-safe multiplexer)** are complete — daemon, scheduler, bounded capture, worktrees,
+provider adapters, process ownership, and the TUI. Phase 2 (lifecycle runtime) is next.
 
 ## License
 

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MemMux terminal UI client (skeleton; Ratatui TUI lands in Phase 1)."
+description = "MemMux terminal UI: the dense operational dashboard for the daemon (Phase 1)."
 
 [[bin]]
 name = "memmux"
@@ -15,3 +15,7 @@ path = "src/main.rs"
 memmux-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
+# ratatui/crossterm 0.28.1 (Aug 2024) verified > 7 days old.
+ratatui = "0.28"
+crossterm = "0.28"
