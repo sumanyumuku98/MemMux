@@ -30,7 +30,9 @@ pub fn render(f: &mut Frame, model: &Model) {
         View::Tasks => render_tasks(f, chunks[1], model),
         View::Queue => render_queue(f, chunks[1], model),
         View::Timeline => render_timeline(f, chunks[1], model),
+        View::Workspaces => render_workspaces(f, chunks[1], model),
         View::NewTask => render_new_task(f, chunks[1], model),
+        View::OpenFolder => render_open_folder(f, chunks[1], model),
         View::Term => render_term(f, chunks[1], model),
         View::Help => render_help(f, chunks[1]),
     }
@@ -43,6 +45,7 @@ fn render_tabs(f: &mut Frame, area: Rect, model: &Model) {
         ("2", "Tasks", View::Tasks),
         ("3", "Queue", View::Queue),
         ("4", "Timeline", View::Timeline),
+        ("5", "Workspaces", View::Workspaces),
     ];
     let mut spans = vec![Span::styled(
         "MemMux ",
@@ -57,7 +60,7 @@ fn render_tabs(f: &mut Frame, area: Rect, model: &Model) {
         spans.push(Span::styled(format!(" {key}:{label} "), style));
     }
     spans.push(Span::styled(
-        "  n:new  ?:help  q:quit",
+        "  o:open  n:new  ?:help  q:quit",
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -125,26 +128,31 @@ fn render_tasks(f: &mut Frame, area: Rect, model: &Model) {
 }
 
 fn render_task_table(f: &mut Frame, area: Rect, model: &Model, title: &str) {
-    let header = Row::new(["ID", "STATE", "TITLE", "PROVIDER"]).style(
+    let header = Row::new(["WORKSPACE", "STATE", "TITLE", "PROVIDER"]).style(
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
-    let rows: Vec<Row> = model
-        .data
-        .tasks
+    // Render tasks grouped by workspace so agents in the same repo sit together (SUM-124).
+    let mut ordered: Vec<(usize, &memmux_proto::TaskView)> =
+        model.data.tasks.iter().enumerate().collect();
+    ordered.sort_by(|(_, a), (_, b)| {
+        workspace_name(model, &a.repository)
+            .cmp(&workspace_name(model, &b.repository))
+            .then(a.id.cmp(&b.id))
+    });
+    let rows: Vec<Row> = ordered
         .iter()
-        .enumerate()
         .map(|(i, t)| {
             let selected =
-                i == model.selected && matches!(model.view, View::Tasks | View::Dashboard);
+                *i == model.selected && matches!(model.view, View::Tasks | View::Dashboard);
             let style = if selected {
                 Style::default().fg(Color::Black).bg(ACCENT)
             } else {
                 Style::default().fg(state_color(&t.state))
             };
             Row::new([
-                short(&t.id, 18),
+                short(&workspace_name(model, &t.repository), 18),
                 t.state.clone(),
                 short(&t.title, 28),
                 t.provider.clone(),
@@ -180,6 +188,100 @@ fn render_task_table(f: &mut Frame, area: Rect, model: &Model, title: &str) {
         };
         f.render_widget(hint, inner);
     }
+}
+
+/// Human name for a task's repository: the registered workspace name if known, else the short id.
+fn workspace_name(model: &Model, repo_id: &str) -> String {
+    model
+        .data
+        .workspaces
+        .iter()
+        .find(|w| w.id == repo_id)
+        .map(|w| w.name.clone())
+        .unwrap_or_else(|| short(repo_id, 16))
+}
+
+/// Registered workspaces with their task counts (SUM-124).
+fn render_workspaces(f: &mut Frame, area: Rect, model: &Model) {
+    let header = Row::new(["WORKSPACE", "TASKS", "PATH"]).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows: Vec<Row> = model
+        .data
+        .workspaces
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let style = if i == model.selected {
+                Style::default().fg(Color::Black).bg(ACCENT)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Row::new([
+                short(&w.name, 22),
+                w.task_count.to_string(),
+                short(&w.path, 60),
+            ])
+            .style(style)
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(24),
+            Constraint::Length(6),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" WORKSPACES — o:open folder · enter/n:add agent here "),
+    );
+    f.render_widget(table, area);
+
+    if model.data.workspaces.is_empty() {
+        let hint = Paragraph::new("no workspaces — press 'o' to open a folder")
+            .style(Style::default().fg(Color::DarkGray));
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        f.render_widget(hint, inner);
+    }
+}
+
+/// Modal to type a folder path to register as a workspace (SUM-124).
+fn render_open_folder(f: &mut Frame, area: Rect, model: &Model) {
+    let text = vec![
+        Line::from(Span::styled(
+            "Open a folder as a workspace",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("path  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}\u{2588}", model.folder_input)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "enter: open   esc: cancel   (must be a git repository)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" OPEN FOLDER "),
+        ),
+        area,
+    );
 }
 
 fn render_queue(f: &mut Frame, area: Rect, model: &Model) {
@@ -467,6 +569,13 @@ mod tests {
                     ),
                 },
             ],
+            workspaces: vec![memmux_proto::WorkspaceView {
+                id: "repo_1".into(),
+                path: "/src/product".into(),
+                name: "product".into(),
+                created_at_ms: 0,
+                task_count: 1,
+            }],
         });
         m
     }
@@ -492,6 +601,22 @@ mod tests {
         let text = buffer_text(&sample_model(View::Queue));
         assert!(text.contains("QUEUE"));
         assert!(text.contains("waiting: admission"));
+    }
+
+    #[test]
+    fn workspaces_view_lists_workspaces_with_task_counts() {
+        let text = buffer_text(&sample_model(View::Workspaces));
+        assert!(text.contains("WORKSPACES"));
+        assert!(text.contains("product")); // workspace name
+        assert!(text.contains("o:open")); // nav hint
+    }
+
+    #[test]
+    fn tasks_view_shows_workspace_grouping_column() {
+        let text = buffer_text(&sample_model(View::Tasks));
+        assert!(text.contains("WORKSPACE"));
+        // The task's repository resolves to its workspace name, not the raw id.
+        assert!(text.contains("product"));
     }
 
     #[test]

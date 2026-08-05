@@ -2,7 +2,9 @@
 //! `update` that returns the next model plus [`Effect`]s for the runtime to execute. Keeping
 //! `update` free of terminal and socket I/O makes the whole interaction layer unit-testable.
 
-use memmux_proto::{CreateTaskRequest, DaemonInfo, EventView, PressureView, TaskView};
+use memmux_proto::{
+    CreateTaskRequest, DaemonInfo, EventView, PressureView, TaskView, WorkspaceView,
+};
 
 /// Provider slugs offered by the new-task form's picker (SUM-87).
 pub const PROVIDERS: [&str; 5] = ["claude-code", "codex", "gemini-cli", "opencode", "generic"];
@@ -18,8 +20,12 @@ pub enum View {
     Queue,
     /// Resource / event timeline (SUM-89).
     Timeline,
+    /// Registered workspaces, tasks grouped under them (SUM-124).
+    Workspaces,
     /// New-task form with provider picker (SUM-87).
     NewTask,
+    /// Modal to open a folder as a workspace (SUM-124).
+    OpenFolder,
     /// Live terminal view of one task: screen grid + scrollback (SUM-84/85/86).
     Term,
     /// Help / keymap (SUM-89).
@@ -129,6 +135,8 @@ pub struct Data {
     pub daemon: Option<DaemonInfo>,
     /// Recent events (newest last).
     pub events: Vec<EventView>,
+    /// Registered workspaces (SUM-124).
+    pub workspaces: Vec<WorkspaceView>,
 }
 
 /// A side effect for the runtime to perform (I/O the pure `update` cannot do).
@@ -151,6 +159,8 @@ pub enum Effect {
     },
     /// Enter interactive attach passthrough for a task (SUM-86; runtime handles the raw loop).
     Attach(String),
+    /// Register a folder as a workspace (SUM-124).
+    AddWorkspace(String),
 }
 
 /// The full application model.
@@ -174,6 +184,8 @@ pub struct Model {
     pub history_rows: Vec<String>,
     /// Whether the Term view shows scrollback history rather than the live screen.
     pub show_history: bool,
+    /// Text buffer for the open-folder modal (SUM-124).
+    pub folder_input: String,
     /// Status line message.
     pub status: String,
     /// Whether to exit.
@@ -192,6 +204,7 @@ impl Default for Model {
             screen_rows: Vec::new(),
             history_rows: Vec::new(),
             show_history: false,
+            folder_input: String::new(),
             status: "connected".to_string(),
             should_quit: false,
         }
@@ -204,11 +217,20 @@ impl Model {
         self.data.tasks.get(self.selected)
     }
 
-    /// Apply loaded data, clamping the selection.
+    /// The currently selected workspace, if any (Workspaces view).
+    pub fn selected_workspace(&self) -> Option<&WorkspaceView> {
+        self.data.workspaces.get(self.selected)
+    }
+
+    /// Apply loaded data, clamping the selection against the current view's list.
     pub fn set_data(&mut self, data: Data) {
         self.data = data;
-        if self.selected >= self.data.tasks.len() {
-            self.selected = self.data.tasks.len().saturating_sub(1);
+        let len = match self.view {
+            View::Workspaces => self.data.workspaces.len(),
+            _ => self.data.tasks.len(),
+        };
+        if self.selected >= len {
+            self.selected = len.saturating_sub(1);
         }
     }
 }
@@ -218,6 +240,9 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
     // Modal views handle their own keys.
     if model.view == View::NewTask {
         return update_form(model, key);
+    }
+    if model.view == View::OpenFolder {
+        return update_open_folder(model, key);
     }
     if model.view == View::Term {
         return update_term(model, key);
@@ -230,17 +255,34 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
         Key::Char('2') => model.view = View::Tasks,
         Key::Char('3') => model.view = View::Queue,
         Key::Char('4') => model.view = View::Timeline,
+        Key::Char('5') => {
+            model.view = View::Workspaces;
+            model.selected = 0;
+        }
+        // Open a folder as a workspace (SUM-124).
+        Key::Char('o') => {
+            model.folder_input = String::new();
+            model.view = View::OpenFolder;
+        }
         Key::Char('n') => {
-            model.form = NewTaskForm::default();
+            // From the Workspaces view, prefill the repo with the selected workspace so launching
+            // an agent into it needs no manual path ("add agent to this workspace").
+            let mut form = NewTaskForm::default();
+            if model.view == View::Workspaces {
+                if let Some(ws) = model.selected_workspace() {
+                    form.repo = ws.path.clone();
+                }
+            }
+            model.form = form;
             model.view = View::NewTask;
         }
         Key::Char('?') | Key::Char('h') => model.view = View::Help,
         Key::Esc => model.view = View::Dashboard,
         Key::Up | Key::Char('k') => move_selection(model, -1),
         Key::Down | Key::Char('j') => move_selection(model, 1),
-        // Enter opens (and starts) the selected task's terminal view.
-        Key::Enter => {
-            if matches!(model.view, View::Dashboard | View::Tasks) {
+        Key::Enter => match model.view {
+            // Enter opens (and starts) the selected task's terminal view.
+            View::Dashboard | View::Tasks => {
                 if let Some(id) = model.selected_task().map(|t| t.id.clone()) {
                     model.focused_task = Some(id.clone());
                     model.screen_rows.clear();
@@ -250,6 +292,39 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
                     return vec![Effect::StartTask(id.clone()), Effect::LoadScreen(id)];
                 }
             }
+            // Enter on a workspace launches an agent into it (repo prefilled).
+            View::Workspaces => {
+                let mut form = NewTaskForm::default();
+                if let Some(ws) = model.selected_workspace() {
+                    form.repo = ws.path.clone();
+                }
+                model.form = form;
+                model.view = View::NewTask;
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Keys for the open-folder modal (SUM-124).
+fn update_open_folder(model: &mut Model, key: Key) -> Vec<Effect> {
+    match key {
+        Key::Esc => model.view = View::Workspaces,
+        Key::Backspace => {
+            model.folder_input.pop();
+        }
+        Key::Char(c) => model.folder_input.push(c),
+        Key::Enter => {
+            let path = model.folder_input.trim().to_string();
+            if path.is_empty() {
+                model.status = "enter a folder path".to_string();
+                return Vec::new();
+            }
+            model.status = format!("opening {path}");
+            model.view = View::Workspaces;
+            return vec![Effect::AddWorkspace(path), Effect::Refresh];
         }
         _ => {}
     }
@@ -290,7 +365,10 @@ fn move_selection(model: &mut Model, delta: isize) {
             model.scroll = (model.scroll as isize + delta).clamp(0, max as isize) as usize;
         }
         _ => {
-            let len = model.data.tasks.len();
+            let len = match model.view {
+                View::Workspaces => model.data.workspaces.len(),
+                _ => model.data.tasks.len(),
+            };
             if len == 0 {
                 return;
             }
@@ -382,6 +460,49 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    fn workspace(id: &str, path: &str) -> WorkspaceView {
+        WorkspaceView {
+            id: id.into(),
+            path: path.into(),
+            name: id.into(),
+            created_at_ms: 0,
+            task_count: 0,
+        }
+    }
+
+    #[test]
+    fn open_folder_flow_adds_a_workspace() {
+        let mut m = Model::default();
+        update(&mut m, Key::Char('o'));
+        assert_eq!(m.view, View::OpenFolder);
+        for c in "/src/app".chars() {
+            update(&mut m, Key::Char(c));
+        }
+        assert_eq!(m.folder_input, "/src/app");
+        let effects = update(&mut m, Key::Enter);
+        assert!(effects.contains(&Effect::AddWorkspace("/src/app".to_string())));
+        assert!(effects.contains(&Effect::Refresh));
+        assert_eq!(m.view, View::Workspaces);
+    }
+
+    #[test]
+    fn enter_on_workspace_prefills_the_new_task_repo() {
+        let mut m = Model {
+            view: View::Workspaces,
+            ..Model::default()
+        };
+        m.set_data(Data {
+            workspaces: vec![workspace("product", "/src/product")],
+            ..Default::default()
+        });
+        update(&mut m, Key::Enter);
+        assert_eq!(m.view, View::NewTask);
+        assert_eq!(
+            m.form.repo, "/src/product",
+            "repo should default to the workspace path"
+        );
     }
 
     #[test]

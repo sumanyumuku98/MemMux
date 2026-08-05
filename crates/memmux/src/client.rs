@@ -61,7 +61,18 @@ impl Client {
         })? {
             data.events = e;
         }
+        if let Response::Workspaces(w) = self.call(&Request::ListWorkspaces)? {
+            data.workspaces = w;
+        }
         Ok(data)
+    }
+
+    /// Register a folder as a workspace (SUM-124).
+    pub fn add_workspace(&self, path: &str) -> anyhow::Result<()> {
+        self.call(&Request::AddWorkspace {
+            path: path.to_string(),
+        })?;
+        Ok(())
     }
 
     /// Admit and launch a task's provider.
