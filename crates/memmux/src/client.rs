@@ -2,7 +2,7 @@
 
 use crate::app::Data;
 use anyhow::Context;
-use memmux_proto::{Request, Response};
+use memmux_proto::{HistoryPage, Request, Response, ScreenView};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -62,5 +62,35 @@ impl Client {
             data.events = e;
         }
         Ok(data)
+    }
+
+    /// Admit and launch a task's provider.
+    pub fn start(&self, id: &str) -> anyhow::Result<()> {
+        self.call(&Request::StartTask { id: id.to_string() })?;
+        Ok(())
+    }
+
+    /// Fetch the current screen grid for a running task, if any.
+    pub fn get_screen(&self, id: &str) -> anyhow::Result<Option<ScreenView>> {
+        match self.call(&Request::GetScreen { id: id.to_string() })? {
+            Response::Screen(s) => Ok(Some(s)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Page a task's scrollback history.
+    pub fn read_history(&self, id: &str, cursor: u64, limit: u32) -> anyhow::Result<HistoryPage> {
+        match self.call(&Request::ReadHistory {
+            id: id.to_string(),
+            cursor,
+            limit,
+        })? {
+            Response::History(h) => Ok(h),
+            _ => Ok(HistoryPage {
+                lines: Vec::new(),
+                next_cursor: cursor,
+                total: 0,
+            }),
+        }
     }
 }

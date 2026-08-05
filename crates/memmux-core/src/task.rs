@@ -145,6 +145,10 @@ pub struct TaskSpec {
     /// Policy overrides.
     #[serde(default)]
     pub policies: TaskPolicies,
+    /// Explicit command for the generic "run anything" provider; ignored by first-class
+    /// providers, which derive their own command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 impl TaskSpec {
@@ -170,6 +174,7 @@ impl TaskSpec {
             resource_class: ResourceClass::default(),
             tools: ToolProfile::default(),
             policies: TaskPolicies::default(),
+            command: None,
         }
     }
 }

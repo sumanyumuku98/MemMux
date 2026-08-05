@@ -3,43 +3,55 @@
 
 #![cfg(unix)]
 
-use memmux_proto::{CreateTaskRequest, Request, Response};
+use memmux_proto::{AttachClientMsg, AttachServerMsg, CreateTaskRequest, Request, Response};
 use memmux_sched::{ResourceEnvelope, GIB};
 use memmux_store::Store;
 use memmuxd::client::Client;
 use memmuxd::daemon::DaemonState;
 use memmuxd::server;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-fn tmp() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("memmuxd-rt-{}", std::process::id()));
+fn write_frame(s: &mut UnixStream, body: &[u8]) {
+    s.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    s.flush().unwrap();
+}
+
+fn read_frame(s: &mut UnixStream) -> Option<Vec<u8>> {
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    s.read_exact(&mut body).ok()?;
+    Some(body)
+}
+
+fn tmp(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("memmuxd-rt-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
-#[test]
-fn client_round_trips_create_and_list_over_the_socket() {
-    let dir = tmp();
+/// Spawn the server on a background runtime and wait for its socket.
+fn spawn_server(dir: &std::path::Path) -> (Client, std::path::PathBuf) {
     let socket = dir.join("memmux.sock");
     let store = Store::open(dir.join("state.db")).unwrap();
     let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
-    let state = Arc::new(Mutex::new(DaemonState::boot(store, envelope).unwrap()));
-
-    // Run the server on a background current-thread runtime.
+    let state = Arc::new(Mutex::new(
+        DaemonState::boot(store, envelope, dir.to_path_buf()).unwrap(),
+    ));
     let sp = socket.clone();
-    let st = Arc::clone(&state);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let _ = rt.block_on(server::serve(&sp, st));
+        let _ = rt.block_on(server::serve(&sp, state));
     });
-
-    // Wait for the socket to appear.
     for _ in 0..300 {
         if socket.exists() {
             break;
@@ -47,6 +59,13 @@ fn client_round_trips_create_and_list_over_the_socket() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(socket.exists(), "daemon socket never appeared");
+    (Client::new(&socket), socket)
+}
+
+#[test]
+fn client_round_trips_create_and_list_over_the_socket() {
+    let dir = tmp("roundtrip");
+    let (client, socket) = spawn_server(&dir);
 
     // Least-privilege local socket (SUM-78): 0600 socket under a 0700 directory.
     use std::os::unix::fs::PermissionsExt;
@@ -54,8 +73,6 @@ fn client_round_trips_create_and_list_over_the_socket() {
     assert_eq!(sock_mode, 0o600, "socket mode was {sock_mode:o}");
     let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700, "socket dir mode was {dir_mode:o}");
-
-    let client = Client::new(&socket);
 
     // Handshake.
     match client.call(&Request::DaemonInfo).unwrap() {
@@ -72,6 +89,7 @@ fn client_round_trips_create_and_list_over_the_socket() {
             base_branch: "main".into(),
             resource_class: None,
             priority: None,
+            command: None,
         }))
         .unwrap()
     {
@@ -90,5 +108,189 @@ fn client_round_trips_create_and_list_over_the_socket() {
         other => panic!("expected Tasks, got {other:?}"),
     }
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn start_streams_screen_and_pages_history() {
+    let dir = tmp("stream");
+    let (client, _socket) = spawn_server(&dir);
+
+    // A generic task that prints enough lines to overflow the resident ring into history.
+    let created = match client
+        .call(&Request::CreateTask(CreateTaskRequest {
+            title: "streamer".into(),
+            repository_path: "/tmp".into(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                "for i in $(seq 1 6000); do echo line-$i; done; sleep 5".into(),
+            ]),
+        }))
+        .unwrap()
+    {
+        Response::Task(t) => t,
+        other => panic!("expected Task, got {other:?}"),
+    };
+
+    // Launch the provider.
+    match client
+        .call(&Request::StartTask {
+            id: created.id.clone(),
+        })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "ACTIVE"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+
+    // The screen shows recent output.
+    let mut saw_screen = false;
+    for _ in 0..200 {
+        if let Response::Screen(s) = client
+            .call(&Request::GetScreen {
+                id: created.id.clone(),
+            })
+            .unwrap()
+        {
+            if s.rows.iter().any(|r| r.contains("line-")) {
+                saw_screen = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(saw_screen, "screen never showed provider output");
+
+    // Older output overflowed the resident buffer into paged history (SUM-85).
+    let mut history_ok = false;
+    for _ in 0..200 {
+        if let Response::History(h) = client
+            .call(&Request::ReadHistory {
+                id: created.id.clone(),
+                cursor: 0,
+                limit: 20,
+            })
+            .unwrap()
+        {
+            if h.total > 0
+                && h.lines
+                    .first()
+                    .map(|l| l.contains("line-1"))
+                    .unwrap_or(false)
+            {
+                history_ok = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(history_ok, "history never paged the earliest lines");
+
+    // Terminating kills the provider process.
+    match client
+        .call(&Request::TerminateTask {
+            id: created.id.clone(),
+        })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "TERMINATED"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn attach_streams_screen_and_accepts_input() {
+    let dir = tmp("attach");
+    let (client, socket) = spawn_server(&dir);
+
+    // A generic task that echoes its stdin (so we can prove input flows through attach).
+    let created = match client
+        .call(&Request::CreateTask(CreateTaskRequest {
+            title: "cat".into(),
+            repository_path: "/tmp".into(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: Some(vec!["cat".into()]),
+        }))
+        .unwrap()
+    {
+        Response::Task(t) => t,
+        other => panic!("expected Task, got {other:?}"),
+    };
+    match client
+        .call(&Request::StartTask {
+            id: created.id.clone(),
+        })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "ACTIVE"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+
+    // Open a raw connection and enter attach mode.
+    let mut s = UnixStream::connect(&socket).unwrap();
+    write_frame(
+        &mut s,
+        &serde_json::to_vec(&Request::Attach {
+            id: created.id.clone(),
+        })
+        .unwrap(),
+    );
+
+    // Send input; `cat` echoes it back into the screen.
+    write_frame(
+        &mut s,
+        &serde_json::to_vec(&AttachClientMsg::Input {
+            data: b"echo-through-attach\n".to_vec(),
+        })
+        .unwrap(),
+    );
+
+    // Read screen frames until the echoed input shows up.
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut saw = false;
+    for _ in 0..200 {
+        match read_frame(&mut s) {
+            Some(bytes) => {
+                if let Ok(AttachServerMsg::Screen(sv)) =
+                    serde_json::from_slice::<AttachServerMsg>(&bytes)
+                {
+                    if sv.rows.iter().any(|r| r.contains("echo-through-attach")) {
+                        saw = true;
+                        break;
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    assert!(saw, "attach never reflected the injected input");
+
+    // Detach leaves the task running.
+    write_frame(
+        &mut s,
+        &serde_json::to_vec(&AttachClientMsg::Detach).unwrap(),
+    );
+    drop(s);
+    match client
+        .call(&Request::GetTask {
+            id: created.id.clone(),
+        })
+        .unwrap()
+    {
+        Response::Task(t) => assert_eq!(t.state, "ACTIVE", "task should survive detach"),
+        other => panic!("expected Task, got {other:?}"),
+    }
+
+    client.call(&Request::TerminateTask { id: created.id }).ok();
     std::fs::remove_dir_all(&dir).ok();
 }

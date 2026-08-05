@@ -44,6 +44,32 @@ pub enum Request {
         /// Maximum number of events.
         limit: u32,
     },
+    /// Admit and launch a task's provider in a PTY.
+    StartTask {
+        /// Task id.
+        id: String,
+    },
+    /// Fetch the current terminal screen grid for a running task (polled by the TUI term-pane).
+    GetScreen {
+        /// Task id.
+        id: String,
+    },
+    /// Page evicted scrollback history for a task (SUM-85).
+    ReadHistory {
+        /// Task id.
+        id: String,
+        /// Global line index to start from.
+        cursor: u64,
+        /// Maximum lines to return.
+        limit: u32,
+    },
+    /// Enter bidirectional attach mode on this connection (SUM-86). After the daemon accepts,
+    /// the connection carries [`AttachServerMsg`]/[`AttachClientMsg`] frames instead of the
+    /// normal response.
+    Attach {
+        /// Task id.
+        id: String,
+    },
 }
 
 /// Fields needed to create a task (§16.2, trimmed to the Phase-1 surface).
@@ -63,6 +89,9 @@ pub struct CreateTaskRequest {
     /// Optional priority slug (`low`, `normal`, `high`, `urgent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Optional explicit command for the generic "run anything" provider (SUM-70).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 /// A response from the daemon.
@@ -82,11 +111,71 @@ pub enum Response {
     Pressure(PressureView),
     /// A page of events.
     Events(Vec<EventView>),
+    /// The current terminal screen grid for a task.
+    Screen(ScreenView),
+    /// A page of scrollback history.
+    History(HistoryPage),
+    /// Acknowledgement with no payload (e.g. attach accepted; stream frames follow).
+    Ok,
     /// An error with a message.
     Error {
         /// Human-readable error.
         message: String,
     },
+}
+
+/// The current terminal screen grid of a running task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenView {
+    /// Screen rows (text).
+    pub rows: Vec<String>,
+    /// Cursor row.
+    pub cursor_row: u16,
+    /// Cursor column.
+    pub cursor_col: u16,
+    /// Whether the provider process is still running.
+    pub running: bool,
+}
+
+/// A page of scrollback history lines.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryPage {
+    /// The rendered history lines.
+    pub lines: Vec<String>,
+    /// Cursor to pass for the next page.
+    pub next_cursor: u64,
+    /// Total history lines available.
+    pub total: u64,
+}
+
+/// A frame the client sends to the daemon while in attach mode (SUM-86).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttachClientMsg {
+    /// Raw bytes to write to the task's stdin.
+    Input {
+        /// The bytes.
+        data: Vec<u8>,
+    },
+    /// Resize the task's terminal.
+    Resize {
+        /// New rows.
+        rows: u16,
+        /// New columns.
+        cols: u16,
+    },
+    /// Leave attach mode; the task keeps running.
+    Detach,
+}
+
+/// A frame the daemon sends to the client while in attach mode (SUM-86).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttachServerMsg {
+    /// A screen update.
+    Screen(ScreenView),
+    /// The task's process exited.
+    Exited,
 }
 
 /// Daemon and protocol identity.
@@ -193,6 +282,7 @@ mod tests {
             base_branch: "main".into(),
             resource_class: Some("standard".into()),
             priority: None,
+            command: None,
         });
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(Request::from_json(&json).unwrap(), req);

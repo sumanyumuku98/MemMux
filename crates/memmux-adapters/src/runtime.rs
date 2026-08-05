@@ -5,7 +5,7 @@
 
 use crate::adapter::{EventWindow, LaunchSpec, ProviderAdapter};
 use memmux_core::{Provider, TaskState};
-use memmux_pty::{CaptureBuffer, CaptureConfig, PtySession, Screen};
+use memmux_pty::{CaptureBuffer, CaptureConfig, PtySession, Screen, StoredLine};
 
 /// A launched provider session under MemMux management.
 pub struct RuntimeInstance {
@@ -91,6 +91,24 @@ impl RuntimeInstance {
     /// The current screen rows (what the TUI term-pane renders).
     pub fn screen_rows(&self) -> Vec<String> {
         self.screen.rows()
+    }
+
+    /// The current cursor position `(row, col)`.
+    pub fn cursor(&self) -> (u16, u16) {
+        self.screen.cursor()
+    }
+
+    /// Take lines evicted from the resident buffer (the daemon persists these to the history
+    /// chunk store so scrollback can be paged back).
+    pub fn take_evicted(&mut self) -> Vec<StoredLine> {
+        self.capture.drain_evicted()
+    }
+
+    /// Resize the terminal (session + screen grid).
+    pub fn resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()> {
+        self.session.resize(rows, cols)?;
+        self.screen.resize(rows, cols);
+        Ok(())
     }
 
     /// Resident bytes of the capture buffer (bounded).
