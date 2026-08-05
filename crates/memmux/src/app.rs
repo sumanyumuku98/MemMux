@@ -103,9 +103,10 @@ impl NewTaskForm {
         PROVIDERS[self.provider_idx.min(PROVIDERS.len() - 1)]
     }
 
-    /// Build a create request if the form is complete enough.
+    /// Build a create request if the form is complete enough. Title is optional (SUM-119): a
+    /// blank title is sent as empty and the daemon auto-derives one; only the repo is required.
     pub fn to_request(&self) -> Option<CreateTaskRequest> {
-        if self.title.trim().is_empty() || self.repo.trim().is_empty() {
+        if self.repo.trim().is_empty() {
             return None;
         }
         Some(CreateTaskRequest {
@@ -186,6 +187,9 @@ pub struct Model {
     pub show_history: bool,
     /// Text buffer for the open-folder modal (SUM-124).
     pub folder_input: String,
+    /// The git root of the directory `memmux` was launched from, if any — the default repo for
+    /// the new-task form (SUM-119). Set by the runtime; `update` only reads it.
+    pub cwd_repo: Option<String>,
     /// Status line message.
     pub status: String,
     /// Whether to exit.
@@ -205,6 +209,7 @@ impl Default for Model {
             history_rows: Vec::new(),
             show_history: false,
             folder_input: String::new(),
+            cwd_repo: None,
             status: "connected".to_string(),
             should_quit: false,
         }
@@ -265,15 +270,10 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
             model.view = View::OpenFolder;
         }
         Key::Char('n') => {
-            // From the Workspaces view, prefill the repo with the selected workspace so launching
-            // an agent into it needs no manual path ("add agent to this workspace").
-            let mut form = NewTaskForm::default();
-            if model.view == View::Workspaces {
-                if let Some(ws) = model.selected_workspace() {
-                    form.repo = ws.path.clone();
-                }
-            }
-            model.form = form;
+            model.form = NewTaskForm {
+                repo: default_repo(model),
+                ..NewTaskForm::default()
+            };
             model.view = View::NewTask;
         }
         Key::Char('?') | Key::Char('h') => model.view = View::Help,
@@ -294,11 +294,10 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
             }
             // Enter on a workspace launches an agent into it (repo prefilled).
             View::Workspaces => {
-                let mut form = NewTaskForm::default();
-                if let Some(ws) = model.selected_workspace() {
-                    form.repo = ws.path.clone();
-                }
-                model.form = form;
+                model.form = NewTaskForm {
+                    repo: default_repo(model),
+                    ..NewTaskForm::default()
+                };
                 model.view = View::NewTask;
             }
             _ => {}
@@ -306,6 +305,17 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
         _ => {}
     }
     Vec::new()
+}
+
+/// The default repo path for a new task (SUM-119): the selected workspace when in the Workspaces
+/// view, else the launch directory's git root.
+fn default_repo(model: &Model) -> String {
+    if model.view == View::Workspaces {
+        if let Some(ws) = model.selected_workspace() {
+            return ws.path.clone();
+        }
+    }
+    model.cwd_repo.clone().unwrap_or_default()
 }
 
 /// Keys for the open-folder modal (SUM-124).
@@ -411,7 +421,7 @@ fn update_form(model: &mut Model, key: Key) -> Vec<Effect> {
                 model.view = View::Tasks;
                 return vec![Effect::CreateTask(req), Effect::Refresh];
             }
-            model.status = "title and repo are required".to_string();
+            model.status = "a repository is required".to_string();
         }
         _ => {}
     }
@@ -485,6 +495,31 @@ mod tests {
         assert!(effects.contains(&Effect::AddWorkspace("/src/app".to_string())));
         assert!(effects.contains(&Effect::Refresh));
         assert_eq!(m.view, View::Workspaces);
+    }
+
+    #[test]
+    fn new_task_needs_only_a_repo_title_optional() {
+        // Repo present, title blank -> valid (daemon auto-derives the title).
+        let form = NewTaskForm {
+            repo: "/src/app".into(),
+            ..NewTaskForm::default()
+        };
+        let req = form.to_request().expect("repo alone is enough");
+        assert!(req.title.is_empty());
+        assert_eq!(req.repository_path, "/src/app");
+        // No repo -> invalid.
+        assert!(NewTaskForm::default().to_request().is_none());
+    }
+
+    #[test]
+    fn n_prefills_repo_from_cwd() {
+        let mut m = Model {
+            cwd_repo: Some("/home/me/proj".into()),
+            ..Model::default()
+        };
+        update(&mut m, Key::Char('n'));
+        assert_eq!(m.view, View::NewTask);
+        assert_eq!(m.form.repo, "/home/me/proj");
     }
 
     #[test]

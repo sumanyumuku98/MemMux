@@ -31,12 +31,12 @@ enum Command {
     Info,
     /// Create a task over the socket.
     Create {
-        /// Task title / intent.
+        /// Task title / intent (optional; auto-derived from provider + repo when omitted).
         #[arg(long)]
-        title: String,
-        /// Repository path.
+        title: Option<String>,
+        /// Repository path (optional; defaults to the current directory's git root).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         /// Provider slug.
         #[arg(long, default_value = "claude-code")]
         provider: String,
@@ -138,9 +138,14 @@ fn main() -> anyhow::Result<()> {
             base,
             cmd,
         } => {
+            let repository_path = match repo {
+                Some(r) => r,
+                None => cwd_git_root()
+                    .context("not in a git repository — run inside a repo or pass --repo <path>")?,
+            };
             let req = Request::CreateTask(CreateTaskRequest {
-                title,
-                repository_path: repo,
+                title: title.unwrap_or_default(), // empty => daemon auto-derives (SUM-119)
+                repository_path,
                 provider,
                 base_branch: base,
                 resource_class: None,
@@ -301,6 +306,15 @@ fn print_response(resp: Response) {
         Response::Ok => println!("ok"),
         Response::Error { message } => eprintln!("error: {message}"),
     }
+}
+
+/// The git repository root containing the current directory, if any (SUM-119).
+fn cwd_git_root() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    memmux_worktree::gitcmd::git_ok(&cwd, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn default_root() -> PathBuf {

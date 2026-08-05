@@ -137,12 +137,18 @@ impl DaemonState {
         self.seq += 1;
         let task_id = format!("task_{now:x}{:04x}", self.seq & 0xffff);
         let repo_id = repo_id_for(&req.repository_path);
+        // Title is optional (SUM-119): auto-derive one from the provider + repo when blank.
+        let title = if req.title.trim().is_empty() {
+            auto_title(provider, &req.repository_path)
+        } else {
+            req.title.trim().to_string()
+        };
 
         let mut spec = TaskSpec::new(
             task_id.as_str(),
             repo_id.as_str(),
             req.repository_path.as_str(),
-            req.title.as_str(),
+            title.as_str(),
             provider,
             req.base_branch.as_str(),
         );
@@ -1119,6 +1125,16 @@ fn repo_id_for(path: &str) -> String {
     format!("repo_{}", short_hash(path))
 }
 
+/// A human default title when none is given (SUM-119): `<provider> · <repo basename>`.
+fn auto_title(provider: Provider, repo_path: &str) -> String {
+    let base = std::path::Path::new(repo_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("repo");
+    format!("{} · {}", provider.slug(), base)
+}
+
 /// The git repository root containing `path`, or `None` if it isn't inside a git repo.
 fn git_toplevel(path: &std::path::Path) -> Option<String> {
     memmux_worktree::gitcmd::git_ok(path, &["rev-parse", "--show-toplevel"])
@@ -1207,6 +1223,26 @@ mod tests {
             Response::Task(t) => assert_eq!(t.id, created.id),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn blank_title_is_auto_derived() {
+        let mut s = state();
+        let v = match s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "   ".into(), // blank
+            repository_path: "/src/product".into(),
+            provider: "codex".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: None,
+        })) {
+            Response::Task(v) => v,
+            other => panic!("expected Task, got {other:?}"),
+        };
+        // Auto-derived title from provider + repo basename (SUM-119).
+        assert!(!v.title.trim().is_empty());
+        assert!(v.title.contains("product"), "got title: {}", v.title);
     }
 
     #[test]

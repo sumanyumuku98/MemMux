@@ -47,7 +47,11 @@ fn main() -> anyhow::Result<()> {
     let autostart =
         memmux::supervisor::ensure_daemon(&root, &client, &memmux::supervisor::memmuxd_path());
 
-    let mut model = Model::default();
+    // Default the new-task repo to the launch directory's git root (SUM-119).
+    let mut model = Model {
+        cwd_repo: cwd_git_root(),
+        ..Model::default()
+    };
     refresh(&client, &mut model);
     match autostart {
         Ok(true) => model.status = "started daemon".to_string(),
@@ -114,6 +118,19 @@ fn run<B: ratatui::backend::Backend>(
         }
     }
     Ok(())
+}
+
+/// The git root of the current directory, if any (default repo for new tasks — SUM-119).
+fn cwd_git_root() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!root.is_empty()).then_some(root)
 }
 
 fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
