@@ -8,7 +8,7 @@
   [![CI](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml/badge.svg)](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml)
   [![Docs](https://github.com/sumanyumuku98/MemMux/actions/workflows/docs.yml/badge.svg)](https://sumanyumuku98.github.io/MemMux/)
 
-  **📖 Full documentation: [sumanyumuku98.github.io/MemMux](https://sumanyumuku98.github.io/MemMux/)** (custom domain `memmux.ai` planned)
+  **📖 Full documentation: [sumanyumuku98.github.io/MemMux](https://sumanyumuku98.github.io/MemMux/)**
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 </div>
 
@@ -79,7 +79,8 @@ MemMux is built in seven phases (tracked in Linear, mirrored here):
 | 5 — Ecosystem | VS Code bridge, SDK, policy hierarchy, desktop shell | Third party adds a provider without daemon changes |
 | 6 — Distributed extension | Optional remote workers, resource placement | Local product proven, protocol stable |
 
-See [`docs/`](./docs) for per-phase design notes and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+See the [documentation site](https://sumanyumuku98.github.io/MemMux/) for per-phase design notes
+and the [architecture overview](https://sumanyumuku98.github.io/MemMux/design/architecture/).
 
 ## Building
 
@@ -112,8 +113,10 @@ cargo run -p memmuxd -- snapshot --root 1
 cargo run -p memmux-bench -- run --scenario all --provider claude-code --out bench-out
 ```
 
-See [`docs/phase-0.md`](./docs/phase-0.md), [`docs/phase-1.md`](./docs/phase-1.md),
-[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md), and [`docs/threat-model.md`](./docs/threat-model.md).
+See the docs site: [Phase 0](https://sumanyumuku98.github.io/MemMux/phases/phase-0/),
+[Phase 1](https://sumanyumuku98.github.io/MemMux/phases/phase-1/),
+[Architecture](https://sumanyumuku98.github.io/MemMux/design/architecture/), and
+[Threat model](https://sumanyumuku98.github.io/MemMux/design/threat-model/).
 
 ## Status
 
@@ -122,7 +125,8 @@ attribution (Phase 0); the memory-safe multiplexer — daemon, scheduler, bounde
 worktrees, provider adapters, process ownership, and the TUI (Phase 1); and the lifecycle
 runtime — checkpoint/hibernate, native + reconstructed resume, RSS-threshold recycling with a
 reclaimed-bytes ledger, and Gemini CLI + OpenCode adapters (Phase 2, see
-[`docs/phase-2.md`](./docs/phase-2.md)). Phase 3 (active optimization) is next.
+[the Phase 2 notes](https://sumanyumuku98.github.io/MemMux/phases/phase-2/)). Phase 3 (active
+optimization) is next.
 
 ## License
 

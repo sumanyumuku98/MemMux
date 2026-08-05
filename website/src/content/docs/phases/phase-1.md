@@ -1,4 +1,8 @@
-# Phase 1 — Memory-safe multiplexer
+---
+title: "Phase 1 — Memory-safe multiplexer"
+description: "Daemon, scheduler, worktrees, provider adapters, and the TUI."
+---
+
 
 **Goal (§20.1):** TUI, tasks, Git worktrees, process groups, global budget, queue, cleanup.
 **Exit criterion:** three active worktrees without uncontrolled daemon/log growth.
@@ -48,7 +52,7 @@ build environment (and vendoring it would add a fragile C toolchain step to CI),
 is a **versioned, length-prefixed JSON protocol** over the UDS, defined in `memmux-proto`. It
 serves the same §16.1 intent (typed local API, least-privilege socket, CLI round-trips) and is
 swappable to gRPC later without changing call sites (aligns with the Phase-6 wire-protocol
-story). See `docs/threat-model.md` for the security posture.
+story). See the [threat model](../../design/threat-model/) for the security posture.
 
 ## Deferred within Phase 1
 

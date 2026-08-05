@@ -1,4 +1,8 @@
-# Benchmark methodology & fairness
+---
+title: "Benchmark methodology"
+description: "How MemMux measures itself fairly against other agent multiplexers."
+---
+
 
 This document governs how the `memmux-bench` harness measures MemMux and its alternatives, and
 the claims discipline it follows (§18, §19.5 of the MemMux V2 specification). It exists so that

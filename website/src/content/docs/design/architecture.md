@@ -1,4 +1,8 @@
-# MemMux architecture
+---
+title: "Architecture"
+description: "The MemMux crate map and how the daemon, TUI, scheduler, PTY capture, worktrees, adapters, and lifecycle fit together."
+---
+
 
 This document tracks the implemented architecture as it grows phase by phase. It is derived
 from the MemMux V2 technical specification; section numbers below reference that spec.

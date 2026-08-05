@@ -1,4 +1,8 @@
-# Phase 0 — Instrumentation prototype
+---
+title: "Phase 0 — Instrumentation prototype"
+description: "Process accounting, attribution, bounded capture, and the benchmark harness."
+---
+
 
 **Goal (§20.1):** wrap agents, collect descendant-process and memory data, bounded terminal
 capture. **Exit criterion:** accurate process attribution on macOS and Linux for two providers.
@@ -54,8 +58,8 @@ Competitor launchers are opt-in and only run if installed:
 cargo run -p memmux-bench -- run --include-competitors --scenario soak
 ```
 
-See [benchmark-methodology.md](./benchmark-methodology.md) for the fairness rules and
-[ARCHITECTURE.md](./ARCHITECTURE.md) for the crate map.
+See [benchmark methodology](../../design/benchmark-methodology/) for the fairness rules and
+[architecture](../../design/architecture/) for the crate map.
 
 ## Gate status (Phase 0 smoke run)
 

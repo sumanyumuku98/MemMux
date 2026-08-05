@@ -1,4 +1,8 @@
-# MemMux threat model & security checklist
+---
+title: "Threat model"
+description: "The security boundaries MemMux enforces."
+---
+
 
 This documents the process-ownership, isolation, and security posture of MemMux (§14 of the
 V2 specification, SUM-20). It is a living document: each row notes the current state of the
