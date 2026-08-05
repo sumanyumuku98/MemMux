@@ -5,7 +5,7 @@
 //! The capture pipeline guarantees the product's central memory property: resident memory is a
 //! function of the configured caps, never of how much output has scrolled past.
 //!
-//! * [`line`] — the compact stored-line representation.
+//! * [`mod@line`] — the compact stored-line representation.
 //! * [`ring`] — bounded ring buffer with line + byte caps and repeated-line collapse
 //!   (SUM-50, SUM-53).
 //! * [`truncate`] — giant-line truncation to a disk artifact (SUM-54).
