@@ -1,20 +1,32 @@
 //! Daemon state: durable-store-backed task registry, request handlers, crash recovery, and the
 //! explainable-audit trail (SUM-66, SUM-67 wiring; serves the SUM-63 API).
 
-use memmux_adapters::{adapter_for, LaunchSpec, RuntimeInstance};
+use memmux_adapters::capabilities::ResumeFidelity;
+use memmux_adapters::{adapter_for, CapabilityGrant, LaunchSpec, ProviderAdapter, RuntimeInstance};
 use memmux_core::{Priority, Provider, ResourceClass, Task, TaskSpec, TaskState};
+use memmux_lifecycle::{
+    assess, ActivitySnapshot, Checkpoint, Reclamation, RecyclePolicy, RecycleRecord, ResumeMode,
+    ResumeOutcome, SafePoint,
+};
 use memmux_proto::{
     CreateTaskRequest, DaemonInfo, EventView, HistoryPage, PressureView, Request, Response,
     ScreenView, TaskView, PROTOCOL_VERSION,
 };
 use memmux_pty::ChunkStore;
 use memmux_sched::{class_reservation, pressure::PressureStage, ResourceEnvelope};
-use memmux_store::{Decision, EventInput, Store};
+use memmux_store::{CheckpointRef, Decision, EventInput, Store};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Lines per history chunk file.
 const HISTORY_CHUNK_LINES: usize = 500;
+
+/// How often the pump checks running providers against their RSS recycle threshold (SUM-94).
+const RECYCLE_CHECK_INTERVAL_MS: u64 = 5_000;
+
+/// Grace period for verifying a provider's process subtree is gone during recycle (SUM-95).
+const TREE_VERIFY_GRACE: Duration = Duration::from_millis(300);
 
 /// The authoritative in-memory + durable daemon state.
 pub struct DaemonState {
@@ -26,6 +38,8 @@ pub struct DaemonState {
     runtimes: HashMap<String, RuntimeInstance>,
     /// Per-task scrollback history (evicted capture lines).
     histories: HashMap<String, ChunkStore>,
+    /// Last time the pump checked running providers against their recycle threshold.
+    last_recycle_check_ms: u64,
     seq: u64,
 }
 
@@ -44,6 +58,7 @@ impl DaemonState {
             root,
             runtimes: HashMap::new(),
             histories: HashMap::new(),
+            last_recycle_check_ms: 0,
             seq: 0,
         };
         state.audit(
@@ -78,6 +93,9 @@ impl DaemonState {
             },
             Request::ListTasks => Response::Tasks(self.tasks.values().map(view).collect()),
             Request::TerminateTask { id } => self.terminate(&id),
+            Request::HibernateTask { id } => self.hibernate(&id),
+            Request::ResumeTask { id } => self.resume(&id),
+            Request::RecycleTask { id } => self.recycle(&id),
             Request::SystemPressure => self.pressure(),
             Request::ReadEvents { after_seq, limit } => self.read_events(after_seq, limit),
             Request::StartTask { id } => self.start_task(&id),
@@ -270,9 +288,7 @@ impl DaemonState {
             };
         }
 
-        let adapter = adapter_for(task.spec.provider);
-        let mut spec = LaunchSpec::in_dir(&task.spec.repository_path);
-        spec.command = task.spec.command.clone();
+        let (adapter, spec) = launch_spec_for(task);
 
         for (to, reason) in [
             (TaskState::Admitting, "admitted: fits budget"),
@@ -290,11 +306,7 @@ impl DaemonState {
                 }
                 let _ = self.store.upsert_task(task);
                 let v = view(task);
-                self.runtimes.insert(id.to_string(), runtime);
-                let hist_dir = self.root.join("tasks").join(id).join("history");
-                if let Ok(store) = ChunkStore::new(&hist_dir, HISTORY_CHUNK_LINES) {
-                    self.histories.insert(id.to_string(), store);
-                }
+                self.install_runtime(id, runtime);
                 self.event(Some(id), "lifecycle", "started", "info", "daemon");
                 self.audit(Some(id), "started", "provider launched in a PTY", None);
                 Response::Task(v)
@@ -315,6 +327,423 @@ impl DaemonState {
                 }
             }
         }
+    }
+
+    /// Install a live runtime and ensure its history store exists (reused across resume so the
+    /// transcript cursor stays continuous).
+    fn install_runtime(&mut self, id: &str, rt: RuntimeInstance) {
+        self.runtimes.insert(id.to_string(), rt);
+        if !self.histories.contains_key(id) {
+            let hist_dir = self.root.join("tasks").join(id).join("history");
+            if let Ok(store) = ChunkStore::new(&hist_dir, HISTORY_CHUNK_LINES) {
+                self.histories.insert(id.to_string(), store);
+            }
+        }
+    }
+
+    /// Stop a task's live provider, flushing its scrollback and (best-effort) verifying its whole
+    /// process subtree is gone (SUM-95). Returns a human-readable cleanup note.
+    fn shutdown_runtime(&mut self, id: &str) -> String {
+        let Some(mut rt) = self.runtimes.remove(id) else {
+            return "no live provider".into();
+        };
+        let pid = rt.pid();
+        let _ = rt.stop();
+        if let Some(hist) = self.histories.get_mut(id) {
+            let _ = hist.append(rt.take_evicted());
+            let _ = hist.flush();
+        }
+        match pid {
+            Some(pid) => verify_subtree_gone(pid).1,
+            None => "no pid to verify".into(),
+        }
+    }
+
+    /// The activity snapshot used for safe-point detection. Sub-state comes from the task's last
+    /// classified state; the daemon is conservative (no continuous mid-write signal, so `writing`
+    /// is false and `assess` relies on the state machine).
+    fn activity(&self, task: &Task) -> ActivitySnapshot {
+        ActivitySnapshot {
+            sub_state: task.state,
+            tool_running: task.state == TaskState::ToolRunning,
+            writing: false,
+        }
+    }
+
+    /// Capture a checkpoint of a live task (§13.1 / SUM-90): repo state, transcript cursor, RSS
+    /// baseline, and the provider's declared secret references.
+    fn capture_checkpoint(&self, id: &str, task: &Task, now: u64) -> Checkpoint {
+        let repo = std::path::Path::new(&task.spec.repository_path);
+        let git_head = git_head(repo).unwrap_or_default();
+        let git_patch_hash = git_patch_hash(repo);
+        let cursor = self.histories.get(id).map(|h| h.total_lines()).unwrap_or(0);
+        let rss = self
+            .runtimes
+            .get(id)
+            .and_then(|rt| rt.pid())
+            .map(sample_subtree_rss)
+            .unwrap_or(0);
+        let secret_refs = adapter_for(task.spec.provider).secret_refs();
+        // Session-ref capture is provider-specific (a claude session id, etc.) and lands with
+        // deeper per-provider integration; until then we checkpoint without one, so resume uses
+        // the reconstructed path rather than claiming a native resume we can't yet drive.
+        Checkpoint::new(
+            id,
+            git_head,
+            git_patch_hash,
+            cursor,
+            None,
+            rss,
+            secret_refs,
+            now,
+        )
+    }
+
+    /// Persist a checkpoint as a disk artifact plus a durable reference in the store (SUM-90).
+    fn persist_checkpoint(&self, cp: &Checkpoint) -> anyhow::Result<()> {
+        let dir = self.root.join("tasks").join(&cp.task_id);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("checkpoint.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(cp)?)?;
+        self.store.save_checkpoint_ref(&CheckpointRef {
+            task_id: cp.task_id.clone(),
+            created_at_ms: cp.created_at_ms,
+            artifact_path: path.display().to_string(),
+            integrity: cp.integrity.clone(),
+        })?;
+        Ok(())
+    }
+
+    /// Load and integrity-check a task's checkpoint before a resume (SUM-90 acceptance).
+    fn load_checkpoint(&self, id: &str) -> anyhow::Result<Checkpoint> {
+        let cref = self
+            .store
+            .load_checkpoint_ref(id)?
+            .ok_or_else(|| anyhow::anyhow!("no checkpoint recorded for {id}"))?;
+        let bytes = std::fs::read(&cref.artifact_path)?;
+        let cp: Checkpoint = serde_json::from_slice(&bytes)?;
+        if !cp.verify() || cp.integrity != cref.integrity {
+            anyhow::bail!("checkpoint integrity check failed for {id}");
+        }
+        Ok(cp)
+    }
+
+    /// Freeze an idle task to a checkpoint and stop its provider (§13 / SUM-90..92).
+    fn hibernate(&mut self, id: &str) -> Response {
+        let now = now_ms();
+        if !self.runtimes.contains_key(id) {
+            return Response::Error {
+                message: format!("task {id} has no live provider to hibernate"),
+            };
+        }
+        let Some(task) = self.tasks.get(id) else {
+            return Response::Error {
+                message: format!("no such task: {id}"),
+            };
+        };
+        // Conservative safe-point gate — never force a freeze mid-tool-call (SUM-91).
+        if let SafePoint::Wait(reason) = assess(&self.activity(task)) {
+            self.audit(Some(id), "hibernate_deferred", &reason, None);
+            return Response::Error {
+                message: format!("not at a safe point: {reason}"),
+            };
+        }
+
+        let task = task.clone();
+        let cp = self.capture_checkpoint(id, &task, now);
+        if let Err(e) = self.persist_checkpoint(&cp) {
+            return Response::Error {
+                message: format!("checkpoint failed: {e}"),
+            };
+        }
+        let cleanup = self.shutdown_runtime(id);
+
+        let task = self.tasks.get_mut(id).expect("checked above");
+        for (to, reason) in [
+            (TaskState::Checkpointing, "capturing checkpoint"),
+            (TaskState::Hibernated, "provider stopped; task frozen"),
+        ] {
+            if let Ok(t) = task.transition(to, reason, now) {
+                let _ = self.store.record_transition(id, &t);
+            }
+        }
+        let _ = self.store.upsert_task(task);
+        let v = view(task);
+        self.event(Some(id), "lifecycle", "hibernated", "info", "daemon");
+        self.audit(
+            Some(id),
+            "hibernated",
+            &format!("checkpoint {} captured; {cleanup}", cp.git_patch_hash),
+            Some(
+                serde_json::json!({
+                    "git_head": cp.git_head,
+                    "git_patch_hash": cp.git_patch_hash,
+                    "transcript_cursor": cp.transcript_cursor,
+                    "rss_baseline_bytes": cp.resource_baseline_bytes,
+                })
+                .to_string(),
+            ),
+        );
+        Response::Task(v)
+    }
+
+    /// Restore a hibernated task from its checkpoint (SUM-92 native / SUM-93 reconstructed).
+    fn resume(&mut self, id: &str) -> Response {
+        let now = now_ms();
+        let Some(task) = self.tasks.get(id) else {
+            return Response::Error {
+                message: format!("no such task: {id}"),
+            };
+        };
+        if task.state != TaskState::Hibernated {
+            return Response::Error {
+                message: format!("task {id} is not hibernated (state {})", task.state),
+            };
+        }
+        let cp = match self.load_checkpoint(id) {
+            Ok(cp) => cp,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("cannot resume {id}: {e}"),
+                }
+            }
+        };
+        let task = task.clone();
+        let outcome = match self.relaunch_from_checkpoint(id, &task, &cp, now) {
+            Ok(o) => o,
+            Err(e) => {
+                // Resume failed entirely: leave the task hibernated with its checkpoint intact so
+                // no work is lost, and report the failure (SUM-93 reconstructed-fallback exhausted).
+                self.audit(
+                    Some(id),
+                    "resume_failed",
+                    &format!("resume failed, checkpoint retained: {e}"),
+                    None,
+                );
+                return Response::Error {
+                    message: format!("resume failed (task remains hibernated): {e}"),
+                };
+            }
+        };
+
+        let task = self.tasks.get_mut(id).expect("checked above");
+        for (to, reason) in [
+            (TaskState::Resuming, "restoring from checkpoint"),
+            (TaskState::Active, "provider resumed"),
+        ] {
+            if let Ok(t) = task.transition(to, reason, now) {
+                let _ = self.store.record_transition(id, &t);
+            }
+        }
+        let _ = self.store.upsert_task(task);
+        let v = view(task);
+        // The checkpoint has been consumed; the task is live again.
+        let _ = self.store.delete_checkpoint_ref(id);
+        self.emit_resume_event(id, &outcome);
+        Response::Task(v)
+    }
+
+    /// Recycle a running provider: checkpoint, restart at a safe point, resume, and ledger the
+    /// reclaimed memory (§8.7 / SUM-94..97).
+    fn recycle(&mut self, id: &str) -> Response {
+        let now = now_ms();
+        if !self.runtimes.contains_key(id) {
+            return Response::Error {
+                message: format!("task {id} has no live provider to recycle"),
+            };
+        }
+        let Some(task) = self.tasks.get(id) else {
+            return Response::Error {
+                message: format!("no such task: {id}"),
+            };
+        };
+        if let SafePoint::Wait(reason) = assess(&self.activity(task)) {
+            self.audit(Some(id), "recycle_deferred", &reason, None);
+            return Response::Error {
+                message: format!("not at a safe point: {reason}"),
+            };
+        }
+        let task = task.clone();
+        let rss_before = self
+            .runtimes
+            .get(id)
+            .and_then(|rt| rt.pid())
+            .map(sample_subtree_rss)
+            .unwrap_or(0);
+
+        let cp = self.capture_checkpoint(id, &task, now);
+        if let Err(e) = self.persist_checkpoint(&cp) {
+            return Response::Error {
+                message: format!("recycle checkpoint failed: {e}"),
+            };
+        }
+        let cleanup = self.shutdown_runtime(id);
+
+        // Active -> Recycling while the provider is down.
+        if let Some(t) = self.tasks.get_mut(id) {
+            if let Ok(tr) = t.transition(TaskState::Recycling, "recycling provider", now) {
+                let _ = self.store.record_transition(id, &tr);
+            }
+            let _ = self.store.upsert_task(t);
+        }
+
+        let outcome = match self.relaunch_from_checkpoint(id, &task, &cp, now) {
+            Ok(o) => o,
+            Err(e) => {
+                // Rollback: resume failed, so fail the task but retain the checkpoint (no lost
+                // work — the user can resume later) — SUM-96.
+                if let Some(t) = self.tasks.get_mut(id) {
+                    if let Ok(tr) = t.transition(TaskState::Failed, "recycle resume failed", now) {
+                        let _ = self.store.record_transition(id, &tr);
+                    }
+                    let _ = self.store.upsert_task(t);
+                }
+                self.audit(
+                    Some(id),
+                    "recycle_rolled_back",
+                    &format!("resume after recycle failed, checkpoint retained: {e}"),
+                    None,
+                );
+                return Response::Error {
+                    message: format!("recycle failed, checkpoint retained: {e}"),
+                };
+            }
+        };
+        let rss_after = self
+            .runtimes
+            .get(id)
+            .and_then(|rt| rt.pid())
+            .map(sample_subtree_rss)
+            .unwrap_or(0);
+
+        // Recycling -> (Resuming) -> Active.
+        let task_ref = self.tasks.get_mut(id).expect("checked above");
+        for (to, reason) in [
+            (TaskState::Resuming, "restoring from checkpoint"),
+            (TaskState::Active, "provider recycled"),
+        ] {
+            if let Ok(t) = task_ref.transition(to, reason, now) {
+                let _ = self.store.record_transition(id, &t);
+            }
+        }
+        let _ = self.store.upsert_task(task_ref);
+        let v = view(task_ref);
+        let _ = self.store.delete_checkpoint_ref(id);
+
+        // Ledger the recycle (Appendix B `runtime_recycled` shape — SUM-97).
+        let reclamation = Reclamation {
+            rss_before,
+            rss_after,
+        };
+        let record = RecycleRecord::new(
+            reclamation,
+            outcome.mode,
+            outcome.latency_ms,
+            cp.git_patch_hash.clone(),
+        );
+        let payload = serde_json::to_string(&record).ok();
+        let _ = self.store.append_event(&EventInput {
+            task_id: Some(id.to_string()),
+            ts_ms: now_ms(),
+            category: "lifecycle".to_string(),
+            event_type: "runtime_recycled".to_string(),
+            severity: "info".to_string(),
+            source: "daemon".to_string(),
+            payload_json: payload,
+        });
+        self.audit(
+            Some(id),
+            "recycled",
+            &format!(
+                "{}; resume {}; {cleanup}",
+                reclamation.summary(),
+                outcome.mode.label()
+            ),
+            serde_json::to_string(&record).ok(),
+        );
+        Response::Task(v)
+    }
+
+    /// Relaunch a task from its checkpoint, choosing native resume vs a reconstructed session and
+    /// validating the result. Installs the new runtime on success.
+    fn relaunch_from_checkpoint(
+        &mut self,
+        id: &str,
+        task: &Task,
+        cp: &Checkpoint,
+        now: u64,
+    ) -> anyhow::Result<ResumeOutcome> {
+        let (adapter, spec) = launch_spec_for(task);
+        let cap = adapter.capabilities().resume;
+        let mode = plan_resume(cap, cp.has_native_session());
+
+        let started = now_ms();
+        let launched = match mode {
+            ResumeMode::Native => {
+                let session = cp.provider_session_ref.as_deref().unwrap_or_default();
+                match adapter.resume_command(&spec, session) {
+                    Some(pty) => RuntimeInstance::spawn_pty(adapter.provider(), pty, now),
+                    None => RuntimeInstance::launch(adapter.as_ref(), &spec, now),
+                }
+            }
+            ResumeMode::Reconstructed | ResumeMode::ColdStart => {
+                RuntimeInstance::launch(adapter.as_ref(), &spec, now)
+            }
+        };
+
+        let mut rt = match launched {
+            Ok(rt) => rt,
+            Err(e) if mode == ResumeMode::Native => {
+                // Native path failed to spawn — fall back to a reconstructed session (SUM-93).
+                let fallback = RuntimeInstance::launch(adapter.as_ref(), &spec, now)?;
+                let latency = now_ms().saturating_sub(started);
+                self.install_runtime(id, fallback);
+                return Ok(ResumeOutcome::reconstructed(
+                    latency,
+                    format!("native resume failed: {e}"),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Post-resume validation (SUM-93 / SUM-96): the provider must actually be running.
+        if !rt.is_running() {
+            anyhow::bail!("resumed provider exited immediately");
+        }
+        let latency = now_ms().saturating_sub(started);
+        self.install_runtime(id, rt);
+        Ok(match mode {
+            ResumeMode::Native => ResumeOutcome::native(latency),
+            ResumeMode::Reconstructed => {
+                ResumeOutcome::reconstructed(latency, "no native session handle")
+            }
+            ResumeMode::ColdStart => {
+                ResumeOutcome::cold_start(latency, "provider does not support resume")
+            }
+        })
+    }
+
+    fn emit_resume_event(&self, id: &str, outcome: &ResumeOutcome) {
+        let _ = self.store.append_event(&EventInput {
+            task_id: Some(id.to_string()),
+            ts_ms: now_ms(),
+            category: "lifecycle".to_string(),
+            event_type: "resumed".to_string(),
+            severity: "info".to_string(),
+            source: "daemon".to_string(),
+            payload_json: serde_json::to_string(outcome).ok(),
+        });
+        self.audit(
+            Some(id),
+            "resumed",
+            &format!(
+                "resumed via {} in {} ms (validated={})",
+                outcome.mode.label(),
+                outcome.latency_ms,
+                outcome.validated
+            ),
+            serde_json::to_string(outcome).ok(),
+        );
     }
 
     /// Pump all live runtimes: drain output into capture + screen, spill evicted scrollback to
@@ -350,6 +779,42 @@ impl DaemonState {
                 }
             }
             self.event(Some(&id), "process", "process_exited", "info", "daemon");
+        }
+
+        self.check_recycle_triggers(now);
+    }
+
+    /// Throttled RSS-threshold recycle trigger (SUM-94): every `RECYCLE_CHECK_INTERVAL_MS`, sample
+    /// each live provider's subtree RSS and recycle those over their per-provider threshold — only
+    /// at a safe point, with a decision event recording the reason and measured RSS.
+    fn check_recycle_triggers(&mut self, now: u64) {
+        if now.saturating_sub(self.last_recycle_check_ms) < RECYCLE_CHECK_INTERVAL_MS {
+            return;
+        }
+        self.last_recycle_check_ms = now;
+
+        // Collect (id, rss, reason) for over-threshold providers without holding a runtime borrow.
+        let mut to_recycle: Vec<(String, u64, String)> = Vec::new();
+        for (id, rt) in self.runtimes.iter() {
+            let Some(task) = self.tasks.get(id) else {
+                continue;
+            };
+            let Some(pid) = rt.pid() else { continue };
+            let rss = sample_subtree_rss(pid);
+            let policy = RecyclePolicy::for_provider(task.spec.provider);
+            if let Some(reason) = policy.should_recycle(rss) {
+                to_recycle.push((id.clone(), rss, reason));
+            }
+        }
+        for (id, rss, reason) in to_recycle {
+            self.audit(
+                Some(&id),
+                "recycle_triggered",
+                &reason,
+                Some(serde_json::json!({ "rss_bytes": rss }).to_string()),
+            );
+            // recycle() re-checks the safe point and rolls back on failure.
+            let _ = self.recycle(&id);
         }
     }
 
@@ -448,6 +913,83 @@ impl DaemonState {
     /// The current resource envelope.
     pub fn envelope(&self) -> &ResourceEnvelope {
         &self.envelope
+    }
+}
+
+/// Build the adapter and launch spec for a task, resolving only the secrets its capability grant
+/// permits (SUM-79). Free function so it borrows nothing of `DaemonState`.
+fn launch_spec_for(task: &Task) -> (Box<dyn ProviderAdapter>, LaunchSpec) {
+    let adapter = adapter_for(task.spec.provider);
+    let mut spec = LaunchSpec::in_dir(&task.spec.repository_path);
+    spec.command = task.spec.command.clone();
+    let refs = adapter.secret_refs();
+    let names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
+    let grant = CapabilityGrant::least_privilege(&task.spec.repository_path).with_secrets(names);
+    spec.env = grant.resolve_env(&refs);
+    (adapter, spec)
+}
+
+/// Decide the resume mode from the provider's negotiated fidelity and whether a native session
+/// handle was checkpointed (SUM-92 / SUM-93). Pure and unit-tested.
+fn plan_resume(cap: ResumeFidelity, has_native_session: bool) -> ResumeMode {
+    match cap {
+        ResumeFidelity::Native if has_native_session => ResumeMode::Native,
+        // Native-capable but no session handle, or explicitly reconstructed: rebuild context.
+        ResumeFidelity::Native | ResumeFidelity::Reconstructed => ResumeMode::Reconstructed,
+        ResumeFidelity::Unsupported => ResumeMode::ColdStart,
+    }
+}
+
+/// `HEAD` commit sha of a git repository, if it is one.
+fn git_head(repo: &std::path::Path) -> Option<String> {
+    memmux_worktree::gitcmd::git_ok(repo, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Hash of the working-tree patch (`git diff HEAD`); empty repos/patches hash deterministically.
+fn git_patch_hash(repo: &std::path::Path) -> String {
+    let diff = memmux_worktree::gitcmd::git_ok(repo, &["diff", "HEAD"]).unwrap_or_default();
+    memmux_lifecycle::content_hash(diff.as_bytes())
+}
+
+/// Resident bytes of the process subtree rooted at `pid` (0 if the sampler can't see it).
+fn sample_subtree_rss(pid: u32) -> u64 {
+    let sampler = memmux_metrics::default_sampler();
+    match sampler.snapshot() {
+        Ok(snap) => {
+            memmux_metrics::ProcessTree::from_samples(snap.samples).subtree_rss_bytes(pid as i32)
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Force-clean the process subtree rooted at `pid` and report whether it is fully gone (SUM-95).
+fn verify_subtree_gone(pid: u32) -> (bool, String) {
+    #[cfg(unix)]
+    {
+        let sampler = memmux_metrics::default_sampler();
+        match memmux_metrics::terminate_subtree(sampler.as_ref(), pid as i32, TREE_VERIFY_GRACE) {
+            Ok(report) => (
+                report.fully_cleaned(),
+                format!(
+                    "process-tree cleanup {:.0}%{}",
+                    report.cleanup_fraction() * 100.0,
+                    if report.used_sigkill {
+                        " (sigkill)"
+                    } else {
+                        ""
+                    }
+                ),
+            ),
+            Err(e) => (false, format!("process-tree verify error: {e}")),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        (true, "process-tree verification is unix-only".into())
     }
 }
 
@@ -623,6 +1165,50 @@ mod tests {
         assert!(s2.tasks.contains_key(&id));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plan_resume_picks_native_only_with_a_session_handle() {
+        // Native-capable provider with a checkpointed session -> native resume.
+        assert_eq!(
+            plan_resume(ResumeFidelity::Native, true),
+            ResumeMode::Native
+        );
+        // Native-capable but no session handle -> reconstructed, not a false native claim.
+        assert_eq!(
+            plan_resume(ResumeFidelity::Native, false),
+            ResumeMode::Reconstructed
+        );
+        // Reconstructed-only providers always reconstruct.
+        assert_eq!(
+            plan_resume(ResumeFidelity::Reconstructed, true),
+            ResumeMode::Reconstructed
+        );
+        // No resume support -> cold start.
+        assert_eq!(
+            plan_resume(ResumeFidelity::Unsupported, false),
+            ResumeMode::ColdStart
+        );
+    }
+
+    #[test]
+    fn hibernate_requires_a_live_provider() {
+        let mut s = state();
+        let t = create(&mut s, "idle task"); // QUEUED, never started
+        match s.handle(Request::HibernateTask { id: t.id }) {
+            Response::Error { message } => assert!(message.contains("no live provider")),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_requires_a_hibernated_task() {
+        let mut s = state();
+        let t = create(&mut s, "queued task");
+        match s.handle(Request::ResumeTask { id: t.id }) {
+            Response::Error { message } => assert!(message.contains("not hibernated")),
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 
     #[test]

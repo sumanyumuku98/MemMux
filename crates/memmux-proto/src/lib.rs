@@ -35,6 +35,21 @@ pub enum Request {
         /// Task id.
         id: String,
     },
+    /// Freeze an idle task to a durable checkpoint and stop its provider (§13 / SUM-90..92).
+    HibernateTask {
+        /// Task id.
+        id: String,
+    },
+    /// Restore a hibernated task from its checkpoint (native resume or reconstructed fallback).
+    ResumeTask {
+        /// Task id.
+        id: String,
+    },
+    /// Recycle a running provider: checkpoint, restart at a safe point, and resume (§8.7).
+    RecycleTask {
+        /// Task id.
+        id: String,
+    },
     /// Report current system memory pressure.
     SystemPressure,
     /// Read events after a cursor.

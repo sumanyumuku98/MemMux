@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS resource_samples (
     rss_bytes       INTEGER NOT NULL,
     accounted_bytes INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS checkpoints (
+    task_id       TEXT PRIMARY KEY,
+    created_at_ms INTEGER NOT NULL,
+    artifact_path TEXT NOT NULL,
+    integrity     TEXT NOT NULL
+);
 "#;
 
 /// An event to append to the log (§15.2). The sequence number is assigned by the store.
@@ -114,6 +120,21 @@ pub struct Decision {
     pub reason: String,
     /// JSON snapshot of the metrics behind the decision.
     pub evidence_json: Option<String>,
+}
+
+/// A durable *reference* to a checkpoint (SUM-90). The full checkpoint JSON is an artifact on
+/// disk; the store keeps only this pointer plus the integrity hash so a corrupt or missing
+/// artifact is detectable before a resume is attempted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRef {
+    /// Owning task id (one live checkpoint per task).
+    pub task_id: String,
+    /// When the checkpoint was captured (ms since epoch).
+    pub created_at_ms: u64,
+    /// Path to the checkpoint JSON artifact on disk.
+    pub artifact_path: String,
+    /// Integrity digest of the checkpoint contents (matches `Checkpoint::integrity`).
+    pub integrity: String,
 }
 
 /// The durable store.
@@ -351,6 +372,52 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0))? as u64)
     }
+
+    /// Insert or replace the checkpoint reference for a task (SUM-90).
+    pub fn save_checkpoint_ref(&self, r: &CheckpointRef) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO checkpoints (task_id, created_at_ms, artifact_path, integrity)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(task_id) DO UPDATE SET
+                created_at_ms=excluded.created_at_ms,
+                artifact_path=excluded.artifact_path,
+                integrity=excluded.integrity",
+            rusqlite::params![
+                r.task_id,
+                r.created_at_ms as i64,
+                r.artifact_path,
+                r.integrity
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a task's checkpoint reference, if one exists.
+    pub fn load_checkpoint_ref(&self, task_id: &str) -> anyhow::Result<Option<CheckpointRef>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT task_id, created_at_ms, artifact_path, integrity
+                 FROM checkpoints WHERE task_id = ?1",
+                [task_id],
+                |row| {
+                    Ok(CheckpointRef {
+                        task_id: row.get(0)?,
+                        created_at_ms: row.get::<_, i64>(1)? as u64,
+                        artifact_path: row.get(2)?,
+                        integrity: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Drop a task's checkpoint reference (after a successful resume or termination).
+    pub fn delete_checkpoint_ref(&self, task_id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM checkpoints WHERE task_id = ?1", [task_id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +454,33 @@ mod tests {
         assert_eq!(loaded.spec.title, "Do work");
         assert_eq!(loaded.history.len(), 1);
         assert_eq!(loaded.history[0].to, TaskState::Queued);
+    }
+
+    #[test]
+    fn checkpoint_ref_saves_loads_and_deletes() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.load_checkpoint_ref("task_1").unwrap().is_none());
+
+        let r = CheckpointRef {
+            task_id: "task_1".into(),
+            created_at_ms: 1234,
+            artifact_path: "/root/tasks/task_1/checkpoint.json".into(),
+            integrity: "deadbeefdeadbeef".into(),
+        };
+        store.save_checkpoint_ref(&r).unwrap();
+        assert_eq!(store.load_checkpoint_ref("task_1").unwrap().unwrap(), r);
+
+        // Upsert replaces in place (one live checkpoint per task).
+        let r2 = CheckpointRef {
+            created_at_ms: 5678,
+            integrity: "cafef00dcafef00d".into(),
+            ..r.clone()
+        };
+        store.save_checkpoint_ref(&r2).unwrap();
+        assert_eq!(store.load_checkpoint_ref("task_1").unwrap().unwrap(), r2);
+
+        store.delete_checkpoint_ref("task_1").unwrap();
+        assert!(store.load_checkpoint_ref("task_1").unwrap().is_none());
     }
 
     #[test]

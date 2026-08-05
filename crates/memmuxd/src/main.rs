@@ -52,6 +52,21 @@ enum Command {
         /// Task id.
         id: String,
     },
+    /// Freeze an idle task to a checkpoint and stop its provider.
+    Hibernate {
+        /// Task id.
+        id: String,
+    },
+    /// Resume a hibernated task from its checkpoint.
+    Resume {
+        /// Task id.
+        id: String,
+    },
+    /// Recycle a running provider (checkpoint, restart, resume).
+    Recycle {
+        /// Task id.
+        id: String,
+    },
     /// List tasks over the socket.
     List,
     /// Report memory pressure over the socket.
@@ -114,6 +129,15 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Start { id } => {
             print_response(Client::new(&socket).call(&Request::StartTask { id })?)
+        }
+        Command::Hibernate { id } => {
+            print_response(Client::new(&socket).call(&Request::HibernateTask { id })?)
+        }
+        Command::Resume { id } => {
+            print_response(Client::new(&socket).call(&Request::ResumeTask { id })?)
+        }
+        Command::Recycle { id } => {
+            print_response(Client::new(&socket).call(&Request::RecycleTask { id })?)
         }
         Command::List => print_response(Client::new(&socket).call(&Request::ListTasks)?),
         Command::Pressure => print_response(Client::new(&socket).call(&Request::SystemPressure)?),
