@@ -65,6 +65,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     artifact_path TEXT NOT NULL,
     integrity     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workspaces (
+    id            TEXT PRIMARY KEY,
+    path          TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
 "#;
 
 /// An event to append to the log (§15.2). The sequence number is assigned by the store.
@@ -135,6 +141,19 @@ pub struct CheckpointRef {
     pub artifact_path: String,
     /// Integrity digest of the checkpoint contents (matches `Checkpoint::integrity`).
     pub integrity: String,
+}
+
+/// A registered workspace: a git repository the daemon manages tasks under (SUM-124).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workspace {
+    /// Stable id derived from the canonical path (matches a task's `repository` id).
+    pub id: String,
+    /// Canonical filesystem path of the repository root.
+    pub path: String,
+    /// Display name (defaults to the directory's base name).
+    pub name: String,
+    /// When the workspace was first registered (ms since epoch).
+    pub created_at_ms: u64,
 }
 
 /// The durable store.
@@ -418,6 +437,42 @@ impl Store {
             .execute("DELETE FROM checkpoints WHERE task_id = ?1", [task_id])?;
         Ok(())
     }
+
+    /// Insert or update a workspace (SUM-124). Idempotent on `id`.
+    pub fn save_workspace(&self, w: &Workspace) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO workspaces (id, path, name, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                path=excluded.path,
+                name=excluded.name",
+            rusqlite::params![w.id, w.path, w.name, w.created_at_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Load all registered workspaces (ordered by registration time).
+    pub fn load_workspaces(&self) -> anyhow::Result<Vec<Workspace>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, name, created_at_ms FROM workspaces ORDER BY created_at_ms",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Workspace {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                created_at_ms: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Remove a workspace by id (tasks are unaffected).
+    pub fn delete_workspace(&self, id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +536,34 @@ mod tests {
 
         store.delete_checkpoint_ref("task_1").unwrap();
         assert!(store.load_checkpoint_ref("task_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn workspaces_save_load_and_delete() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.load_workspaces().unwrap().is_empty());
+
+        let w = Workspace {
+            id: "repo_abc".into(),
+            path: "/src/product".into(),
+            name: "product".into(),
+            created_at_ms: 100,
+        };
+        store.save_workspace(&w).unwrap();
+        // Idempotent upsert with a new name.
+        store
+            .save_workspace(&Workspace {
+                name: "renamed".into(),
+                ..w.clone()
+            })
+            .unwrap();
+        let all = store.load_workspaces().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "renamed");
+        assert_eq!(all[0].path, "/src/product");
+
+        store.delete_workspace("repo_abc").unwrap();
+        assert!(store.load_workspaces().unwrap().is_empty());
     }
 
     #[test]

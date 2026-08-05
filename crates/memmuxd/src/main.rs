@@ -67,6 +67,11 @@ enum Command {
         /// Task id.
         id: String,
     },
+    /// Manage workspaces (registered git repositories).
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCmd,
+    },
     /// List tasks over the socket.
     List,
     /// Report memory pressure over the socket.
@@ -82,6 +87,23 @@ enum Command {
         /// Root pid (defaults to this process).
         #[arg(long)]
         root_pid: Option<i32>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceCmd {
+    /// Register a folder as a workspace (defaults to the current directory).
+    Add {
+        /// Path to the repository (or anywhere inside it).
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// List registered workspaces.
+    List,
+    /// Remove a workspace by id.
+    Rm {
+        /// Workspace id.
+        id: String,
     },
 }
 
@@ -138,6 +160,14 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Recycle { id } => {
             print_response(Client::new(&socket).call(&Request::RecycleTask { id })?)
+        }
+        Command::Workspace { action } => {
+            let req = match action {
+                WorkspaceCmd::Add { path } => Request::AddWorkspace { path },
+                WorkspaceCmd::List => Request::ListWorkspaces,
+                WorkspaceCmd::Rm { id } => Request::RemoveWorkspace { id },
+            };
+            print_response(Client::new(&socket).call(&req)?);
         }
         Command::List => print_response(Client::new(&socket).call(&Request::ListTasks)?),
         Command::Pressure => print_response(Client::new(&socket).call(&Request::SystemPressure)?),
@@ -249,6 +279,23 @@ fn print_response(resp: Response) {
             );
             for line in h.lines {
                 println!("{line}");
+            }
+        }
+        Response::Workspace(w) => {
+            println!(
+                "{}  {}  {}  ({} task(s))",
+                w.id, w.name, w.path, w.task_count
+            )
+        }
+        Response::Workspaces(ws) => {
+            if ws.is_empty() {
+                println!("(no workspaces)");
+            }
+            for w in ws {
+                println!(
+                    "{}  {}  {}  ({} task(s))",
+                    w.id, w.name, w.path, w.task_count
+                );
             }
         }
         Response::Ok => println!("ok"),
