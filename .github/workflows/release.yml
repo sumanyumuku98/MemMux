@@ -15,6 +15,8 @@ permissions:
 env:
   # SUM-26: signing/notarization engages only when these repo secrets exist.
   HAS_APPLE_CREDS: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_NOTARY_KEY != '' }}
+  # Homebrew tap auto-publish engages only when a push token to the tap repo is configured.
+  HAS_TAP: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
 
 jobs:
   build:
@@ -81,3 +83,23 @@ jobs:
             dist/*.tar.gz dist/*.sha256 dist/install.sh dist/memmux.rb \
             --title "MemMux ${{ github.ref_name }}" \
             --generate-notes
+      - name: Publish formula to Homebrew tap (only if HOMEBREW_TAP_TOKEN is set)
+        if: env.HAS_TAP == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: sumanyumuku98/homebrew-tap
+          VERSION: ${{ github.ref_name }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp dist/memmux.rb tap/Formula/memmux.rb
+          cd tap
+          git config user.name "memmux-release-bot"
+          git config user.email "memmux-release-bot@users.noreply.github.com"
+          git add Formula/memmux.rb
+          if git diff --cached --quiet; then
+            echo "formula unchanged; nothing to publish"
+          else
+            git commit -m "memmux ${VERSION}"
+            git push
+          fi

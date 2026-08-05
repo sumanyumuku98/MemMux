@@ -50,12 +50,26 @@ cp packaging/launchd/com.memmux.memmuxd.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.memmux.memmuxd.plist
 ```
 
-### Homebrew tap
+### Homebrew tap (auto-published)
 
-The generated `memmux.rb` is attached to each release. To serve it via Homebrew, create a
-`sumanyumuku98/homebrew-tap` repository and commit `memmux.rb` to it (or automate that copy in a
-follow-up job using a PAT). Until the tap exists, users can `brew install ./memmux.rb` from a
-downloaded formula.
+The generated `memmux.rb` is attached to each release **and** auto-committed to the
+`sumanyumuku98/homebrew-tap` repo's `Formula/memmux.rb` by the release workflow — but only when a
+push token is configured. To enable it:
+
+1. Create the tap repo `sumanyumuku98/homebrew-tap` (public, empty is fine).
+2. Create a fine-grained PAT with **Contents: read/write** on that repo.
+3. Add it to the MemMux repo as the `HOMEBREW_TAP_TOKEN` secret
+   (**Settings → Secrets and variables → Actions**).
+
+With the secret present, `brew install sumanyumuku98/tap/memmux` works after each release. Until
+the secret exists, the publish step is skipped (the formula still ships as a release asset, so
+`brew install ./memmux.rb` from a downloaded formula continues to work).
+
+## Hosted API docs (GitHub Pages)
+
+`.github/workflows/docs.yml` builds `cargo doc --workspace --no-deps` and deploys it to GitHub
+Pages on every push to `main`. Enable it once: **Settings → Pages → Source: "GitHub Actions"**.
+The published site redirects to the `memmuxd` crate docs; all workspace crates are browsable.
 
 ## macOS code-signing & notarization (SUM-26 — pending your Apple credentials)
 
