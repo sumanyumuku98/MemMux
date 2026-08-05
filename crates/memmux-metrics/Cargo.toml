@@ -12,7 +12,8 @@ memmux-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+# libc is used by the macOS sampler and by recursive process-tree termination (all Unix).
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
