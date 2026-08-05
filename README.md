@@ -82,6 +82,37 @@ MemMux is built in seven phases (tracked in Linear, mirrored here):
 See the [documentation site](https://sumanyumuku98.github.io/MemMux/) for per-phase design notes
 and the [architecture overview](https://sumanyumuku98.github.io/MemMux/design/architecture/).
 
+## Installation
+
+Prebuilt binaries for Linux (x86_64) and macOS (Apple Silicon + Intel) ship with each
+[release](https://github.com/sumanyumuku98/MemMux/releases/latest).
+
+**One-line installer** (installs `memmux` + `memmuxd` to `~/.local/bin`):
+
+```bash
+curl -fsSL https://github.com/sumanyumuku98/MemMux/releases/latest/download/install.sh | sh
+# then make sure ~/.local/bin is on your PATH:
+export PATH="$HOME/.local/bin:$PATH"
+memmuxd version
+```
+
+Override the install directory with `MEMMUX_BIN_DIR`. Because the installer fetches over `curl`,
+macOS Gatekeeper does not quarantine the binaries.
+
+**Manual download:** grab the archive for your platform from the
+[releases page](https://github.com/sumanyumuku98/MemMux/releases/latest), verify the `.sha256`,
+and extract:
+
+```bash
+tar xzf memmux-*-<target>.tar.gz && mv memmux memmuxd ~/.local/bin/
+# macOS only, if you downloaded via a browser (which sets the quarantine flag):
+xattr -dr com.apple.quarantine ~/.local/bin/memmux ~/.local/bin/memmuxd
+```
+
+> **Notes for the current pre-release:** macOS binaries are **unsigned** (notarization is pending),
+> so a browser download needs the `xattr` step above; the `curl` installer avoids it. `brew
+> install` is **not available yet** — the Homebrew tap is not wired up. Or build from source below.
+
 ## Building
 
 ```bash
