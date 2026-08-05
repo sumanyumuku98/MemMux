@@ -6,9 +6,9 @@
   **The memory-aware local runtime for parallel AI coding agents.**
 
   [![CI](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml/badge.svg)](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml)
-  [![Docs](https://github.com/sumanyumuku98/MemMux/actions/workflows/docs.yml/badge.svg)](https://memmux.ai)
+  [![Docs](https://github.com/sumanyumuku98/MemMux/actions/workflows/docs.yml/badge.svg)](https://sumanyumuku98.github.io/MemMux/)
 
-  **📖 Full documentation: [memmux.ai](https://memmux.ai)**
+  **📖 Full documentation: [sumanyumuku98.github.io/MemMux](https://sumanyumuku98.github.io/MemMux/)** (custom domain `memmux.ai` planned)
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 </div>
 

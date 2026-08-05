@@ -65,19 +65,24 @@ With the secret present, `brew install sumanyumuku98/tap/memmux` works after eac
 the secret exists, the publish step is skipped (the formula still ships as a release asset, so
 `brew install ./memmux.rb` from a downloaded formula continues to work).
 
-## Hosted docs (GitHub Pages → memmux.ai)
+## Hosted docs (GitHub Pages)
 
 `.github/workflows/docs.yml` builds the complete documentation site on every push to `main` and
-deploys it to GitHub Pages, served at **https://memmux.ai**:
+deploys it to GitHub Pages. It is live today at
+**https://sumanyumuku98.github.io/MemMux/** and comprises:
 
 - an **mdBook** of the guides in `docs/` (architecture, phases, threat model, releasing);
 - the generated **rustdoc API reference** nested under **`/api/`** (`cargo doc --workspace
   --no-deps`, built with `-D warnings`).
 
-One-time setup:
+Pages is already enabled (Source: "GitHub Actions").
 
-1. Enable Pages: **Settings → Pages → Source: "GitHub Actions"** (already done via the API).
-2. Point DNS for `memmux.ai` at GitHub Pages (apex domain):
+### Custom domain (`memmux.ai`) — when the domain is owned
+
+The workflow already writes a `CNAME` file for `memmux.ai`; the domain is **not yet activated**
+(it isn't owned). To switch over once you own it:
+
+1. Point DNS for `memmux.ai` at GitHub Pages (apex domain):
 
    | Type | Name | Value |
    | --- | --- | --- |
@@ -92,8 +97,12 @@ One-time setup:
 
    (Optionally add a `CNAME` record for `www` → `sumanyumuku98.github.io`.)
 
-The custom domain is written into the site via a `CNAME` file by the workflow; once DNS resolves,
-GitHub issues a TLS certificate and the `sumanyumuku98.github.io` URL redirects to `memmux.ai`.
+2. Set the custom domain (either **Settings → Pages → Custom domain → `memmux.ai`**, or
+   `gh api --method PUT repos/sumanyumuku98/MemMux/pages -f cname=memmux.ai`).
+
+Once DNS resolves, GitHub issues a TLS certificate and the `sumanyumuku98.github.io` URL
+redirects to `memmux.ai`. Remember to repoint the README badge/link and the repo
+description/website back to `https://memmux.ai` at that point.
 
 ## macOS code-signing & notarization (SUM-26 — pending your Apple credentials)
 
