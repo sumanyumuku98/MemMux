@@ -13,8 +13,6 @@ use memmux::client::Client;
 use memmux::render::render;
 use memmux_proto::{AttachClientMsg, AttachServerMsg, Request};
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use std::io::{stdout, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -96,7 +94,8 @@ fn run<B: ratatui::backend::Backend>(
                             if let Err(e) = attach_passthrough(terminal, client, &id) {
                                 model.status = format!("attach ended: {e}");
                             }
-                            model.view = memmux::app::View::Term;
+                            // Raw passthrough returned (detached / agent exited); refresh the list.
+                            refresh(client, model);
                         }
                     }
                 }
@@ -196,7 +195,10 @@ fn refresh(client: &Client, model: &mut Model) {
     }
 }
 
-/// Interactive attach: full-screen raw passthrough to a task's PTY until Ctrl-a d (SUM-86).
+/// Interactive attach: a **true raw passthrough** to the task's PTY (SUM-125). The agent's raw
+/// output bytes are written straight to our terminal so it renders the agent's own colours/UI
+/// natively; our keystrokes are forwarded as input. `Ctrl-a d` detaches (`Ctrl-a Ctrl-a` sends a
+/// literal Ctrl-a). The agent is sized to our real terminal so it repaints full-screen.
 fn attach_passthrough<B: Backend>(
     terminal: &mut Terminal<B>,
     client: &Client,
@@ -208,67 +210,93 @@ fn attach_passthrough<B: Backend>(
         &serde_json::to_vec(&Request::Attach { id: id.to_string() })?,
     )?;
 
-    // Read screen frames on a background thread.
+    // Size the agent to our real terminal, then clear so it repaints over a blank screen.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    send_frame(
+        &mut stream,
+        &serde_json::to_vec(&AttachClientMsg::Resize { rows, cols })?,
+    )?;
+    {
+        let mut out = stdout();
+        let _ = execute!(
+            out,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        );
+    }
+
+    // Reader thread: write the agent's raw bytes straight to our stdout.
     let mut reader_stream = stream.try_clone()?;
-    let (tx, rx) = mpsc::channel::<AttachServerMsg>();
+    let (exit_tx, exit_rx) = mpsc::channel::<()>();
     let reader = std::thread::spawn(move || {
+        let mut out = stdout();
         while let Ok(Some(bytes)) = recv_frame(&mut reader_stream) {
-            if let Ok(msg) = serde_json::from_slice::<AttachServerMsg>(&bytes) {
-                let exited = matches!(msg, AttachServerMsg::Exited);
-                if tx.send(msg).is_err() || exited {
-                    break;
+            match serde_json::from_slice::<AttachServerMsg>(&bytes) {
+                Ok(AttachServerMsg::Output { data: b }) => {
+                    let _ = out.write_all(&b);
+                    let _ = out.flush();
                 }
+                Ok(AttachServerMsg::Exited) => break,
+                _ => {}
             }
         }
+        let _ = exit_tx.send(());
     });
 
-    let mut rows: Vec<String> = vec!["(attached — press Ctrl-a then d to detach)".to_string()];
     let mut prefix = false;
     let result = loop {
-        terminal.draw(|f| {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" ATTACH {id} — Ctrl-a d to detach "));
-            let text: Vec<Line> = rows.iter().map(|r| Line::from(r.clone())).collect();
-            f.render_widget(Paragraph::new(text).block(block), f.area());
-        })?;
-
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                AttachServerMsg::Screen(sv) => rows = sv.rows,
-                AttachServerMsg::Exited => break,
-            }
+        if exit_rx.try_recv().is_ok() {
+            break Ok(()); // agent exited
         }
-
-        if event::poll(Duration::from_millis(30))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Release {
-                    continue;
-                }
-                if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('a') {
-                    prefix = true;
-                    continue;
-                }
-                if prefix {
-                    prefix = false;
-                    if k.code == KeyCode::Char('d') {
-                        let _ =
-                            send_frame(&mut stream, &serde_json::to_vec(&AttachClientMsg::Detach)?);
-                        break Ok(());
+        if event::poll(Duration::from_millis(20))? {
+            match event::read()? {
+                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    let ctrl_a =
+                        k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('a');
+                    if ctrl_a && !prefix {
+                        prefix = true;
+                        continue;
+                    }
+                    if prefix {
+                        prefix = false;
+                        if k.code == KeyCode::Char('d') {
+                            let _ = send_frame(
+                                &mut stream,
+                                &serde_json::to_vec(&AttachClientMsg::Detach)?,
+                            );
+                            break Ok(());
+                        }
+                        if ctrl_a {
+                            // Ctrl-a Ctrl-a -> send a literal Ctrl-a to the agent.
+                            send_frame(
+                                &mut stream,
+                                &serde_json::to_vec(&AttachClientMsg::Input { data: vec![0x01] })?,
+                            )?;
+                            continue;
+                        }
+                    }
+                    if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
+                        send_frame(
+                            &mut stream,
+                            &serde_json::to_vec(&AttachClientMsg::Input { data: bytes })?,
+                        )?;
                     }
                 }
-                if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
-                    send_frame(
+                Event::Resize(cols, rows) => {
+                    let _ = send_frame(
                         &mut stream,
-                        &serde_json::to_vec(&AttachClientMsg::Input { data: bytes })?,
-                    )?;
+                        &serde_json::to_vec(&AttachClientMsg::Resize { rows, cols })?,
+                    );
                 }
+                _ => {}
             }
         }
     };
 
     drop(stream);
     let _ = reader.join();
+    // The agent painted directly to the screen; force a clean TUI redraw on return.
+    terminal.clear()?;
     result
 }
 
