@@ -2,7 +2,7 @@
 //! events to [`app::Key`], applies the pure `update`, and executes the resulting effects against
 //! the daemon. All UI logic lives in the library (`app` + `render`) so it stays testable.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -26,10 +26,24 @@ struct Cli {
     /// Managed root (defaults to $MEMMUX_ROOT or ~/.memmux); the socket is `<root>/memmux.sock`.
     #[arg(long)]
     root: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Update MemMux to the latest release, in place (SUM-129).
+    Update,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // `memmux update`: self-update the installed binaries and exit (no TUI).
+    if matches!(cli.command, Some(Command::Update)) {
+        return run_self_update();
+    }
+
     let root = cli
         .root
         .or_else(|| std::env::var_os("MEMMUX_ROOT").map(PathBuf::from))
@@ -57,12 +71,20 @@ fn main() -> anyhow::Result<()> {
         Err(e) => model.status = format!("daemon auto-start failed: {e}"),
     }
 
+    // Non-blocking "update available" check (SUM-129) — result surfaces in the status line.
+    let (hint_tx, hint_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        if let Some(msg) = memmux::update::check_for_update(env!("CARGO_PKG_VERSION")) {
+            let _ = hint_tx.send(msg);
+        }
+    });
+
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    let result = run(&mut terminal, &client, &mut model);
+    let result = run(&mut terminal, &client, &mut model, &hint_rx);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -74,9 +96,14 @@ fn run<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     client: &Client,
     model: &mut Model,
+    hint_rx: &std::sync::mpsc::Receiver<String>,
 ) -> anyhow::Result<()> {
     let mut last_refresh = Instant::now();
     loop {
+        // Surface the background update-check result once it arrives (SUM-129).
+        if let Ok(msg) = hint_rx.try_recv() {
+            model.status = msg;
+        }
         terminal.draw(|f| render(f, model))?;
 
         if event::poll(Duration::from_millis(250))? {
@@ -108,6 +135,38 @@ fn run<B: ratatui::backend::Backend>(
         if last_refresh.elapsed() >= Duration::from_millis(1000) {
             refresh(client, model);
             last_refresh = Instant::now();
+        }
+    }
+    Ok(())
+}
+
+/// `memmux update`: resolve the newest release and swap the installed binaries in place (SUM-129).
+fn run_self_update() -> anyhow::Result<()> {
+    // Install where the current binary lives, unless overridden (matches the installer's env).
+    let bin_dir = std::env::var_os("MEMMUX_BIN_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    println!("checking for updates…");
+    match memmux::update::run_update(env!("CARGO_PKG_VERSION"), &bin_dir) {
+        Ok(memmux::update::Outcome::UpToDate(v)) => {
+            println!("memmux is already up to date (v{v})");
+        }
+        Ok(memmux::update::Outcome::Updated {
+            from,
+            to,
+            installed,
+        }) => {
+            println!("updated {}: {from} → {to}", installed.join(" + "));
+            println!("restart the daemon to use the new version:  pkill memmuxd");
+        }
+        Err(e) => {
+            eprintln!("update failed: {e}");
+            std::process::exit(1);
         }
     }
     Ok(())
