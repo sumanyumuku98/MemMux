@@ -9,10 +9,16 @@ GitHub Actions pipeline (`.github/workflows/release.yml`, SUM-25).
 
 ## Cutting a release
 
+**Bump the version first.** `memmuxd version` reports `CARGO_PKG_VERSION`, so the
+`[workspace.package] version` in `Cargo.toml` must match the tag — otherwise the binaries report
+the wrong version. A `preflight` job in the Release workflow **fails the release on a tag/version
+mismatch**, so this can't slip through.
+
 ```bash
-# From an up-to-date main:
-git tag v0.1.0
-git push origin v0.1.0
+# 1. Bump [workspace.package] version in Cargo.toml (e.g. 0.2.0 -> 0.3.0), commit via PR, merge.
+# 2. From an up-to-date main, tag the matching version:
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 The tag push runs the **Release** workflow, which:
