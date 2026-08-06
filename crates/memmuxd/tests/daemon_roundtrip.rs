@@ -381,7 +381,7 @@ fn attach_streams_screen_and_accepts_input() {
         .unwrap(),
     );
 
-    // Send input; `cat` echoes it back into the screen.
+    // Send input; the PTY echoes it back as raw output (SUM-125 raw passthrough).
     write_frame(
         &mut s,
         &serde_json::to_vec(&AttachClientMsg::Input {
@@ -390,16 +390,16 @@ fn attach_streams_screen_and_accepts_input() {
         .unwrap(),
     );
 
-    // Read screen frames until the echoed input shows up.
+    // Read raw Output frames until the echoed bytes show up verbatim.
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut saw = false;
     for _ in 0..200 {
         match read_frame(&mut s) {
             Some(bytes) => {
-                if let Ok(AttachServerMsg::Screen(sv)) =
+                if let Ok(AttachServerMsg::Output { data: out }) =
                     serde_json::from_slice::<AttachServerMsg>(&bytes)
                 {
-                    if sv.rows.iter().any(|r| r.contains("echo-through-attach")) {
+                    if String::from_utf8_lossy(&out).contains("echo-through-attach") {
                         saw = true;
                         break;
                     }
@@ -408,7 +408,7 @@ fn attach_streams_screen_and_accepts_input() {
             None => break,
         }
     }
-    assert!(saw, "attach never reflected the injected input");
+    assert!(saw, "attach never streamed the echoed raw output");
 
     // Detach leaves the task running.
     write_frame(

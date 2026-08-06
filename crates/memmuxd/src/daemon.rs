@@ -1042,6 +1042,28 @@ impl DaemonState {
         }
     }
 
+    /// Begin teeing a task's raw PTY output for an attached client (SUM-125).
+    pub fn attach_begin(&mut self, id: &str) {
+        if let Some(rt) = self.runtimes.get_mut(id) {
+            rt.set_attached(true);
+        }
+    }
+
+    /// Stop teeing raw output (client detached / gone).
+    pub fn attach_end(&mut self, id: &str) {
+        if let Some(rt) = self.runtimes.get_mut(id) {
+            rt.set_attached(false);
+        }
+    }
+
+    /// Take raw PTY output buffered for the attached client since the last drain.
+    pub fn attach_drain(&mut self, id: &str) -> Vec<u8> {
+        self.runtimes
+            .get_mut(id)
+            .map(|rt| rt.drain_attach())
+            .unwrap_or_default()
+    }
+
     /// Resize a running task's terminal (attach resize).
     pub fn resize(&mut self, id: &str, rows: u16, cols: u16) {
         if let Some(rt) = self.runtimes.get_mut(id) {

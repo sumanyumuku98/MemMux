@@ -87,18 +87,35 @@ async fn attach_loop(
     let (mut rd, mut wr) = stream.into_split();
     let mut tick = tokio::time::interval(ATTACH_FRAME_INTERVAL);
 
+    // Tee raw PTY output for the duration of the attach (SUM-125). The client sends a Resize on
+    // connect, which makes the agent repaint in full colour.
+    state.lock().expect("state poisoned").attach_begin(&id);
+
+    let result = attach_stream(&mut rd, &mut wr, &state, &id, &mut tick).await;
+
+    state.lock().expect("state poisoned").attach_end(&id);
+    result
+}
+
+async fn attach_stream(
+    rd: &mut (impl tokio::io::AsyncRead + Unpin),
+    wr: &mut (impl tokio::io::AsyncWrite + Unpin),
+    state: &Arc<Mutex<DaemonState>>,
+    id: &str,
+    tick: &mut tokio::time::Interval,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             biased;
-            frame = read_frame(&mut rd) => {
+            frame = read_frame(rd) => {
                 match frame? {
                     None => break, // client disconnected
                     Some(bytes) => match serde_json::from_slice::<AttachClientMsg>(&bytes) {
                         Ok(AttachClientMsg::Input { data }) => {
-                            state.lock().expect("state poisoned").write_stdin(&id, &data);
+                            state.lock().expect("state poisoned").write_stdin(id, &data);
                         }
                         Ok(AttachClientMsg::Resize { rows, cols }) => {
-                            state.lock().expect("state poisoned").resize(&id, rows, cols);
+                            state.lock().expect("state poisoned").resize(id, rows, cols);
                         }
                         Ok(AttachClientMsg::Detach) => break,
                         Err(_) => {} // ignore malformed frames
@@ -106,17 +123,17 @@ async fn attach_loop(
                 }
             }
             _ = tick.tick() => {
-                let (screen, running) = {
-                    let guard = state.lock().expect("state poisoned");
-                    (guard.screen_view(&id), guard.is_running(&id))
+                let (out, running) = {
+                    let mut guard = state.lock().expect("state poisoned");
+                    (guard.attach_drain(id), guard.is_running(id))
                 };
-                if let Some(sv) = screen {
-                    let msg = AttachServerMsg::Screen(sv);
-                    write_frame(&mut wr, &serde_json::to_vec(&msg)?).await?;
+                if !out.is_empty() {
+                    let msg = AttachServerMsg::Output { data: out };
+                    write_frame(wr, &serde_json::to_vec(&msg)?).await?;
                 }
                 if !running {
                     let msg = AttachServerMsg::Exited;
-                    write_frame(&mut wr, &serde_json::to_vec(&msg)?).await?;
+                    write_frame(wr, &serde_json::to_vec(&msg)?).await?;
                     break;
                 }
             }

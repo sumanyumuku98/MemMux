@@ -218,8 +218,15 @@ pub enum AttachClientMsg {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttachServerMsg {
-    /// A screen update.
+    /// A screen update (vt100-rendered plain-text grid; used by non-raw viewers).
     Screen(ScreenView),
+    /// Raw PTY output bytes for a true terminal passthrough — preserves the agent's own
+    /// colors/styling so the client's terminal renders it natively (SUM-125). A struct variant
+    /// because internal tagging (`kind`) cannot wrap a bare sequence.
+    Output {
+        /// Raw bytes.
+        data: Vec<u8>,
+    },
     /// The task's process exited.
     Exited,
 }
@@ -345,6 +352,16 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn attach_output_round_trips_raw_bytes() {
+        let msg = AttachServerMsg::Output {
+            data: vec![0x1b, b'[', b'1', b'm', b'h', b'i'],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: AttachServerMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
     }
 
     #[test]

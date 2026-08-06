@@ -281,15 +281,12 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
         Key::Up | Key::Char('k') => move_selection(model, -1),
         Key::Down | Key::Char('j') => move_selection(model, 1),
         Key::Enter => match model.view {
-            // Enter opens (and starts) the selected task's terminal view.
+            // Enter starts the selected agent and drops straight into an interactive session
+            // (raw PTY passthrough) — SUM-125. The runtime owns the terminal until Ctrl-a d.
             View::Dashboard | View::Tasks => {
                 if let Some(id) = model.selected_task().map(|t| t.id.clone()) {
                     model.focused_task = Some(id.clone());
-                    model.screen_rows.clear();
-                    model.history_rows.clear();
-                    model.show_history = false;
-                    model.view = View::Term;
-                    return vec![Effect::StartTask(id.clone()), Effect::LoadScreen(id)];
+                    return vec![Effect::StartTask(id.clone()), Effect::Attach(id)];
                 }
             }
             // Enter on a workspace launches an agent into it (repo prefilled).
@@ -628,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_term_starts_task_and_streams() {
+    fn enter_starts_and_attaches_interactively() {
         let mut m = Model {
             view: View::Tasks,
             ..Model::default()
@@ -639,31 +636,13 @@ mod tests {
         });
 
         let effects = update(&mut m, Key::Enter);
-        assert_eq!(m.view, View::Term);
-        assert_eq!(m.focused_task.as_deref(), Some("t1"));
+        // Interactive on open (SUM-125): Enter starts the agent AND attaches to it.
         assert!(effects
             .iter()
             .any(|e| matches!(e, Effect::StartTask(id) if id == "t1")));
         assert!(effects
             .iter()
-            .any(|e| matches!(e, Effect::LoadScreen(id) if id == "t1")));
-
-        // 'h' toggles scrollback and requests a history page (SUM-85).
-        let e2 = update(&mut m, Key::Char('h'));
-        assert!(m.show_history);
-        assert!(e2
-            .iter()
-            .any(|e| matches!(e, Effect::LoadHistory { id, .. } if id == "t1")));
-
-        // 'a' requests attach passthrough (SUM-86).
-        let e3 = update(&mut m, Key::Char('a'));
-        assert!(e3
-            .iter()
             .any(|e| matches!(e, Effect::Attach(id) if id == "t1")));
-
-        // Esc returns to the task list.
-        update(&mut m, Key::Esc);
-        assert_eq!(m.view, View::Tasks);
-        assert!(m.focused_task.is_none());
+        assert_eq!(m.focused_task.as_deref(), Some("t1"));
     }
 }
