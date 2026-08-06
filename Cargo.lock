@@ -506,7 +506,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memmux"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-adapters"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "memmux-core",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-lifecycle"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "memmux-core",
  "serde",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-metrics"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "memmux-core",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "memmux-core",
  "serde",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-pty"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "memmux-core",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-sched"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "memmux-core",
  "serde",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "memmux-core",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "memmux-worktree"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "memmux-core",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "memmuxd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
