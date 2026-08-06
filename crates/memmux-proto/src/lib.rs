@@ -35,6 +35,18 @@ pub enum Request {
         /// Task id.
         id: String,
     },
+    /// Forget a terminal task: remove it from the registry and durable store entirely. Refused
+    /// for tasks with a live provider or that are not yet in a terminal state (SUM-130).
+    ForgetTask {
+        /// Task id.
+        id: String,
+    },
+    /// Restart a non-running task: discard the stale session, re-queue, and relaunch its provider
+    /// so a dead/failed agent can be brought back with one keystroke (SUM-130).
+    RestartTask {
+        /// Task id.
+        id: String,
+    },
     /// Freeze an idle task to a durable checkpoint and stop its provider (§13 / SUM-90..92).
     HibernateTask {
         /// Task id.

@@ -11,7 +11,7 @@ use crossterm::terminal::{
 use memmux::app::{update, Effect, Key, Model};
 use memmux::client::Client;
 use memmux::render::render;
-use memmux_proto::{AttachClientMsg, AttachServerMsg, Request};
+use memmux_proto::{AttachClientMsg, AttachServerMsg, CreateTaskRequest, Request};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::Terminal;
 use std::io::{stdout, Read, Write};
@@ -59,9 +59,13 @@ fn main() -> anyhow::Result<()> {
     let autostart =
         memmux::supervisor::ensure_daemon(&root, &client, &memmux::supervisor::memmuxd_path());
 
-    // Default the new-task repo to the launch directory's git root (SUM-119).
+    // Default the new-task repo to the launch directory's git root (SUM-119), and remember the raw
+    // launch dir too so a plain shell / the folder browser can start anywhere (SUM-130).
     let mut model = Model {
         cwd_repo: cwd_git_root(),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
         ..Model::default()
     };
     refresh(&client, &mut model);
@@ -212,10 +216,38 @@ fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<St
             Ok(_) => refresh(client, model),
             Err(e) => model.status = format!("create failed: {e}"),
         },
-        Effect::StartTask(id) => match client.start(&id) {
-            Ok(()) => model.status = format!("started {id}"),
-            Err(e) => model.status = format!("start failed: {e}"),
+        // One-key quick-launch (SUM-130): create → start → attach, all here. Returns the id to
+        // attach only when a provider actually came up.
+        Effect::QuickLaunch {
+            provider,
+            repo,
+            shell,
+        } => return quick_launch(client, model, &provider, &repo, shell),
+        // Open an agent (SUM-130): reuse/start/restart, attaching only if a live provider results —
+        // this is the fix for Enter flashing a blank screen on a dead agent.
+        Effect::OpenTask(id) => {
+            if client.start(&id).is_ok() || client.restart(&id).is_ok() {
+                refresh(client, model);
+                return Some(id);
+            }
+            refresh(client, model);
+            model.status = format!("{id}: agent exited — press Enter to restart, x to remove");
+        }
+        Effect::TerminateTask(id) => match client.terminate(&id) {
+            Ok(()) => {
+                model.status = format!("terminated {id}");
+                refresh(client, model);
+            }
+            Err(e) => model.status = format!("terminate failed: {e}"),
         },
+        Effect::ForgetTask(id) => match client.forget(&id) {
+            Ok(()) => {
+                model.status = format!("removed {id}");
+                refresh(client, model);
+            }
+            Err(e) => model.status = format!("remove failed: {e}"),
+        },
+        Effect::ListDir(path) => list_dir(model, &path),
         Effect::AddWorkspace(path) => match client.add_workspace(&path) {
             Ok(()) => refresh(client, model),
             Err(e) => model.status = format!("open folder failed: {e}"),
@@ -223,6 +255,79 @@ fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<St
         Effect::Attach(id) => return Some(id),
     }
     None
+}
+
+/// Quick-launch (SUM-130): create a task for `provider` in `repo`, start it, and — on success —
+/// return its id so the caller enters attach. A `shell` launch uses the generic provider with
+/// `$SHELL` (the generic adapter with no command exits immediately, so one must be supplied).
+fn quick_launch(
+    client: &Client,
+    model: &mut Model,
+    provider: &str,
+    repo: &str,
+    shell: bool,
+) -> Option<String> {
+    let command = shell.then(|| vec![default_shell()]);
+    let req = CreateTaskRequest {
+        title: String::new(),
+        repository_path: repo.to_string(),
+        provider: provider.to_string(),
+        base_branch: "main".to_string(),
+        resource_class: None,
+        priority: None,
+        command,
+    };
+    let id = match client.create(req) {
+        Ok(id) => id,
+        Err(e) => {
+            model.status = format!("launch failed: {e}");
+            return None;
+        }
+    };
+    match client.start(&id) {
+        Ok(()) => {
+            refresh(client, model);
+            model.status = format!("launched {provider}");
+            Some(id)
+        }
+        Err(e) => {
+            refresh(client, model);
+            model.status = format!("launch failed: {e}");
+            None
+        }
+    }
+}
+
+/// The user's interactive shell for a plain-terminal quick-launch, falling back to `/bin/sh`.
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+/// List the sub-directories of `path` for the folder browser (SUM-130), writing the result into
+/// the model. A leading `..` is offered unless `path` is the filesystem root. Unreadable entries
+/// are skipped; hidden dirs (dotfiles) are shown so repos like `.config` work.
+fn list_dir(model: &mut Model, path: &str) {
+    let dir = std::path::Path::new(path);
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut entries: Vec<String> = Vec::new();
+    if canonical.parent().is_some() {
+        entries.push("..".to_string());
+    }
+    match std::fs::read_dir(&canonical) {
+        Ok(rd) => {
+            let mut dirs: Vec<String> = rd
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            dirs.sort();
+            entries.extend(dirs);
+        }
+        Err(e) => model.status = format!("cannot read {path}: {e}"),
+    }
+    model.browse_dir = canonical.to_string_lossy().into_owned();
+    model.browse_entries = entries;
+    model.browse_selected = 0;
 }
 
 fn refresh(client: &Client, model: &mut Model) {

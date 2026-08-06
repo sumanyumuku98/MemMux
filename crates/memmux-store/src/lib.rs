@@ -221,6 +221,18 @@ impl Store {
         Ok(())
     }
 
+    /// Forget a task entirely: delete its row, transition history, and any checkpoint. Events are
+    /// retained as an immutable audit trail. Used by `ForgetTask` to clear a terminal task
+    /// (SUM-130).
+    pub fn delete_task(&self, id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM transitions WHERE task_id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM checkpoints WHERE task_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// Load one task (with its transition history) by id.
     pub fn load_task(&self, id: &str) -> anyhow::Result<Option<Task>> {
         let row = self
@@ -509,6 +521,23 @@ mod tests {
         assert_eq!(loaded.spec.title, "Do work");
         assert_eq!(loaded.history.len(), 1);
         assert_eq!(loaded.history[0].to, TaskState::Queued);
+    }
+
+    #[test]
+    fn delete_task_removes_row_and_history() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = task("task_1");
+        t.transition(TaskState::Queued, "submitted", 1100).unwrap();
+        store.upsert_task(&t).unwrap();
+        store
+            .record_transition(t.id().as_str(), &t.history[0])
+            .unwrap();
+        assert!(store.load_task("task_1").unwrap().is_some());
+
+        store.delete_task("task_1").unwrap();
+        assert!(store.load_task("task_1").unwrap().is_none());
+        // History is gone too, so a recycled id can't inherit stale transitions.
+        assert!(store.load_task("task_1").unwrap().is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Rendering for the Home view + modals (SUM-126/127). Pure ratatui drawing over the [`Model`];
 //! no I/O. All colours come from [`crate::theme`] so the look stays cohesive.
 
-use crate::app::{FormField, Model, NavItem, View, PROVIDERS};
+use crate::app::{FormField, Model, NavItem, PendingAction, View, LAUNCH_ITEMS, PROVIDERS};
 use crate::theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -35,6 +35,8 @@ pub fn render(f: &mut Frame, model: &Model) {
     // Modals draw over the body.
     match model.view {
         View::NewTask => render_new_task(f, chunks[1], model),
+        View::Launch => render_launch(f, chunks[1], model),
+        View::Confirm => render_confirm(f, chunks[1], model),
         View::OpenFolder => render_open_folder(f, chunks[1], model),
         View::Help => render_help(f, chunks[1]),
         View::Home => {}
@@ -70,7 +72,7 @@ fn render_header(f: &mut Frame, area: Rect, model: &Model) {
     f.render_widget(Paragraph::new(left), pad(area));
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "o open  n new  ? help  q quit ",
+            "c launch  x close  o folder  ? help  q quit ",
             theme::dim(),
         )))
         .alignment(Alignment::Right),
@@ -134,7 +136,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, model: &Model) {
 
     if nav.is_empty() {
         let hint = Paragraph::new(Line::from(Span::styled(
-            "press o to open a folder",
+            "press c to launch an agent",
             theme::dim(),
         )))
         .alignment(Alignment::Center);
@@ -246,22 +248,136 @@ fn render_new_task(f: &mut Frame, area: Rect, model: &Model) {
     modal(f, area, " NEW AGENT ", text);
 }
 
+/// Interactive folder browser (SUM-130): arrow-navigate directories and press `a` to register the
+/// folder currently shown, instead of hand-typing an absolute path.
 fn render_open_folder(f: &mut Frame, area: Rect, model: &Model) {
-    let text = vec![
+    let dir = if model.browse_dir.is_empty() {
+        "…"
+    } else {
+        model.browse_dir.as_str()
+    };
+    let mut text = vec![
         Line::from(vec![
-            Span::styled("path  ", theme::dim()),
+            Span::styled("in  ", theme::dim()),
             Span::styled(
-                format!("{}▉", model.folder_input),
-                Style::default().fg(theme::FG),
+                dir.to_string(),
+                Style::default()
+                    .fg(theme::ACCENT2)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(""),
+    ];
+    // Show a window of entries around the selection so the modal stays a sensible height.
+    let max_rows = area.height.saturating_sub(8).max(4) as usize;
+    let start = model.browse_selected.saturating_sub(max_rows / 2);
+    for (i, name) in model
+        .browse_entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_rows)
+    {
+        let label = if name == ".." {
+            "..  (up)".to_string()
+        } else {
+            format!("{name}/")
+        };
+        let style = if i == model.browse_selected {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::FG)
+        };
+        let marker = if i == model.browse_selected {
+            "▶ "
+        } else {
+            "  "
+        };
+        text.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "↑↓ move · enter/→ open · ←/⌫ up · a add this folder · esc",
+        theme::dim(),
+    )));
+    modal(f, area, " ADD WORKSPACE — BROWSE ", text);
+}
+
+/// One-key quick-launch palette (SUM-130): pick any agent — or a plain shell — for `launch_repo`.
+fn render_launch(f: &mut Frame, area: Rect, model: &Model) {
+    let repo = if model.launch_repo.is_empty() {
+        "(no folder — press o to pick one)".to_string()
+    } else {
+        model.launch_repo.clone()
+    };
+    let mut text = vec![
+        Line::from(vec![
+            Span::styled("launch into  ", theme::dim()),
+            Span::styled(repo, Style::default().fg(theme::ACCENT2)),
+        ]),
+        Line::from(""),
+    ];
+    for (i, (label, _provider, is_shell)) in LAUNCH_ITEMS.iter().enumerate() {
+        let selected = i == model.launch_selected;
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::FG)
+        };
+        let desc = if *is_shell {
+            "  plain interactive shell"
+        } else {
+            ""
+        };
+        text.push(Line::from(vec![
+            Span::styled(format!("{marker}{}. {label}", i + 1), style),
+            Span::styled(desc.to_string(), theme::dim()),
+        ]));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "1–5 or ↑↓+enter to launch · esc to cancel",
+        theme::dim(),
+    )));
+    modal(f, area, " LAUNCH AGENT ", text);
+}
+
+/// Confirmation prompt for a destructive close action (SUM-130).
+fn render_confirm(f: &mut Frame, area: Rect, model: &Model) {
+    let (verb, id, note) = match &model.pending {
+        Some(PendingAction::Terminate(id)) => (
+            "Terminate",
+            id.as_str(),
+            "the agent is killed; a dirty worktree is preserved",
+        ),
+        Some(PendingAction::Forget(id)) => (
+            "Remove",
+            id.as_str(),
+            "the agent is dropped from the list for good",
+        ),
+        None => ("", "", ""),
+    };
+    let text = vec![
         Line::from(Span::styled(
-            "enter open · esc cancel · (must be a git repository)",
+            format!("{verb} {id}?"),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(note.to_string(), theme::dim())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "enter / y  yes      esc / n  no",
             theme::dim(),
         )),
     ];
-    modal(f, area, " OPEN FOLDER ", text);
+    modal(f, area, " CONFIRM ", text);
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
@@ -269,10 +385,12 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("j / k", "move selection"),
         (
             "enter",
-            "open agent (interactive) · or launch into a workspace",
+            "open agent (starts/restarts + attaches) · or launch into a workspace",
         ),
-        ("n", "new agent"),
-        ("o", "open a folder as a workspace"),
+        ("c", "launch an agent or shell (quick-launch palette)"),
+        ("x", "close: terminate a running agent or remove a dead one"),
+        ("n", "new agent via the full form"),
+        ("o", "browse for a folder to register as a workspace"),
         ("Ctrl-a d", "detach from an agent"),
         ("? ", "toggle this help"),
         ("q", "quit"),
@@ -484,5 +602,40 @@ mod tests {
         let s = text_of(&m);
         assert!(s.contains("NEW AGENT"));
         assert!(s.contains("provider"));
+    }
+
+    #[test]
+    fn launch_palette_lists_every_agent_and_a_shell() {
+        let mut m = model();
+        m.view = View::Launch;
+        m.launch_repo = "/src/product".into();
+        let s = text_of(&m);
+        assert!(s.contains("LAUNCH AGENT"));
+        assert!(s.contains("claude-code"));
+        assert!(s.contains("codex"));
+        assert!(s.contains("shell"));
+        assert!(s.contains("/src/product"));
+    }
+
+    #[test]
+    fn confirm_modal_names_the_action() {
+        let mut m = model();
+        m.view = View::Confirm;
+        m.pending = Some(PendingAction::Terminate("task_abc".into()));
+        let s = text_of(&m);
+        assert!(s.contains("CONFIRM"));
+        assert!(s.contains("Terminate task_abc"));
+    }
+
+    #[test]
+    fn folder_browser_lists_entries() {
+        let mut m = model();
+        m.view = View::OpenFolder;
+        m.browse_dir = "/src".into();
+        m.browse_entries = vec!["..".into(), "product".into()];
+        let s = text_of(&m);
+        assert!(s.contains("BROWSE"));
+        assert!(s.contains("/src"));
+        assert!(s.contains("product/"));
     }
 }
