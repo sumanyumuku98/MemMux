@@ -108,6 +108,8 @@ impl DaemonState {
             },
             Request::ListTasks => Response::Tasks(self.tasks.values().map(view).collect()),
             Request::TerminateTask { id } => self.terminate(&id),
+            Request::ForgetTask { id } => self.forget(&id),
+            Request::RestartTask { id } => self.restart(&id),
             Request::HibernateTask { id } => self.hibernate(&id),
             Request::ResumeTask { id } => self.resume(&id),
             Request::RecycleTask { id } => self.recycle(&id),
@@ -394,14 +396,20 @@ impl DaemonState {
                 message: format!("task {id} is not startable from {}", snapshot.state),
             };
         }
+        self.launch_queued(id, &snapshot, now)
+    }
 
+    /// Admit and launch a task that is already in `Queued`: cut its worktree, drive
+    /// Queued → Admitting → Starting → Active, and install the running provider. Shared by
+    /// `start_task` and `restart` so both take the identical launch path (SUM-130).
+    fn launch_queued(&mut self, id: &str, snapshot: &Task, now: u64) -> Response {
         // Cut an isolated per-task worktree and launch the provider inside it (SUM-121). Falls
         // back to the raw repo path when it isn't a git repository.
-        let cwd = self.ensure_worktree(id, &snapshot);
-        let (adapter, mut spec) = launch_spec_for(&snapshot);
+        let cwd = self.ensure_worktree(id, snapshot);
+        let (adapter, mut spec) = launch_spec_for(snapshot);
         spec.cwd = Some(cwd);
 
-        let task = self.tasks.get_mut(id).expect("checked above");
+        let task = self.tasks.get_mut(id).expect("caller holds the task");
         for (to, reason) in [
             (TaskState::Admitting, "admitted: fits budget"),
             (TaskState::Starting, "launching provider"),
@@ -439,6 +447,105 @@ impl DaemonState {
                 }
             }
         }
+    }
+
+    /// Restart a non-running task: discard the stale session, re-queue, and relaunch (SUM-130).
+    /// A live runtime is returned as-is (attach will reuse it). A `Terminated` task is torn down
+    /// for good and cannot be restarted — the caller should forget it instead.
+    fn restart(&mut self, id: &str) -> Response {
+        let now = now_ms();
+        if self.runtimes.contains_key(id) {
+            return match self.tasks.get(id) {
+                Some(t) => Response::Task(view(t)),
+                None => Response::Error {
+                    message: format!("no such task: {id}"),
+                },
+            };
+        }
+        let Some(snapshot) = self.tasks.get(id).cloned() else {
+            return Response::Error {
+                message: format!("no such task: {id}"),
+            };
+        };
+        if snapshot.state == TaskState::Terminated {
+            return Response::Error {
+                message: format!("task {id} is terminated and cannot be restarted"),
+            };
+        }
+        // Drop the dead session and drive the task back to Queued via legal transitions.
+        if !self.force_requeue(id, now) {
+            return Response::Error {
+                message: format!("task {id} cannot be restarted from {}", snapshot.state),
+            };
+        }
+        let _ = self
+            .store
+            .upsert_task(self.tasks.get(id).expect("checked above"));
+        let requeued = self.tasks.get(id).cloned().expect("checked above");
+        self.event(Some(id), "lifecycle", "restarted", "info", "daemon");
+        self.launch_queued(id, &requeued, now)
+    }
+
+    /// Drive a non-running task to `Queued` via legal transitions, discarding its dead session.
+    /// Trying `[Queued, Failed, Active]` by priority converges to `Queued` from every non-terminal
+    /// state (e.g. `WaitingUser → Active → Failed → Queued`). Returns whether `Queued` was reached.
+    fn force_requeue(&mut self, id: &str, now: u64) -> bool {
+        let task = self.tasks.get_mut(id).expect("caller holds the task");
+        for _ in 0..6 {
+            if task.state == TaskState::Queued {
+                return true;
+            }
+            let next = [TaskState::Queued, TaskState::Failed, TaskState::Active]
+                .into_iter()
+                .find(|&s| task.state.can_transition_to(s));
+            match next {
+                Some(s) => {
+                    if let Ok(t) = task.transition(s, "restart: re-queue", now) {
+                        let _ = self.store.record_transition(id, &t);
+                    }
+                }
+                None => break,
+            }
+        }
+        task.state == TaskState::Queued
+    }
+
+    /// Forget a terminal task: remove it from the registry and durable store entirely (SUM-130).
+    /// Refused when a live provider still exists or the task is not yet terminal (terminate first).
+    fn forget(&mut self, id: &str) -> Response {
+        if self.runtimes.contains_key(id) {
+            return Response::Error {
+                message: format!("task {id} is still running — terminate it before forgetting"),
+            };
+        }
+        let Some(task) = self.tasks.get(id) else {
+            return Response::Error {
+                message: format!("no such task: {id}"),
+            };
+        };
+        if !matches!(task.state, TaskState::Failed | TaskState::Terminated) {
+            return Response::Error {
+                message: format!(
+                    "task {id} is {} — terminate it before forgetting",
+                    task.state
+                ),
+            };
+        }
+        self.tasks.remove(id);
+        self.histories.remove(id);
+        if let Err(e) = self.store.delete_task(id) {
+            return Response::Error {
+                message: format!("store error forgetting {id}: {e}"),
+            };
+        }
+        self.audit(
+            Some(id),
+            "forgotten",
+            "task removed from the registry",
+            None,
+        );
+        self.event(Some(id), "lifecycle", "forgotten", "info", "daemon");
+        Response::Ok
     }
 
     /// Install a live runtime and ensure its history store exists (reused across resume so the
@@ -1408,6 +1515,105 @@ mod tests {
             Response::Task(v) => assert_eq!(v.state, "TERMINATED"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn forget_removes_a_terminated_task() {
+        let mut s = state();
+        let t = create(&mut s, "doomed");
+        s.handle(Request::TerminateTask { id: t.id.clone() });
+        assert!(matches!(
+            s.handle(Request::ForgetTask { id: t.id.clone() }),
+            Response::Ok
+        ));
+        match s.handle(Request::ListTasks) {
+            Response::Tasks(ts) => assert!(ts.is_empty(), "task should be gone"),
+            other => panic!("{other:?}"),
+        }
+        // It is also gone from the durable store.
+        assert!(s.store.load_task(&t.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn forget_refuses_a_nonterminal_task() {
+        let mut s = state();
+        let t = create(&mut s, "still queued"); // QUEUED, not terminal
+        assert!(matches!(
+            s.handle(Request::ForgetTask { id: t.id.clone() }),
+            Response::Error { .. }
+        ));
+        match s.handle(Request::ListTasks) {
+            Response::Tasks(ts) => assert_eq!(ts.len(), 1, "task must be retained"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn restart_refuses_a_terminated_task() {
+        let mut s = state();
+        let t = create(&mut s, "doomed");
+        s.handle(Request::TerminateTask { id: t.id.clone() });
+        assert!(matches!(
+            s.handle(Request::RestartTask { id: t.id.clone() }),
+            Response::Error { .. }
+        ));
+    }
+
+    /// End-to-end lifecycle over a real PTY (SUM-130): a generic shell task starts, terminates,
+    /// and is then forgotten — the exact path the quick-launch palette + `x` close key drive.
+    #[test]
+    fn shell_task_starts_terminates_and_is_forgotten() {
+        let tmp = std::env::temp_dir().join(format!("memmuxd-e2e-{}", std::process::id()));
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
+        let mut s = DaemonState::boot(store, envelope, tmp.clone()).unwrap();
+
+        let created = match s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "shell".into(),
+            repository_path: repo.to_string_lossy().into_owned(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
+        })) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+
+        match s.handle(Request::StartTask {
+            id: created.id.clone(),
+        }) {
+            Response::Task(v) => assert_eq!(v.state, "ACTIVE", "shell should launch"),
+            other => panic!("start: {other:?}"),
+        }
+        // Forget is refused while it is still running.
+        assert!(matches!(
+            s.handle(Request::ForgetTask {
+                id: created.id.clone()
+            }),
+            Response::Error { .. }
+        ));
+        // Terminate → Terminated, then forget removes it entirely.
+        match s.handle(Request::TerminateTask {
+            id: created.id.clone(),
+        }) {
+            Response::Task(v) => assert_eq!(v.state, "TERMINATED"),
+            other => panic!("terminate: {other:?}"),
+        }
+        assert!(matches!(
+            s.handle(Request::ForgetTask {
+                id: created.id.clone()
+            }),
+            Response::Ok
+        ));
+        match s.handle(Request::ListTasks) {
+            Response::Tasks(ts) => assert!(ts.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

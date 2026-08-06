@@ -75,10 +75,45 @@ impl Client {
         Ok(())
     }
 
-    /// Admit and launch a task's provider.
+    /// Create a task and return its id (SUM-130, used by quick-launch to chain create→start→attach).
+    pub fn create(&self, req: memmux_proto::CreateTaskRequest) -> anyhow::Result<String> {
+        match self.call(&Request::CreateTask(req))? {
+            Response::Task(t) => Ok(t.id),
+            Response::Error { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!("unexpected create response: {other:?}")),
+        }
+    }
+
+    /// Admit and launch a task's provider. Errors when the daemon refuses (e.g. not startable).
     pub fn start(&self, id: &str) -> anyhow::Result<()> {
-        self.call(&Request::StartTask { id: id.to_string() })?;
-        Ok(())
+        match self.call(&Request::StartTask { id: id.to_string() })? {
+            Response::Error { message } => Err(anyhow::anyhow!(message)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Restart a dead/failed task: re-queue and relaunch (SUM-130).
+    pub fn restart(&self, id: &str) -> anyhow::Result<()> {
+        match self.call(&Request::RestartTask { id: id.to_string() })? {
+            Response::Error { message } => Err(anyhow::anyhow!(message)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Terminate a running/queued task (SUM-130).
+    pub fn terminate(&self, id: &str) -> anyhow::Result<()> {
+        match self.call(&Request::TerminateTask { id: id.to_string() })? {
+            Response::Error { message } => Err(anyhow::anyhow!(message)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Forget a terminal task, removing it from the registry (SUM-130).
+    pub fn forget(&self, id: &str) -> anyhow::Result<()> {
+        match self.call(&Request::ForgetTask { id: id.to_string() })? {
+            Response::Error { message } => Err(anyhow::anyhow!(message)),
+            _ => Ok(()),
+        }
     }
 
     /// Fetch the current screen grid for a running task, if any.
