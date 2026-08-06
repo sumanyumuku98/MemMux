@@ -14,6 +14,9 @@ pub mod app;
 pub mod render;
 pub mod theme;
 
+/// Self-update: `memmux update` + the "update available" hint (SUM-129).
+pub mod update;
+
 #[cfg(unix)]
 pub mod client;
 

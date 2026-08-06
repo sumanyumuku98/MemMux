@@ -34,6 +34,34 @@ curl -fsSL https://raw.githubusercontent.com/sumanyumuku98/MemMux/main/install.s
 Because the installer fetches over `curl` (not a browser), macOS Gatekeeper does not quarantine
 the binaries — there is no signing prompt to clear.
 
+## Upgrading
+
+Once `memmux` is installed, upgrade both binaries in place with the built-in updater — no
+re-running the installer:
+
+```bash
+memmux update
+```
+
+It checks the [releases](https://github.com/sumanyumuku98/MemMux/releases) (pre-releases included),
+and if a newer version exists, downloads the archive for your platform and atomically replaces
+`memmux` and `memmuxd` where they're installed. If you're already current it's a no-op:
+
+```text
+checking for updates…
+memmux is already up to date (v0.3.0)
+```
+
+After an upgrade, restart the background daemon so it picks up the new build:
+
+```bash
+pkill memmuxd    # the next `memmux` launch auto-starts the new daemon
+```
+
+The TUI also shows a non-blocking **"update available"** hint in its status line on launch when a
+newer release exists. To install somewhere other than where the current binary lives, set
+`MEMMUX_BIN_DIR`; to pin a specific version, set `MEMMUX_VERSION` (e.g. `MEMMUX_VERSION=v0.3.0`).
+
 ## Manual download
 
 Grab the archive for your platform from the
