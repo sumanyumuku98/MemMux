@@ -30,7 +30,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # PR/main gate runs on Linux only — GitHub hosted macOS runners are unreliable to
+        # acquire for this account and were blocking merges. macOS coverage runs nightly and
+        # on-demand in ci-macos.yml (SUM-130).
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,7 +48,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # PR/main gate runs on Linux only — GitHub hosted macOS runners are unreliable to
+        # acquire for this account and were blocking merges. macOS coverage runs nightly and
+        # on-demand in ci-macos.yml (SUM-130).
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
