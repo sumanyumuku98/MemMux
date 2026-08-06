@@ -107,12 +107,6 @@ fn run<B: ratatui::backend::Backend>(
         }
         if last_refresh.elapsed() >= Duration::from_millis(1000) {
             refresh(client, model);
-            // Keep the live terminal view fresh while it's open.
-            if model.view == memmux::app::View::Term {
-                if let Some(id) = model.focused_task.clone() {
-                    load_screen(client, model, &id);
-                }
-            }
             last_refresh = Instant::now();
         }
     }
@@ -163,11 +157,6 @@ fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<St
             Ok(()) => model.status = format!("started {id}"),
             Err(e) => model.status = format!("start failed: {e}"),
         },
-        Effect::LoadScreen(id) => load_screen(client, model, &id),
-        Effect::LoadHistory { id, cursor } => match client.read_history(&id, cursor, 500) {
-            Ok(page) => model.history_rows = page.lines,
-            Err(e) => model.status = format!("history failed: {e}"),
-        },
         Effect::AddWorkspace(path) => match client.add_workspace(&path) {
             Ok(()) => refresh(client, model),
             Err(e) => model.status = format!("open folder failed: {e}"),
@@ -175,14 +164,6 @@ fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<St
         Effect::Attach(id) => return Some(id),
     }
     None
-}
-
-fn load_screen(client: &Client, model: &mut Model, id: &str) {
-    match client.get_screen(id) {
-        Ok(Some(s)) => model.screen_rows = s.rows,
-        Ok(None) => {}
-        Err(e) => model.status = format!("screen failed: {e}"),
-    }
 }
 
 fn refresh(client: &Client, model: &mut Model) {

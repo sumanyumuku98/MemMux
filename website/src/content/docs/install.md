@@ -79,8 +79,9 @@ Just run the UI — it **auto-starts the daemon** if one isn't already running (
 memmux                         # opens the TUI; starts memmuxd on demand (press ? for keys)
 ```
 
-In the UI, press **`o`** to open a folder as a **workspace**, then **`5`** to see your workspaces
-and **Enter** to launch an agent into the selected one (no manual repo path needed).
+In the UI: press **`o`** to open a folder as a **workspace**, use **`j`/`k`** to move around the
+sidebar, and **`Enter`** to launch an agent into the selected workspace (no manual repo path
+needed) or to open a running agent **interactively** (its own colours; **`Ctrl-a d`** to detach).
 
 The daemon stores durable state under `~/.memmux` (override with `MEMMUX_ROOT`) and is left
 running in the background after you quit the UI. You can also drive it directly from the CLI:

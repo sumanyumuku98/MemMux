@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod render;
+pub mod theme;
 
 #[cfg(unix)]
 pub mod client;
