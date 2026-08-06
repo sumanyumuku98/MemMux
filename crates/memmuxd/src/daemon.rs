@@ -15,6 +15,7 @@ use memmux_proto::{
 use memmux_pty::ChunkStore;
 use memmux_sched::{class_reservation, pressure::PressureStage, ResourceEnvelope};
 use memmux_store::{CheckpointRef, Decision, EventInput, Store, Workspace};
+use memmux_worktree::{ManagedLayout, TaskSlug, WorktreeHandle, WorktreeManager};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,6 +41,10 @@ pub struct DaemonState {
     histories: HashMap<String, ChunkStore>,
     /// Registered workspaces, keyed by id (SUM-124).
     workspaces: BTreeMap<String, Workspace>,
+    /// Creates/removes per-task git worktrees (SUM-121).
+    worktree_mgr: WorktreeManager,
+    /// Live per-task worktrees, keyed by task id.
+    worktrees: HashMap<String, WorktreeHandle>,
     /// Last time the pump checked running providers against their recycle threshold.
     last_recycle_check_ms: u64,
     seq: u64,
@@ -57,6 +62,7 @@ impl DaemonState {
             workspaces.insert(w.id.clone(), w);
         }
         let recovered = tasks.len();
+        let worktree_mgr = WorktreeManager::new(ManagedLayout::new(root.clone()));
         let state = Self {
             store,
             tasks,
@@ -65,6 +71,8 @@ impl DaemonState {
             runtimes: HashMap::new(),
             histories: HashMap::new(),
             workspaces,
+            worktree_mgr,
+            worktrees: HashMap::new(),
             last_recycle_check_ms: 0,
             seq: 0,
         };
@@ -307,6 +315,9 @@ impl DaemonState {
                 let _ = hist.flush();
             }
         }
+        // Dirty-protected worktree teardown (SUM-121): clean worktrees are removed, dirty ones
+        // are retained so no uncommitted work is lost.
+        self.cleanup_worktree(id);
 
         let task = self.tasks.get_mut(id).expect("checked above");
         // Drive ANY -> TERMINATING -> TERMINATED.
@@ -373,19 +384,24 @@ impl DaemonState {
                 },
             };
         }
-        let Some(task) = self.tasks.get_mut(id) else {
+        let Some(snapshot) = self.tasks.get(id).cloned() else {
             return Response::Error {
                 message: format!("no such task: {id}"),
             };
         };
-        if task.state != TaskState::Queued {
+        if snapshot.state != TaskState::Queued {
             return Response::Error {
-                message: format!("task {id} is not startable from {}", task.state),
+                message: format!("task {id} is not startable from {}", snapshot.state),
             };
         }
 
-        let (adapter, spec) = launch_spec_for(task);
+        // Cut an isolated per-task worktree and launch the provider inside it (SUM-121). Falls
+        // back to the raw repo path when it isn't a git repository.
+        let cwd = self.ensure_worktree(id, &snapshot);
+        let (adapter, mut spec) = launch_spec_for(&snapshot);
+        spec.cwd = Some(cwd);
 
+        let task = self.tasks.get_mut(id).expect("checked above");
         for (to, reason) in [
             (TaskState::Admitting, "admitted: fits budget"),
             (TaskState::Starting, "launching provider"),
@@ -433,6 +449,87 @@ impl DaemonState {
             let hist_dir = self.root.join("tasks").join(id).join("history");
             if let Ok(store) = ChunkStore::new(&hist_dir, HISTORY_CHUNK_LINES) {
                 self.histories.insert(id.to_string(), store);
+            }
+        }
+    }
+
+    /// Ensure the task has an isolated git worktree and return the directory to launch in
+    /// (SUM-121). Reuses an existing worktree; creates `memmux/<slug>` under the managed layout on
+    /// first start; falls back to the raw repo path when it isn't a git repository.
+    fn ensure_worktree(&mut self, id: &str, task: &Task) -> PathBuf {
+        if let Some(h) = self.worktrees.get(id) {
+            return h.path.clone();
+        }
+        let slug = TaskSlug::generate(&task.spec.title, id);
+        match self.worktree_mgr.create(
+            std::path::Path::new(&task.spec.repository_path),
+            &task.spec.repository,
+            &task.spec.id,
+            &slug,
+            &task.spec.base_branch,
+        ) {
+            Ok(handle) => {
+                let path = handle.path.clone();
+                self.audit(
+                    Some(id),
+                    "worktree_created",
+                    &format!(
+                        "isolated worktree at {} on {}",
+                        path.display(),
+                        handle.branch
+                    ),
+                    None,
+                );
+                self.event(Some(id), "worktree", "worktree_created", "info", "daemon");
+                self.worktrees.insert(id.to_string(), handle);
+                path
+            }
+            Err(e) => {
+                self.audit(
+                    Some(id),
+                    "worktree_skipped",
+                    &format!("no isolated worktree ({e}); launching in the repository path"),
+                    None,
+                );
+                PathBuf::from(&task.spec.repository_path)
+            }
+        }
+    }
+
+    /// Tear down a task's worktree with dirty-state protection (SUM-121/SUM-59): a clean worktree
+    /// is removed; a dirty one is **retained** (never deleted) with its patch hash recorded so no
+    /// uncommitted work is lost. No-op if the task has no worktree.
+    fn cleanup_worktree(&mut self, id: &str) {
+        let Some(handle) = self.worktrees.remove(id) else {
+            return;
+        };
+        let dirty = self
+            .worktree_mgr
+            .dirty_manifest(&handle)
+            .ok()
+            .filter(|m| m.dirty);
+        match dirty {
+            Some(m) => {
+                self.audit(
+                    Some(id),
+                    "worktree_retained",
+                    &format!(
+                        "worktree {} has uncommitted changes (patch {}); retained, not deleted",
+                        handle.path.display(),
+                        m.patch_hash
+                    ),
+                    None,
+                );
+                self.event(Some(id), "worktree", "worktree_retained", "warn", "daemon");
+            }
+            None => {
+                let _ = self.worktree_mgr.remove_worktree(&handle, false);
+                self.audit(
+                    Some(id),
+                    "worktree_removed",
+                    &format!("removed clean worktree {}", handle.path.display()),
+                    None,
+                );
             }
         }
     }
@@ -769,7 +866,11 @@ impl DaemonState {
         cp: &Checkpoint,
         now: u64,
     ) -> anyhow::Result<ResumeOutcome> {
-        let (adapter, spec) = launch_spec_for(task);
+        let (adapter, mut spec) = launch_spec_for(task);
+        // Resume/recycle into the same isolated worktree the task was launched in (SUM-121).
+        if let Some(h) = self.worktrees.get(id) {
+            spec.cwd = Some(h.path.clone());
+        }
         let cap = adapter.capabilities().resume;
         let mode = plan_resume(cap, cp.has_native_session());
 
@@ -874,6 +975,8 @@ impl DaemonState {
                     let _ = self.store.upsert_task(task);
                 }
             }
+            // The provider exited on its own — tear down its worktree (dirty-protected).
+            self.cleanup_worktree(&id);
             self.event(Some(&id), "process", "process_exited", "info", "daemon");
         }
 
@@ -1407,6 +1510,76 @@ mod tests {
             }),
             Response::Error { .. }
         ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tasks_get_isolated_worktrees_and_dirty_ones_are_retained() {
+        let dir = std::env::temp_dir().join(format!("memmuxd-wt121-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+
+        let mut s = DaemonState::boot(
+            Store::open_in_memory().unwrap(),
+            ResourceEnvelope::with_default_reserves(32 * GIB),
+            dir.clone(),
+        )
+        .unwrap();
+
+        let mk = |s: &mut DaemonState, title: &str| -> Task {
+            let v = match s.handle(Request::CreateTask(CreateTaskRequest {
+                title: title.into(),
+                repository_path: repo.display().to_string(),
+                provider: "generic".into(),
+                base_branch: "main".into(),
+                resource_class: None,
+                priority: None,
+                command: None,
+            })) {
+                Response::Task(v) => v,
+                other => panic!("{other:?}"),
+            };
+            s.tasks.get(&v.id).unwrap().clone()
+        };
+        let a = mk(&mut s, "task a");
+        let b = mk(&mut s, "task b");
+
+        // Each task gets its own worktree under the managed layout — distinct, real directories.
+        let pa = s.ensure_worktree(a.spec.id.as_str(), &a);
+        let pb = s.ensure_worktree(b.spec.id.as_str(), &b);
+        assert_ne!(pa, pb, "tasks must not share a worktree");
+        assert!(pa.is_dir() && pb.is_dir());
+        assert!(s.worktrees.contains_key(a.spec.id.as_str()));
+
+        // A dirty worktree is retained (never deleted); a clean one is removed.
+        std::fs::write(pa.join("uncommitted.txt"), "wip").unwrap();
+        s.cleanup_worktree(a.spec.id.as_str());
+        assert!(pa.exists(), "dirty worktree must be retained");
+        assert!(!s.worktrees.contains_key(a.spec.id.as_str()));
+
+        s.cleanup_worktree(b.spec.id.as_str());
+        assert!(!pb.exists(), "clean worktree should be removed");
 
         std::fs::remove_dir_all(&dir).ok();
     }
