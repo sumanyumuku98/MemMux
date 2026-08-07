@@ -244,8 +244,11 @@ fn sync_panes(model: &mut Model, panes: &mut PaneManager) {
 /// Bring a task's provider up (start, else restart) and open it as a live pane (SUM-132).
 fn open_agent_pane(client: &Client, model: &mut Model, panes: &mut PaneManager, id: &str) {
     if client.start(id).is_ok() || client.restart(id).is_ok() {
-        model.open_pane(id);
+        // Refresh FIRST so a freshly-created agent is in `model.data`; otherwise `open_pane`'s
+        // `ws_key(id)` can't resolve its workspace and drops it into the "other" group, so a split
+        // appears to jump to the new agent alone instead of tiling beside it (SUM-137).
         refresh(client, model);
+        model.open_pane(id);
         let (rows, cols) = pane_sizes(model)
             .into_iter()
             .find(|(pid, _)| pid == id)
