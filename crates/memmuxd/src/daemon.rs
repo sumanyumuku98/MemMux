@@ -16,7 +16,7 @@ use memmux_pty::ChunkStore;
 use memmux_sched::{class_reservation, pressure::PressureStage, ResourceEnvelope};
 use memmux_store::{CheckpointRef, Decision, EventInput, Store, Workspace};
 use memmux_worktree::{ManagedLayout, TaskSlug, WorktreeHandle, WorktreeManager};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -55,6 +55,13 @@ pub struct DaemonState {
     used_bytes: u64,
     /// Last time `sample_tick` ran, for throttling.
     last_sample_ms: u64,
+    /// Pids ever observed under each running task's root (SUM-77). Scopes reconciliation to the
+    /// managed set, and lets natural-exit reaping find descendants that already reparented to init.
+    seen_pids: HashMap<String, HashSet<i32>>,
+    /// Escaped pids already surfaced, to dedupe the per-tick escaped alerts (SUM-77).
+    escaped_reported: HashSet<i32>,
+    /// Fraction of managed-set memory attributed to a task in the last sweep (SUM-30 gate ≥ 0.95).
+    attributed_fraction: f64,
     seq: u64,
 }
 
@@ -94,6 +101,9 @@ impl DaemonState {
             samples: HashMap::new(),
             used_bytes: 0,
             last_sample_ms: 0,
+            seen_pids: HashMap::new(),
+            escaped_reported: HashSet::new(),
+            attributed_fraction: 1.0,
             seq: 0,
         };
         state.audit(
@@ -331,7 +341,11 @@ impl DaemonState {
             };
         }
 
-        // Kill and reap the live provider process, if any, preserving its history.
+        // Reap the WHOLE provider subtree, not just the direct PTY child (SUM-76). This must run
+        // while the root is still alive: once it exits, its descendants reparent to init and the
+        // subtree link is lost — so we reap first, then stop the runtime (which reaps the zombie).
+        let root_pid = self.runtimes.get(id).and_then(|rt| rt.pid());
+        self.reap_task_processes(id, root_pid);
         if let Some(mut rt) = self.runtimes.remove(id) {
             let _ = rt.stop();
             if let Some(hist) = self.histories.get_mut(id) {
@@ -690,6 +704,60 @@ impl DaemonState {
             Some(pid) => verify_subtree_gone(pid).1,
             None => "no pid to verify".into(),
         }
+    }
+
+    /// Recursively reap every process MemMux owns for task `id` — the root's current live subtree
+    /// (if `root_pid` is still alive) unioned with every pid we recorded under it — then record the
+    /// cleanup outcome (SUM-76 / §14.1: ≥99.5% of owned descendants gone). Also drops the task's
+    /// sampling/seen state. Reaping the recorded pids is what makes natural-exit cleanup work: once
+    /// the root dies its descendants reparent to init, so the live subtree alone no longer sees them.
+    fn reap_task_processes(&mut self, id: &str, root_pid: Option<u32>) {
+        #[cfg(unix)]
+        {
+            let sampler = memmux_metrics::default_sampler();
+            let mut targets: HashSet<i32> = HashSet::new();
+            if let Some(pid) = root_pid {
+                if let Ok(snap) = sampler.snapshot() {
+                    let tree = memmux_metrics::ProcessTree::from_samples(snap.samples);
+                    targets.insert(pid as i32);
+                    targets.extend(tree.descendants(pid as i32));
+                }
+            }
+            if let Some(seen) = self.seen_pids.get(id) {
+                targets.extend(seen.iter().copied());
+            }
+            targets.retain(|&p| p > 1);
+            if !targets.is_empty() {
+                let targets: Vec<i32> = targets.into_iter().collect();
+                let summary = match memmux_metrics::terminate_pids(
+                    sampler.as_ref(),
+                    &targets,
+                    TREE_VERIFY_GRACE,
+                ) {
+                    Ok(report) => {
+                        let clean = report.fully_cleaned();
+                        let summary = format!(
+                            "process-tree cleanup {:.0}% ({} targeted, {} survived{})",
+                            report.cleanup_fraction() * 100.0,
+                            report.targeted.len(),
+                            report.survivors.len(),
+                            if report.used_sigkill { ", sigkill" } else { "" },
+                        );
+                        let severity = if clean { "info" } else { "warn" };
+                        self.event(Some(id), "process", "process_reclaimed", severity, "daemon");
+                        summary
+                    }
+                    Err(e) => format!("process-tree reclaim error: {e}"),
+                };
+                self.audit(Some(id), "process_reclaimed", &summary, None);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = root_pid;
+
+        // The task is ending — forget its sampling/reconciliation state.
+        self.seen_pids.remove(id);
+        self.samples.remove(id);
     }
 
     /// The activity snapshot used for safe-point detection. Sub-state comes from the task's last
@@ -1097,6 +1165,7 @@ impl DaemonState {
             }
         }
         for id in exited {
+            let root_pid = self.runtimes.get(&id).and_then(|rt| rt.pid());
             if let Some(mut rt) = self.runtimes.remove(&id) {
                 // Final drain + flush before dropping the runtime.
                 if let Some(hist) = self.histories.get_mut(&id) {
@@ -1104,6 +1173,9 @@ impl DaemonState {
                     let _ = hist.flush();
                 }
             }
+            // The provider exited on its own; its descendants may have reparented to init. Reap
+            // them from the pids we recorded under this task while it was running (SUM-76).
+            self.reap_task_processes(&id, root_pid);
             if let Some(task) = self.tasks.get_mut(&id) {
                 if !task.state.is_terminal() && task.state != TaskState::Terminating {
                     if let Ok(t) = task.transition(TaskState::Terminating, "provider exited", now) {
@@ -1129,10 +1201,12 @@ impl DaemonState {
     /// task — caching per-task bytes + the agent-attributed total for `pressure` and `TaskView`,
     /// and persisting each sample to the durable store for history/benchmarking.
     ///
-    /// Host-wide attribution with the ≥0.95 gate + escaped/unknown surfacing (SUM-30/77) needs
-    /// launch-wrapper-reported pids to be meaningful (otherwise every unrelated host process reads
-    /// as "unknown"); that lands with the reconciliation-sweep ticket. Here we only attribute the
-    /// processes MemMux actually launched.
+    /// It also runs a **managed-scoped** reconciliation sweep (SUM-77/30): the pids ever seen under
+    /// each task's root are recorded in `seen_pids`, and reconciliation is scoped to that managed
+    /// set (via [`managed_reconcile`]) so unrelated host processes are never misclassified as
+    /// "unknown". Processes that escaped their task's subtree are surfaced as `process_escaped`
+    /// events (deduped); the ≥0.95 attribution gate is tracked over the managed set. Reclaiming
+    /// escaped processes is a pressure-ladder policy (deferred) — here we only surface them.
     fn sample_tick(&mut self, now: u64) {
         if now.saturating_sub(self.last_sample_ms) < SAMPLE_INTERVAL_MS {
             return;
@@ -1147,7 +1221,10 @@ impl DaemonState {
             .collect();
         if roots.is_empty() {
             self.samples.clear();
+            self.seen_pids.clear();
+            self.escaped_reported.clear();
             self.used_bytes = 0;
+            self.attributed_fraction = 1.0;
             return;
         }
 
@@ -1156,6 +1233,10 @@ impl DaemonState {
             return;
         };
         let tree = memmux_metrics::ProcessTree::from_samples(snap.samples);
+
+        // Forget tasks that are no longer running.
+        let running: HashSet<&str> = roots.iter().map(|(id, _)| id.as_str()).collect();
+        self.seen_pids.retain(|id, _| running.contains(id.as_str()));
 
         self.samples.clear();
         let mut total_accounted = 0u64;
@@ -1169,11 +1250,55 @@ impl DaemonState {
                 .store
                 .record_sample(now, Some(id), s.rss_bytes, s.accounted_bytes);
             self.samples.insert(id.clone(), s);
+
+            // Record every pid currently under this task's root, and prune ones no longer alive.
+            let seen = self.seen_pids.entry(id.clone()).or_default();
+            seen.insert(*pid);
+            seen.extend(tree.descendants(*pid));
+            seen.retain(|p| tree.get(*p).is_some());
         }
         self.used_bytes = total_accounted;
         let _ = self
             .store
             .record_sample(now, None, self.used_bytes, self.used_bytes);
+
+        // Managed-scoped reconciliation: flag processes that escaped their task's subtree.
+        let report = managed_reconcile(&tree, &roots, &self.seen_pids);
+        self.attributed_fraction = report.attributed_fraction;
+        if self.attributed_fraction < 0.95 {
+            self.event(None, "process", "attribution_below_gate", "warn", "daemon");
+        }
+
+        let escaped_now: HashSet<i32> = report.escaped.iter().map(|f| f.pid).collect();
+        for f in &report.escaped {
+            if self.escaped_reported.insert(f.pid) {
+                // A process a task once owned is now outside its subtree — surface, don't kill.
+                let _ = self.store.append_event(&EventInput {
+                    task_id: None,
+                    ts_ms: now_ms(),
+                    category: "process".to_string(),
+                    event_type: "process_escaped".to_string(),
+                    severity: "warn".to_string(),
+                    source: "daemon".to_string(),
+                    payload_json: Some(
+                        serde_json::json!({
+                            "pid": f.pid,
+                            "name": f.name,
+                            "bytes": f.bytes,
+                        })
+                        .to_string(),
+                    ),
+                });
+                self.audit(
+                    None,
+                    "process_escaped",
+                    &format!("pid {} ({}) escaped its task subtree", f.pid, f.name),
+                    Some(serde_json::json!({ "pid": f.pid, "bytes": f.bytes }).to_string()),
+                );
+            }
+        }
+        // Let pids that are no longer escaped re-alert if they escape again later.
+        self.escaped_reported.retain(|p| escaped_now.contains(p));
     }
 
     /// Throttled RSS-threshold recycle trigger (SUM-94): every `RECYCLE_CHECK_INTERVAL_MS`, sample
@@ -1405,6 +1530,51 @@ fn verify_subtree_gone(pid: u32) -> (bool, String) {
         let _ = pid;
         (true, "process-tree verification is unix-only".into())
     }
+}
+
+/// Reconcile the **managed** process set — the pids MemMux has seen under each task root — against
+/// the current tree, flagging processes that escaped their task's subtree (SUM-77/30).
+///
+/// The sweep is deliberately scoped: a tree containing only managed pids is handed to
+/// [`memmux_metrics::reconcile_tree`], so unrelated host processes are never seen and never
+/// misclassified as "unknown" (which is what made a naive host-wide sweep useless). A pid that was
+/// seen under a root but now sits outside every root's subtree (e.g. reparented to init) is
+/// classified `escaped`; `attributed_fraction` is therefore measured over the managed set only.
+fn managed_reconcile(
+    tree: &memmux_metrics::ProcessTree,
+    roots: &[(String, i32)],
+    seen: &HashMap<String, HashSet<i32>>,
+) -> memmux_metrics::ReconciliationReport {
+    // Managed pids: each root + its live descendants, plus every still-alive pid ever seen.
+    let mut managed: HashSet<i32> = HashSet::new();
+    for (_id, pid) in roots {
+        if tree.get(*pid).is_some() {
+            managed.insert(*pid);
+            managed.extend(tree.descendants(*pid));
+        }
+    }
+    for pids in seen.values() {
+        managed.extend(pids.iter().filter(|p| tree.get(**p).is_some()).copied());
+    }
+
+    // A tree of only the managed processes — `attribute` can't see the rest of the host.
+    let samples: Vec<memmux_metrics::ProcessSample> = managed
+        .iter()
+        .filter_map(|p| tree.get(*p).cloned())
+        .collect();
+    let managed_tree = memmux_metrics::ProcessTree::from_samples(samples);
+
+    let root_specs: Vec<memmux_metrics::RootSpec> = roots
+        .iter()
+        .map(|(id, pid)| memmux_metrics::RootSpec::task(*pid, id.clone()))
+        .collect();
+    let mut expected: HashMap<i32, memmux_core::ids::TaskId> = HashMap::new();
+    for (id, pids) in seen {
+        for p in pids {
+            expected.insert(*p, memmux_core::ids::TaskId::new(id.clone()));
+        }
+    }
+    memmux_metrics::reconcile_tree(&managed_tree, &root_specs, &expected)
 }
 
 fn view(task: &Task) -> TaskView {
@@ -1985,6 +2155,151 @@ mod tests {
             .is_empty());
 
         s.handle(Request::TerminateTask { id: created.id });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Pure managed-scoped reconciliation (SUM-77/30): a previously-seen pid that reparented
+    /// outside its root is flagged `escaped`, while unrelated host processes are never seen (so
+    /// never misclassified as unknown), and attribution is measured over the managed set only.
+    #[test]
+    fn managed_reconcile_flags_escaped_but_ignores_unrelated_host_processes() {
+        use memmux_metrics::{ProcessSample, ProcessTree};
+        fn s(pid: i32, ppid: i32, rss: u64) -> ProcessSample {
+            ProcessSample {
+                pid,
+                ppid,
+                name: format!("p{pid}"),
+                rss_bytes: rss,
+                pss_bytes: None,
+                phys_footprint_bytes: None,
+            }
+        }
+        // task_A root 100 (child 101); pid 300 was seen under task_A but reparented to init
+        // (escaped); pid 999 is an unrelated host process; pid 1 is init.
+        let tree = ProcessTree::from_samples(vec![
+            s(1, 0, 10),
+            s(100, 1, 500),
+            s(101, 100, 200),
+            s(300, 1, 250),
+            s(999, 1, 700),
+        ]);
+        let roots = vec![("task_A".to_string(), 100)];
+        let mut seen: HashMap<String, HashSet<i32>> = HashMap::new();
+        seen.insert("task_A".to_string(), [100, 101, 300].into_iter().collect());
+
+        let report = managed_reconcile(&tree, &roots, &seen);
+
+        assert_eq!(
+            report.escaped.iter().map(|f| f.pid).collect::<Vec<_>>(),
+            vec![300],
+            "the reparented once-owned pid must be flagged escaped"
+        );
+        assert_eq!(report.escaped[0].bytes, 250);
+        assert!(
+            report.unknown.is_empty(),
+            "unrelated host processes must be out of scope, not flagged unknown"
+        );
+        assert!(
+            !report.escaped.iter().any(|f| f.pid == 999),
+            "the unrelated host process must not be flagged"
+        );
+        // Over the managed set every byte is attributed (owned or escaped-but-known).
+        assert_eq!(report.attributed_fraction, 1.0);
+    }
+
+    /// End-to-end (real PTY, per the TDD DoD): terminating a task reaps its WHOLE provider
+    /// subtree, not just the direct PTY child (SUM-76). A shell forks two `sleep` children;
+    /// after `TerminateTask` the entire subtree is gone.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_reaps_the_whole_provider_subtree() {
+        fn snapshot_tree() -> memmux_metrics::ProcessTree {
+            let sampler = memmux_metrics::default_sampler();
+            memmux_metrics::ProcessTree::from_samples(sampler.snapshot().unwrap().samples)
+        }
+        fn poll_descendants(root: i32, want: usize) -> Vec<i32> {
+            for _ in 0..30 {
+                let d = snapshot_tree().descendants(root);
+                if d.len() >= want {
+                    return d;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            snapshot_tree().descendants(root)
+        }
+        fn pid_gone(pid: i32) -> bool {
+            for _ in 0..40 {
+                if snapshot_tree().get(pid).is_none() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            snapshot_tree().get(pid).is_none()
+        }
+
+        let tmp = std::env::temp_dir().join(format!("memmuxd-reap-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("repo")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
+        let mut s = DaemonState::boot(store, envelope, tmp.clone()).unwrap();
+
+        let created = match s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "tree".into(),
+            repository_path: tmp.join("repo").to_string_lossy().into_owned(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 300 & sleep 300 & wait".into(),
+            ]),
+        })) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            s.handle(Request::StartTask {
+                id: created.id.clone()
+            }),
+            Response::Task(_)
+        ));
+
+        let root_pid = s
+            .runtimes
+            .get(&created.id)
+            .and_then(|rt| rt.pid())
+            .expect("running provider pid") as i32;
+
+        // Wait for the shell to fork its two `sleep` children.
+        let descendants = poll_descendants(root_pid, 2);
+        assert!(
+            descendants.len() >= 2,
+            "expected the shell to fork sleep children, got {descendants:?}"
+        );
+
+        // A sample tick records the whole subtree into seen_pids.
+        s.sample_tick(10_000);
+        let seen = s.seen_pids.get(&created.id).cloned().unwrap_or_default();
+        assert!(
+            descendants.iter().all(|p| seen.contains(p)),
+            "seen_pids must record the subtree: seen={seen:?} descendants={descendants:?}"
+        );
+
+        s.handle(Request::TerminateTask {
+            id: created.id.clone(),
+        });
+
+        // The entire subtree is gone — the ≥99.5% cleanup is wired into terminate, not just recycle.
+        for pid in &descendants {
+            assert!(pid_gone(*pid), "descendant {pid} should have been reaped");
+        }
+        assert!(
+            pid_gone(root_pid),
+            "root {root_pid} should have been reaped"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
