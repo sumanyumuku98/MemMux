@@ -9,7 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-const SIDEBAR_WIDTH: u16 = 30;
+/// Sidebar width in columns (shared with the runtime's pane-geometry math — SUM-132).
+pub const SIDEBAR_WIDTH: u16 = 30;
 
 /// Draw the whole UI for the current model.
 pub fn render(f: &mut Frame, model: &Model) {
@@ -82,7 +83,90 @@ fn render_home(f: &mut Frame, area: Rect, model: &Model) {
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(10)])
         .split(area);
     render_sidebar(f, cols[0], model);
-    render_detail(f, cols[1], model);
+    // With panes open, the main area is the pane grid; otherwise the agent/workspace detail.
+    if model.panes.is_some() {
+        render_pane_grid(f, cols[1], model);
+    } else {
+        render_detail(f, cols[1], model);
+    }
+}
+
+/// Render the open agent panes into `area` (SUM-132): the tiling tree, or just the focused pane
+/// when zoomed.
+fn render_pane_grid(f: &mut Frame, area: Rect, model: &Model) {
+    let Some(layout) = &model.panes else { return };
+    if model.zoomed {
+        if let Some(id) = model.focused_pane() {
+            render_pane(f, area, id, model);
+            return;
+        }
+    }
+    for (id, rect) in layout.leaf_rects(area) {
+        render_pane(f, rect, &id, model);
+    }
+}
+
+/// Render one agent pane: a rounded panel (accent border when focused) whose body is the agent's
+/// live colored screen snapshot (SUM-132).
+fn render_pane(f: &mut Frame, area: Rect, id: &str, model: &Model) {
+    let focused = model.focused_pane() == Some(id);
+    let task = model.data.tasks.iter().find(|t| t.id == id);
+    let (title_text, state) = match task {
+        Some(t) => (short(&t.title, 24), t.state.clone()),
+        None => (short(id, 24), String::new()),
+    };
+    let border = if focused {
+        theme::ACCENT
+    } else {
+        theme::state_color(&state)
+    };
+    let title = format!(" {title_text} · {state} ");
+    let block = panel_accent(&title, border);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    match model.pane_screens.get(id) {
+        Some(grid) if !grid.rows.is_empty() => {
+            let lines: Vec<Line> = grid
+                .rows
+                .iter()
+                .take(inner.height as usize)
+                .map(|row| {
+                    Line::from(
+                        row.iter()
+                            .take(inner.width as usize)
+                            .map(|c| {
+                                Span::styled(
+                                    c.ch.to_string(),
+                                    Style::default().fg(c.fg).bg(c.bg).add_modifier(c.mods),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), inner);
+            // Place the real terminal cursor in the focused, live pane.
+            if focused && grid.alive {
+                let (cr, cc) = grid.cursor;
+                if cc < inner.width && cr < inner.height {
+                    f.set_cursor_position((inner.x + cc, inner.y + cr));
+                }
+            }
+        }
+        _ => {
+            let msg = if model.pane_screens.get(id).map(|g| g.alive) == Some(false) {
+                "· agent exited — Ctrl-a x to close ·"
+            } else {
+                "· starting… ·"
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(msg, theme::dim())))
+                    .alignment(Alignment::Center),
+                inner,
+            );
+        }
+    }
 }
 
 fn render_sidebar(f: &mut Frame, area: Rect, model: &Model) {
@@ -166,7 +250,7 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model) {
                 kv("workspace", &workspace_name(model, &t.repository)),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enter → open interactive session (Ctrl-a d to detach)",
+                    "Enter → open as a pane (Ctrl-a o to return to the sidebar)",
                     Style::default().fg(theme::ACCENT2),
                 )),
             ]
@@ -386,16 +470,25 @@ fn render_confirm(f: &mut Frame, area: Rect, model: &Model) {
 
 fn render_help(f: &mut Frame, area: Rect) {
     let keys = [
-        ("j / k", "move selection"),
+        ("j / k", "move sidebar selection"),
         (
             "enter",
-            "open agent (starts/restarts + attaches) · or launch into a workspace",
+            "open the selected agent as a pane · or launch into a workspace",
         ),
         ("c", "launch an agent or shell (quick-launch palette)"),
-        ("x", "close: terminate a running agent or remove a dead one"),
+        (
+            "x",
+            "sidebar: terminate a running agent or remove a dead one",
+        ),
         ("n", "new agent via the full form"),
         ("o", "browse for a folder to register as a workspace"),
-        ("Ctrl-a d", "detach from an agent"),
+        ("—— panes ——", "(focus in a pane, then Ctrl-a …)"),
+        ("Ctrl-a h/j/k/l", "move focus between panes"),
+        ("Ctrl-a v / -", "split: launch a new pane right / down"),
+        ("Ctrl-a z", "zoom the focused pane"),
+        ("Ctrl-a x", "close the focused pane"),
+        ("Ctrl-a o / d", "return focus to the sidebar"),
+        ("Ctrl-a Ctrl-a", "send a literal Ctrl-a to the agent"),
         ("? ", "toggle this help"),
         ("q", "quit"),
     ];
@@ -592,11 +685,11 @@ mod tests {
     }
 
     #[test]
-    fn selecting_an_agent_shows_the_interactive_hint() {
+    fn selecting_an_agent_shows_the_open_pane_hint() {
         let mut m = model();
         m.selected = 1; // the agent row
         let s = text_of(&m);
-        assert!(s.contains("interactive session"));
+        assert!(s.contains("open as a pane"));
     }
 
     #[test]
@@ -605,7 +698,40 @@ mod tests {
         m.view = View::Help;
         let s = text_of(&m);
         assert!(s.contains("HELP"));
-        assert!(s.contains("detach"));
+        assert!(s.contains("panes"));
+    }
+
+    #[test]
+    fn open_pane_renders_the_agent_screen_with_focus_border() {
+        use crate::app::{GridCell, StyledGrid};
+        let mut m = model();
+        m.open_pane("task_abc");
+        m.pane_screens.insert(
+            "task_abc".into(),
+            StyledGrid {
+                rows: vec![vec![
+                    GridCell {
+                        ch: 'h',
+                        fg: theme::FG,
+                        bg: theme::BG,
+                        mods: ratatui::style::Modifier::empty(),
+                    },
+                    GridCell {
+                        ch: 'i',
+                        fg: theme::FG,
+                        bg: theme::BG,
+                        mods: ratatui::style::Modifier::empty(),
+                    },
+                ]],
+                cursor: (0, 2),
+                alive: true,
+            },
+        );
+        let s = text_of(&m);
+        // The sidebar stays visible AND the agent's live screen renders in the pane.
+        assert!(s.contains("WORKSPACES"));
+        assert!(s.contains("hi"));
+        assert!(s.contains("Refactor auth")); // agent title in the pane border
     }
 
     #[test]

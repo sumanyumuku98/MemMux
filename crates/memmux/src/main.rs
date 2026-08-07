@@ -8,14 +8,16 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use memmux::app::{update, Effect, Key, Model};
+use memmux::app::update;
+use memmux::app::{Dir, Effect, Focus, Key, Model, Orient, View};
 use memmux::client::Client;
+use memmux::pane::PaneManager;
 use memmux::render::render;
-use memmux_proto::{AttachClientMsg, AttachServerMsg, CreateTaskRequest, Request};
-use ratatui::backend::{Backend, CrosstermBackend};
+use memmux_proto::{CreateTaskRequest, Request};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
-use std::io::{stdout, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -102,36 +104,42 @@ fn run<B: ratatui::backend::Backend>(
     model: &mut Model,
     hint_rx: &std::sync::mpsc::Receiver<String>,
 ) -> anyhow::Result<()> {
+    // Reader threads ping `dirty` when a pane gets new output so we can redraw promptly (SUM-132).
+    let (dirty_tx, dirty_rx) = mpsc::channel::<()>();
+    let mut panes = PaneManager::new(client.socket().to_path_buf(), dirty_tx);
     let mut last_refresh = Instant::now();
     loop {
+        // Snapshot live pane screens into the model, resize sessions to their rects, drop closed.
+        sync_panes(model, &mut panes);
         // Surface the background update-check result once it arrives (SUM-129).
         if let Ok(msg) = hint_rx.try_recv() {
             model.status = msg;
         }
         terminal.draw(|f| render(f, model))?;
 
-        if event::poll(Duration::from_millis(250))? {
+        // Redraw quickly while panes stream output; idle otherwise.
+        let timeout = if model.panes.is_some() {
+            Duration::from_millis(33)
+        } else {
+            Duration::from_millis(250)
+        };
+        if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Release {
-                    if let Some(k) = map_key(key.code, key.modifiers) {
-                        let effects = update(model, k);
-                        let mut attach = None;
-                        for effect in effects {
-                            if let Some(id) = apply_effect(client, model, effect) {
-                                attach = Some(id);
-                            }
-                        }
-                        if let Some(id) = attach {
-                            if let Err(e) = attach_passthrough(terminal, client, &id) {
-                                model.status = format!("attach ended: {e}");
-                            }
-                            // Raw passthrough returned (detached / agent exited); refresh the list.
-                            refresh(client, model);
+                    if model.view == View::Home && model.focus == Focus::Panes {
+                        // Focused pane grid: Ctrl-a prefix drives pane commands, else keys are
+                        // forwarded to the focused agent (SUM-132).
+                        handle_pane_key(client, model, &mut panes, key.code, key.modifiers);
+                    } else if let Some(k) = map_key(key.code, key.modifiers) {
+                        for effect in update(model, k) {
+                            apply_effect(client, model, &mut panes, effect);
                         }
                     }
                 }
             }
         }
+        // Coalesce pane dirty pings (we redraw every loop anyway).
+        while dirty_rx.try_recv().is_ok() {}
 
         if model.should_quit {
             break;
@@ -142,6 +150,135 @@ fn run<B: ratatui::backend::Backend>(
         }
     }
     Ok(())
+}
+
+/// The pane grid's rect on screen — must match `render_home`'s split (SUM-132).
+fn grid_area() -> Rect {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    Rect {
+        x: memmux::render::SIDEBAR_WIDTH.min(cols),
+        y: 1,
+        width: cols.saturating_sub(memmux::render::SIDEBAR_WIDTH),
+        height: rows.saturating_sub(2),
+    }
+}
+
+/// Each open pane's inner content size `(rows, cols)` (rect minus its 1-cell border).
+fn pane_sizes(model: &Model) -> Vec<(String, (u16, u16))> {
+    let Some(layout) = &model.panes else {
+        return Vec::new();
+    };
+    let area = grid_area();
+    let rects = if model.zoomed {
+        match model.focused_pane() {
+            Some(f) => vec![(f.to_string(), area)],
+            None => layout.leaf_rects(area),
+        }
+    } else {
+        layout.leaf_rects(area)
+    };
+    rects
+        .into_iter()
+        .map(|(id, r)| (id, (r.height.saturating_sub(2), r.width.saturating_sub(2))))
+        .collect()
+}
+
+/// Resize live pane PTYs to their rects, snapshot them into the model, and drop closed sessions.
+fn sync_panes(model: &mut Model, panes: &mut PaneManager) {
+    let ids: Vec<String> = model.panes.as_ref().map(|l| l.leaves()).unwrap_or_default();
+    panes.retain(&ids);
+    for (id, (rows, cols)) in pane_sizes(model) {
+        panes.resize(&id, rows, cols);
+        if let Some(grid) = panes.snapshot(&id) {
+            model.pane_screens.insert(id, grid);
+        }
+    }
+    model.pane_screens.retain(|k, _| ids.iter().any(|i| i == k));
+}
+
+/// Bring a task's provider up (start, else restart) and open it as a live pane (SUM-132).
+fn open_agent_pane(client: &Client, model: &mut Model, panes: &mut PaneManager, id: &str) {
+    if client.start(id).is_ok() || client.restart(id).is_ok() {
+        model.open_pane(id);
+        refresh(client, model);
+        let (rows, cols) = pane_sizes(model)
+            .into_iter()
+            .find(|(pid, _)| pid == id)
+            .map(|(_, sz)| sz)
+            .unwrap_or((24, 80));
+        if let Err(e) = panes.open(id, rows.max(1), cols.max(1)) {
+            model.status = format!("attach failed: {e}");
+            model.close_pane(id);
+        }
+    } else {
+        model.close_pane(id);
+        refresh(client, model);
+        model.status = format!("{id}: agent exited — Enter to retry, x to remove");
+    }
+}
+
+/// Keys while a pane is focused: `Ctrl-a` prefix + command, else forward to the agent (SUM-132).
+fn handle_pane_key(
+    client: &Client,
+    model: &mut Model,
+    panes: &mut PaneManager,
+    code: KeyCode,
+    mods: KeyModifiers,
+) {
+    let ctrl_a = mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('a');
+    if model.prefix_active {
+        model.prefix_active = false;
+        match code {
+            KeyCode::Char('o') | KeyCode::Char('d') | KeyCode::Esc => model.focus = Focus::Sidebar,
+            KeyCode::Char('h') => model.focus_dir(Dir::Left, grid_area()),
+            KeyCode::Char('j') => model.focus_dir(Dir::Down, grid_area()),
+            KeyCode::Char('k') => model.focus_dir(Dir::Up, grid_area()),
+            KeyCode::Char('l') => model.focus_dir(Dir::Right, grid_area()),
+            KeyCode::Char('z') => model.toggle_zoom(),
+            KeyCode::Char('x') => {
+                if let Some(id) = model.focused_pane().map(str::to_string) {
+                    model.close_pane(&id);
+                    panes.close(&id);
+                }
+            }
+            // Split: choose orientation for the next opened pane, then pick an agent to launch.
+            KeyCode::Char('v') => {
+                model.split_orient = Orient::Cols;
+                open_launch_from_panes(model);
+            }
+            KeyCode::Char('-') => {
+                model.split_orient = Orient::Rows;
+                open_launch_from_panes(model);
+            }
+            // Ctrl-a Ctrl-a → send a literal Ctrl-a to the agent.
+            _ if ctrl_a => {
+                if let Some(id) = model.focused_pane().map(str::to_string) {
+                    panes.send_input(&id, &[0x01]);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    if ctrl_a {
+        model.prefix_active = true;
+        return;
+    }
+    if let Some(id) = model.focused_pane().map(str::to_string) {
+        if let Some(bytes) = key_to_bytes(code, mods) {
+            panes.send_input(&id, &bytes);
+        }
+    }
+    // The runtime will start the provider / open the session when the palette pick returns.
+    let _ = client;
+}
+
+/// Open the quick-launch palette from within the pane grid (Ctrl-a v / Ctrl-a -).
+fn open_launch_from_panes(model: &mut Model) {
+    let repo = model.launch_target_repo();
+    model.launch_repo = repo;
+    model.launch_selected = 0;
+    model.view = View::Launch;
 }
 
 /// `memmux update`: resolve the newest release and swap the installed binaries in place (SUM-129).
@@ -207,34 +344,31 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
     })
 }
 
-/// Apply one effect. Returns `Some(task_id)` if an attach passthrough should be entered (the
-/// runtime must own the terminal for that, so it can't happen inside this function).
-fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<String> {
+/// Apply one effect against the daemon and the local pane manager (SUM-132).
+fn apply_effect(client: &Client, model: &mut Model, panes: &mut PaneManager, effect: Effect) {
     match effect {
         Effect::Refresh => refresh(client, model),
         Effect::CreateTask(req) => match client.call(&Request::CreateTask(req)) {
             Ok(_) => refresh(client, model),
             Err(e) => model.status = format!("create failed: {e}"),
         },
-        // One-key quick-launch (SUM-130): create → start → attach, all here. Returns the id to
-        // attach only when a provider actually came up.
+        // Quick-launch (SUM-130/132): create the task, then open it as a live pane.
         Effect::QuickLaunch {
             provider,
             repo,
             shell,
-        } => return quick_launch(client, model, &provider, &repo, shell),
-        // Open an agent (SUM-130): reuse/start/restart, attaching only if a live provider results —
-        // this is the fix for Enter flashing a blank screen on a dead agent.
-        Effect::OpenTask(id) => {
-            if client.start(&id).is_ok() || client.restart(&id).is_ok() {
-                refresh(client, model);
-                return Some(id);
+        } => {
+            if let Some(id) = quick_launch(client, model, &provider, &repo, shell) {
+                open_agent_pane(client, model, panes, &id);
             }
-            refresh(client, model);
-            model.status = format!("{id}: agent exited — press Enter to restart, x to remove");
         }
+        // Open an agent as a pane (SUM-132): start-or-restart, then wire the live session.
+        Effect::OpenPane(id) => open_agent_pane(client, model, panes, &id),
         Effect::TerminateTask(id) => match client.terminate(&id) {
             Ok(()) => {
+                // Terminating an open agent also closes its pane.
+                model.close_pane(&id);
+                panes.close(&id);
                 model.status = format!("terminated {id}");
                 refresh(client, model);
             }
@@ -242,6 +376,8 @@ fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<St
         },
         Effect::ForgetTask(id) => match client.forget(&id) {
             Ok(()) => {
+                model.close_pane(&id);
+                panes.close(&id);
                 model.status = format!("removed {id}");
                 refresh(client, model);
             }
@@ -252,14 +388,12 @@ fn apply_effect(client: &Client, model: &mut Model, effect: Effect) -> Option<St
             Ok(()) => refresh(client, model),
             Err(e) => model.status = format!("open folder failed: {e}"),
         },
-        Effect::Attach(id) => return Some(id),
     }
-    None
 }
 
-/// Quick-launch (SUM-130): create a task for `provider` in `repo`, start it, and — on success —
-/// return its id so the caller enters attach. A `shell` launch uses the generic provider with
-/// `$SHELL` (the generic adapter with no command exits immediately, so one must be supplied).
+/// Quick-launch (SUM-130): create a task for `provider` in `repo` and return its id. A `shell`
+/// launch uses the generic provider with `$SHELL` (the generic adapter with no command exits
+/// immediately, so one must be supplied). The caller opens the pane.
 fn quick_launch(
     client: &Client,
     model: &mut Model,
@@ -277,21 +411,12 @@ fn quick_launch(
         priority: None,
         command,
     };
-    let id = match client.create(req) {
-        Ok(id) => id,
-        Err(e) => {
-            model.status = format!("launch failed: {e}");
-            return None;
-        }
-    };
-    match client.start(&id) {
-        Ok(()) => {
-            refresh(client, model);
+    match client.create(req) {
+        Ok(id) => {
             model.status = format!("launched {provider}");
             Some(id)
         }
         Err(e) => {
-            refresh(client, model);
             model.status = format!("launch failed: {e}");
             None
         }
@@ -340,111 +465,6 @@ fn refresh(client: &Client, model: &mut Model) {
     }
 }
 
-/// Interactive attach: a **true raw passthrough** to the task's PTY (SUM-125). The agent's raw
-/// output bytes are written straight to our terminal so it renders the agent's own colours/UI
-/// natively; our keystrokes are forwarded as input. `Ctrl-a d` detaches (`Ctrl-a Ctrl-a` sends a
-/// literal Ctrl-a). The agent is sized to our real terminal so it repaints full-screen.
-fn attach_passthrough<B: Backend>(
-    terminal: &mut Terminal<B>,
-    client: &Client,
-    id: &str,
-) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(client.socket())?;
-    send_frame(
-        &mut stream,
-        &serde_json::to_vec(&Request::Attach { id: id.to_string() })?,
-    )?;
-
-    // Size the agent to our real terminal, then clear so it repaints over a blank screen.
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    send_frame(
-        &mut stream,
-        &serde_json::to_vec(&AttachClientMsg::Resize { rows, cols })?,
-    )?;
-    {
-        let mut out = stdout();
-        let _ = execute!(
-            out,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::MoveTo(0, 0)
-        );
-    }
-
-    // Reader thread: write the agent's raw bytes straight to our stdout.
-    let mut reader_stream = stream.try_clone()?;
-    let (exit_tx, exit_rx) = mpsc::channel::<()>();
-    let reader = std::thread::spawn(move || {
-        let mut out = stdout();
-        while let Ok(Some(bytes)) = recv_frame(&mut reader_stream) {
-            match serde_json::from_slice::<AttachServerMsg>(&bytes) {
-                Ok(AttachServerMsg::Output { data: b }) => {
-                    let _ = out.write_all(&b);
-                    let _ = out.flush();
-                }
-                Ok(AttachServerMsg::Exited) => break,
-                _ => {}
-            }
-        }
-        let _ = exit_tx.send(());
-    });
-
-    let mut prefix = false;
-    let result = loop {
-        if exit_rx.try_recv().is_ok() {
-            break Ok(()); // agent exited
-        }
-        if event::poll(Duration::from_millis(20))? {
-            match event::read()? {
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    let ctrl_a =
-                        k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('a');
-                    if ctrl_a && !prefix {
-                        prefix = true;
-                        continue;
-                    }
-                    if prefix {
-                        prefix = false;
-                        if k.code == KeyCode::Char('d') {
-                            let _ = send_frame(
-                                &mut stream,
-                                &serde_json::to_vec(&AttachClientMsg::Detach)?,
-                            );
-                            break Ok(());
-                        }
-                        if ctrl_a {
-                            // Ctrl-a Ctrl-a -> send a literal Ctrl-a to the agent.
-                            send_frame(
-                                &mut stream,
-                                &serde_json::to_vec(&AttachClientMsg::Input { data: vec![0x01] })?,
-                            )?;
-                            continue;
-                        }
-                    }
-                    if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
-                        send_frame(
-                            &mut stream,
-                            &serde_json::to_vec(&AttachClientMsg::Input { data: bytes })?,
-                        )?;
-                    }
-                }
-                Event::Resize(cols, rows) => {
-                    let _ = send_frame(
-                        &mut stream,
-                        &serde_json::to_vec(&AttachClientMsg::Resize { rows, cols })?,
-                    );
-                }
-                _ => {}
-            }
-        }
-    };
-
-    drop(stream);
-    let _ = reader.join();
-    // The agent painted directly to the screen; force a clean TUI redraw on return.
-    terminal.clear()?;
-    result
-}
-
 /// Encode a key event as the bytes a PTY expects.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     Some(match code {
@@ -465,22 +485,4 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
         KeyCode::Left => vec![0x1b, b'[', b'D'],
         _ => return None,
     })
-}
-
-fn send_frame(s: &mut UnixStream, body: &[u8]) -> std::io::Result<()> {
-    s.write_all(&(body.len() as u32).to_be_bytes())?;
-    s.write_all(body)?;
-    s.flush()
-}
-
-fn recv_frame(s: &mut UnixStream) -> std::io::Result<Option<Vec<u8>>> {
-    let mut len = [0u8; 4];
-    match s.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
-    s.read_exact(&mut body)?;
-    Ok(Some(body))
 }

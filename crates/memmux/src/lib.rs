@@ -14,6 +14,10 @@ pub mod app;
 pub mod render;
 pub mod theme;
 
+/// Client-side terminal multiplexer: per-agent Attach sessions parsed into styled grids (SUM-132).
+#[cfg(unix)]
+pub mod pane;
+
 /// Self-update: `memmux update` + the "update available" hint (SUM-129).
 pub mod update;
 

@@ -15,10 +15,14 @@ path = "src/main.rs"
 memmux-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # ratatui/crossterm 0.28.1 (Aug 2024) verified > 7 days old.
 ratatui = "0.28"
 crossterm = "0.28"
+# vt100 0.16.2 (2025-07) — already vetted/locked via memmux-pty; used client-side to parse each
+# pane's PTY byte stream into a styled grid for the multiplexer (SUM-132).
+vt100 = "0.16"
 
 [dev-dependencies]
 # Spin up a real daemon in-process to test daemon reuse (SUM-118).

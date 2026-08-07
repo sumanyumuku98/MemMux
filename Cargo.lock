@@ -516,8 +516,10 @@ dependencies = [
  "memmux-store",
  "memmuxd",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
+ "vt100",
 ]
 
 [[package]]
