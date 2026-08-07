@@ -66,3 +66,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --doc
+      # Catch broken rustdoc intra-doc links on the PR (the Docs deploy also enforces this on
+      # main; running it here stops post-merge Docs breakage — SUM-133).
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"

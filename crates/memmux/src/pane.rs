@@ -1,9 +1,10 @@
 //! Client-side terminal multiplexer (SUM-132).
 //!
-//! Each open agent pane holds a live [`Request::Attach`] connection to the daemon. A reader thread
+//! Each open agent pane holds a live `Request::Attach` connection to the daemon. A reader thread
 //! feeds the raw PTY output bytes — which carry the agent's own colours — into a per-pane
-//! `vt100::Parser`. The render loop snapshots each parser into a [`StyledGrid`] and draws it into a
-//! ratatui rect, so several agents render as colored panes at once with the sidebar still visible.
+//! `vt100::Parser`. The render loop snapshots each parser into a [`StyledGrid`](crate::app::StyledGrid)
+//! and draws it into a ratatui rect, so several agents render as colored panes at once with the
+//! sidebar still visible.
 //! This reuses the existing Attach protocol wholesale; no daemon changes.
 
 use crate::app::{GridCell, StyledGrid};
