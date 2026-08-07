@@ -336,7 +336,8 @@ fn handle_pane_key(
 
 /// Open the quick-launch palette from within the pane grid (Ctrl-b v / Ctrl-b -).
 fn open_launch_from_panes(model: &mut Model) {
-    let repo = model.launch_target_repo();
+    // Split into the focused pane's workspace so the new agent tiles beside it (SUM-136).
+    let repo = model.split_target_repo();
     model.launch_repo = repo;
     model.launch_selected = 0;
     model.view = View::Launch;
