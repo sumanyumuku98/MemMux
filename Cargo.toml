@@ -29,6 +29,8 @@ anyhow = "1.0"
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# toml 0.8 (2023) — user config file parsing (SUM-133); well over 7 days old.
+toml = "0.8"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
 # NOTE (org dependency policy): versions pinned to releases published > 7 days ago.
 # `tracing-subscriber` deliberately omits the `env-filter` feature so we don't pull the
