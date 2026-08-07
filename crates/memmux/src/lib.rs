@@ -14,6 +14,9 @@ pub mod app;
 pub mod render;
 pub mod theme;
 
+/// User configuration from `<root>/config.toml` (SUM-133).
+pub mod config;
+
 /// Client-side terminal multiplexer: per-agent Attach sessions parsed into styled grids (SUM-132).
 #[cfg(unix)]
 pub mod pane;

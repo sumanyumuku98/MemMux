@@ -3,7 +3,10 @@
 //! the daemon. All UI logic lives in the library (`app` + `render`) so it stays testable.
 
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -61,6 +64,9 @@ fn main() -> anyhow::Result<()> {
     let autostart =
         memmux::supervisor::ensure_daemon(&root, &client, &memmux::supervisor::memmuxd_path());
 
+    // User config (SUM-133): the pane leader key from <root>/config.toml (default Ctrl-b).
+    let cfg = memmux::config::Config::load(&root);
+
     // Default the new-task repo to the launch directory's git root (SUM-119), and remember the raw
     // launch dir too so a plain shell / the folder browser can start anywhere (SUM-130).
     let mut model = Model {
@@ -68,6 +74,7 @@ fn main() -> anyhow::Result<()> {
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
+        prefix: cfg.prefix,
         ..Model::default()
     };
     refresh(&client, &mut model);
@@ -87,13 +94,18 @@ fn main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    // Mouse capture (SUM-133) lets clicks focus panes / select sidebar rows.
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let result = run(&mut terminal, &client, &mut model, &hint_rx);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -124,11 +136,11 @@ fn run<B: ratatui::backend::Backend>(
             Duration::from_millis(250)
         };
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Release {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if model.view == View::Home && model.focus == Focus::Panes {
-                        // Focused pane grid: Ctrl-a prefix drives pane commands, else keys are
-                        // forwarded to the focused agent (SUM-132).
+                        // Focused pane grid: the leader drives pane commands, else keys are
+                        // forwarded to the focused agent (SUM-132/133).
                         handle_pane_key(client, model, &mut panes, key.code, key.modifiers);
                     } else if let Some(k) = map_key(key.code, key.modifiers) {
                         for effect in update(model, k) {
@@ -136,6 +148,14 @@ fn run<B: ratatui::backend::Backend>(
                         }
                     }
                 }
+                // Left-click focuses a pane or selects a sidebar row (SUM-133).
+                Event::Mouse(me)
+                    if model.view == View::Home
+                        && me.kind == MouseEventKind::Down(MouseButton::Left) =>
+                {
+                    handle_mouse_click(model, me.column, me.row);
+                }
+                _ => {}
             }
         }
         // Coalesce pane dirty pings (we redraw every loop anyway).
@@ -161,6 +181,25 @@ fn grid_area() -> Rect {
         width: cols.saturating_sub(memmux::render::SIDEBAR_WIDTH),
         height: rows.saturating_sub(2),
     }
+}
+
+/// The sidebar rect on screen — mirrors `render_home`'s split (SUM-133).
+fn sidebar_area() -> Rect {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    Rect {
+        x: 0,
+        y: 1,
+        width: memmux::render::SIDEBAR_WIDTH.min(cols),
+        height: rows.saturating_sub(2),
+    }
+}
+
+/// Route a left-click: select a sidebar row, else focus the pane under the cursor (SUM-133).
+fn handle_mouse_click(model: &mut Model, col: u16, row: u16) {
+    if model.select_nav_at(col, row, sidebar_area()) {
+        return;
+    }
+    model.focus_pane_at(col, row, grid_area());
 }
 
 /// Each open pane's inner content size `(rows, cols)` (rect minus its 1-cell border).
@@ -217,7 +256,8 @@ fn open_agent_pane(client: &Client, model: &mut Model, panes: &mut PaneManager, 
     }
 }
 
-/// Keys while a pane is focused: `Ctrl-a` prefix + command, else forward to the agent (SUM-132).
+/// Keys while a pane is focused: the configurable leader (default `Ctrl-b`) + command, else forward
+/// to the agent (SUM-132/133). The leader comes from `model.prefix` (config.toml).
 fn handle_pane_key(
     client: &Client,
     model: &mut Model,
@@ -225,7 +265,8 @@ fn handle_pane_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) {
-    let ctrl_a = mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('a');
+    let pfx = model.prefix;
+    let prefix = mods.contains(KeyModifiers::CONTROL) == pfx.ctrl && code == KeyCode::Char(pfx.ch);
     if model.prefix_active {
         model.prefix_active = false;
         match code {
@@ -250,17 +291,17 @@ fn handle_pane_key(
                 model.split_orient = Orient::Rows;
                 open_launch_from_panes(model);
             }
-            // Ctrl-a Ctrl-a → send a literal Ctrl-a to the agent.
-            _ if ctrl_a => {
+            // Leader pressed twice → send a literal leader byte to the agent.
+            _ if prefix => {
                 if let Some(id) = model.focused_pane().map(str::to_string) {
-                    panes.send_input(&id, &[0x01]);
+                    panes.send_input(&id, &[pfx.literal_byte()]);
                 }
             }
             _ => {}
         }
         return;
     }
-    if ctrl_a {
+    if prefix {
         model.prefix_active = true;
         return;
     }
@@ -273,7 +314,7 @@ fn handle_pane_key(
     let _ = client;
 }
 
-/// Open the quick-launch palette from within the pane grid (Ctrl-a v / Ctrl-a -).
+/// Open the quick-launch palette from within the pane grid (Ctrl-b v / Ctrl-b -).
 fn open_launch_from_panes(model: &mut Model) {
     let repo = model.launch_target_repo();
     model.launch_repo = repo;

@@ -39,7 +39,7 @@ pub fn render(f: &mut Frame, model: &Model) {
         View::Launch => render_launch(f, chunks[1], model),
         View::Confirm => render_confirm(f, chunks[1], model),
         View::OpenFolder => render_open_folder(f, chunks[1], model),
-        View::Help => render_help(f, chunks[1]),
+        View::Help => render_help(f, chunks[1], model),
         View::Home => {}
     }
 }
@@ -156,9 +156,9 @@ fn render_pane(f: &mut Frame, area: Rect, id: &str, model: &Model) {
         }
         _ => {
             let msg = if model.pane_screens.get(id).map(|g| g.alive) == Some(false) {
-                "· agent exited — Ctrl-a x to close ·"
+                format!("· agent exited — {} x to close ·", model.prefix.label())
             } else {
-                "· starting… ·"
+                "· starting… ·".to_string()
             };
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(msg, theme::dim())))
@@ -250,7 +250,10 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model) {
                 kv("workspace", &workspace_name(model, &t.repository)),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enter → open as a pane (Ctrl-a o to return to the sidebar)",
+                    format!(
+                        "Enter → open as a pane ({} o to return to the sidebar)",
+                        model.prefix.label()
+                    ),
                     Style::default().fg(theme::ACCENT2),
                 )),
             ]
@@ -468,29 +471,46 @@ fn render_confirm(f: &mut Frame, area: Rect, model: &Model) {
     modal(f, area, " CONFIRM ", text);
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
-    let keys = [
-        ("j / k", "move sidebar selection"),
+fn render_help(f: &mut Frame, area: Rect, model: &Model) {
+    let p = model.prefix.label(); // configurable leader, e.g. "Ctrl-b"
+    let keys: Vec<(String, String)> = vec![
+        ("j / k".into(), "move sidebar selection".into()),
         (
-            "enter",
-            "open the selected agent as a pane · or launch into a workspace",
+            "enter".into(),
+            "open the selected agent as a pane · or launch into a workspace".into(),
         ),
-        ("c", "launch an agent or shell (quick-launch palette)"),
         (
-            "x",
-            "sidebar: terminate a running agent or remove a dead one",
+            "c".into(),
+            "launch an agent or shell (quick-launch palette)".into(),
         ),
-        ("n", "new agent via the full form"),
-        ("o", "browse for a folder to register as a workspace"),
-        ("—— panes ——", "(focus in a pane, then Ctrl-a …)"),
-        ("Ctrl-a h/j/k/l", "move focus between panes"),
-        ("Ctrl-a v / -", "split: launch a new pane right / down"),
-        ("Ctrl-a z", "zoom the focused pane"),
-        ("Ctrl-a x", "close the focused pane"),
-        ("Ctrl-a o / d", "return focus to the sidebar"),
-        ("Ctrl-a Ctrl-a", "send a literal Ctrl-a to the agent"),
-        ("? ", "toggle this help"),
-        ("q", "quit"),
+        (
+            "x".into(),
+            "sidebar: terminate a running agent or remove a dead one".into(),
+        ),
+        ("n".into(), "new agent via the full form".into()),
+        (
+            "o".into(),
+            "browse for a folder to register as a workspace".into(),
+        ),
+        ("—— panes ——".into(), format!("(focus a pane, then {p} …)")),
+        (format!("{p} h/j/k/l"), "move focus between panes".into()),
+        (
+            format!("{p} v / -"),
+            "split: launch a new pane right / down".into(),
+        ),
+        (format!("{p} z"), "zoom the focused pane".into()),
+        (format!("{p} x"), "close the focused pane".into()),
+        (format!("{p} o / d"), "return focus to the sidebar".into()),
+        (
+            format!("{p} {p}"),
+            "send a literal leader to the agent".into(),
+        ),
+        ("? ".into(), "toggle this help".into()),
+        ("q".into(), "quit".into()),
+        (
+            "config".into(),
+            "set the leader in ~/.memmux/config.toml → prefix = \"ctrl-b\"".into(),
+        ),
     ];
     let text: Vec<Line> = keys
         .iter()

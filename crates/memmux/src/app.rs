@@ -37,7 +37,7 @@ pub enum PendingAction {
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// A spatial direction for pane focus movement (Ctrl-a h/j/k/l).
+/// A spatial direction for pane focus movement (the leader + h/j/k/l).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
     /// Left.
@@ -66,6 +66,68 @@ pub enum Focus {
     Sidebar,
     /// The pane grid (keys go to the focused agent).
     Panes,
+}
+
+/// The pane-command leader key, configurable via `~/.memmux/config.toml` (SUM-133). Default
+/// `Ctrl-b` (tmux's leader) — `Ctrl-a` is avoided because shells/readline swallow it as
+/// "beginning of line". Held as plain data so `app` stays crossterm-free; the runtime matches
+/// real key events against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    /// Whether Ctrl must be held.
+    pub ctrl: bool,
+    /// The (lowercase ASCII) key.
+    pub ch: char,
+}
+
+impl Default for Prefix {
+    fn default() -> Self {
+        Self {
+            ctrl: true,
+            ch: 'b',
+        }
+    }
+}
+
+impl Prefix {
+    /// Parse a spec like `"ctrl-b"`, `"ctrl+b"`, `"c-b"`, or a bare `"b"`. Returns `None` for
+    /// anything but a single ASCII letter (callers keep the default).
+    pub fn parse(s: &str) -> Option<Prefix> {
+        let s = s.trim().to_ascii_lowercase();
+        let (ctrl, rest) = if let Some(r) = s
+            .strip_prefix("ctrl-")
+            .or_else(|| s.strip_prefix("ctrl+"))
+            .or_else(|| s.strip_prefix("c-"))
+        {
+            (true, r.to_string())
+        } else {
+            (false, s)
+        };
+        let mut chars = rest.chars();
+        let ch = chars.next()?;
+        if chars.next().is_some() || !ch.is_ascii_alphabetic() {
+            return None;
+        }
+        Some(Prefix { ctrl, ch })
+    }
+
+    /// Human label for help/hints, e.g. `"Ctrl-b"`.
+    pub fn label(&self) -> String {
+        if self.ctrl {
+            format!("Ctrl-{}", self.ch)
+        } else {
+            self.ch.to_ascii_uppercase().to_string()
+        }
+    }
+
+    /// The byte to forward when the prefix is pressed twice (a literal prefix to the agent).
+    pub fn literal_byte(&self) -> u8 {
+        if self.ctrl {
+            (self.ch as u8) & 0x1f
+        } else {
+            self.ch as u8
+        }
+    }
 }
 
 /// One cell of a rendered pane grid (a client-side snapshot of a vt100 screen — SUM-132).
@@ -389,13 +451,15 @@ pub struct Model {
     pub pending: Option<PendingAction>,
     /// Whether keyboard focus is on the sidebar or the pane grid (SUM-132).
     pub focus: Focus,
-    /// Ctrl-a prefix pressed inside the pane grid, awaiting a command key (SUM-132).
+    /// The configurable pane leader key (SUM-133); set by the runtime from config.
+    pub prefix: Prefix,
+    /// Leader pressed inside the pane grid, awaiting a command key (SUM-132).
     pub prefix_active: bool,
     /// The open agent panes as a tiling tree (`None` = none open) (SUM-132).
     pub panes: Option<PaneLayout>,
     /// The focused pane's task id (SUM-132).
     pub focused_pane: Option<String>,
-    /// Orientation for the next opened pane (toggled by Ctrl-a v / Ctrl-a -) (SUM-132).
+    /// Orientation for the next opened pane (toggled by leader v / leader -) (SUM-132).
     pub split_orient: Orient,
     /// Whether the focused pane is zoomed to fill the grid area (SUM-132).
     pub zoomed: bool,
@@ -423,6 +487,7 @@ impl Default for Model {
             browse_selected: 0,
             pending: None,
             focus: Focus::Sidebar,
+            prefix: Prefix::default(),
             prefix_active: false,
             panes: None,
             focused_pane: None,
@@ -612,6 +677,42 @@ impl Model {
         if let Some((_, id)) = best {
             self.focused_pane = Some(id);
         }
+    }
+
+    /// Left-click hit-test for the sidebar (SUM-133): if `(col,row)` falls on a nav row within the
+    /// bordered sidebar `area`, select it and focus the sidebar. Returns whether it hit.
+    pub fn select_nav_at(&mut self, col: u16, row: u16, area: Rect) -> bool {
+        let inside = col >= area.x
+            && col < area.x + area.width
+            && row > area.y // first row is the panel's top border/title
+            && row < area.y + area.height.saturating_sub(1);
+        if !inside {
+            return false;
+        }
+        let idx = (row - area.y - 1) as usize; // list starts one row below the top border
+        let len = self.nav_items().len();
+        if idx >= len {
+            return false;
+        }
+        self.selected = idx;
+        self.focus = Focus::Sidebar;
+        true
+    }
+
+    /// Left-click hit-test for the pane grid (SUM-133): focus the pane whose rect contains
+    /// `(col,row)` within `area`. Returns whether it hit a pane.
+    pub fn focus_pane_at(&mut self, col: u16, row: u16, area: Rect) -> bool {
+        let Some(layout) = &self.panes else {
+            return false;
+        };
+        for (id, r) in layout.leaf_rects(area) {
+            if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
+                self.focused_pane = Some(id);
+                self.focus = Focus::Panes;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1068,6 +1169,84 @@ mod tests {
         assert!(m.zoomed);
         m.toggle_zoom();
         assert!(!m.zoomed);
+    }
+
+    #[test]
+    fn prefix_parses_and_formats() {
+        assert_eq!(
+            Prefix::default(),
+            Prefix {
+                ctrl: true,
+                ch: 'b'
+            }
+        );
+        for s in ["ctrl-a", "ctrl+a", "c-a", "  Ctrl-A  "] {
+            assert_eq!(
+                Prefix::parse(s),
+                Some(Prefix {
+                    ctrl: true,
+                    ch: 'a'
+                })
+            );
+        }
+        assert_eq!(
+            Prefix::parse("b"),
+            Some(Prefix {
+                ctrl: false,
+                ch: 'b'
+            })
+        );
+        assert_eq!(Prefix::parse("ctrl-1"), None);
+        assert_eq!(Prefix::parse("ctrl-ab"), None);
+        assert_eq!(Prefix::parse(""), None);
+        assert_eq!(
+            Prefix {
+                ctrl: true,
+                ch: 'b'
+            }
+            .label(),
+            "Ctrl-b"
+        );
+        assert_eq!(
+            Prefix {
+                ctrl: true,
+                ch: 'b'
+            }
+            .literal_byte(),
+            0x02
+        );
+        assert_eq!(
+            Prefix {
+                ctrl: true,
+                ch: 'a'
+            }
+            .literal_byte(),
+            0x01
+        );
+    }
+
+    #[test]
+    fn mouse_click_focuses_a_pane_and_selects_a_sidebar_row() {
+        use ratatui::layout::Rect;
+        let mut m = model_with_data();
+        m.open_pane("t1");
+        m.split_orient = Orient::Cols;
+        m.open_pane("t2"); // t1 | t2
+        let grid = Rect::new(30, 1, 60, 22);
+        // A click in the right half hits t2, the left half hits t1.
+        assert!(m.focus_pane_at(80, 10, grid));
+        assert_eq!(m.focused_pane(), Some("t2"));
+        assert!(m.focus_pane_at(35, 10, grid));
+        assert_eq!(m.focused_pane(), Some("t1"));
+
+        // Sidebar: row maps to a nav index (list starts one row below the border at area.y).
+        let sidebar = Rect::new(0, 1, 30, 22);
+        // nav_items() = [Workspace(0), Agent(0)=t1, Agent(1)=t2, Workspace(1), Agent(2)=t3]
+        assert!(m.select_nav_at(5, 3, sidebar)); // row 3 → idx (3-1-1)=1 → Agent(0)
+        assert_eq!(m.selected_nav(), Some(NavItem::Agent(0)));
+        assert_eq!(m.focus, Focus::Sidebar);
+        // A click above the first row (on the border) doesn't select.
+        assert!(!m.select_nav_at(5, 1, sidebar));
     }
 
     #[test]
