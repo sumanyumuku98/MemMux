@@ -33,6 +33,163 @@ pub enum PendingAction {
     Forget(String),
 }
 
+// ---- Pane multiplexer (SUM-132) ---------------------------------------------------------------
+
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+/// A spatial direction for pane focus movement (Ctrl-a h/j/k/l).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dir {
+    /// Left.
+    Left,
+    /// Right.
+    Right,
+    /// Up.
+    Up,
+    /// Down.
+    Down,
+}
+
+/// How a split divides its area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Orient {
+    /// Side by side (a | b) — a "split right".
+    Cols,
+    /// Stacked (a over b) — a "split down".
+    Rows,
+}
+
+/// Whether keyboard focus is on the sidebar or inside the pane grid (SUM-132).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// The workspace/agent sidebar.
+    Sidebar,
+    /// The pane grid (keys go to the focused agent).
+    Panes,
+}
+
+/// One cell of a rendered pane grid (a client-side snapshot of a vt100 screen — SUM-132).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GridCell {
+    /// The glyph.
+    pub ch: char,
+    /// Foreground colour.
+    pub fg: ratatui::style::Color,
+    /// Background colour.
+    pub bg: ratatui::style::Color,
+    /// Style modifiers (bold/italic/underline/reverse).
+    pub mods: ratatui::style::Modifier,
+}
+
+/// A snapshot of an agent's terminal screen, drawn into a pane (SUM-132). Runtime-produced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StyledGrid {
+    /// Rows of styled cells.
+    pub rows: Vec<Vec<GridCell>>,
+    /// Cursor `(row, col)`.
+    pub cursor: (u16, u16),
+    /// Whether the agent process is still alive.
+    pub alive: bool,
+}
+
+/// A binary tiling tree of open agent panes (SUM-132). `Leaf` holds a task id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneLayout {
+    /// A single agent pane (task id).
+    Leaf(String),
+    /// A split of two sub-layouts.
+    Split {
+        /// Split orientation.
+        orient: Orient,
+        /// First child (left/top).
+        a: Box<PaneLayout>,
+        /// Second child (right/bottom).
+        b: Box<PaneLayout>,
+    },
+}
+
+impl PaneLayout {
+    /// All leaf task ids, left-to-right / top-to-bottom.
+    pub fn leaves(&self) -> Vec<String> {
+        match self {
+            PaneLayout::Leaf(id) => vec![id.clone()],
+            PaneLayout::Split { a, b, .. } => {
+                let mut v = a.leaves();
+                v.extend(b.leaves());
+                v
+            }
+        }
+    }
+
+    /// Whether `id` is present.
+    pub fn contains(&self, id: &str) -> bool {
+        self.leaves().iter().any(|l| l == id)
+    }
+
+    /// Split the leaf `target` into `[target | new_id]` (or stacked) with `new_id` focused.
+    fn split_leaf(&mut self, target: &str, new_id: &str, orient: Orient) -> bool {
+        match self {
+            PaneLayout::Leaf(id) if id == target => {
+                let a = Box::new(PaneLayout::Leaf(id.clone()));
+                let b = Box::new(PaneLayout::Leaf(new_id.to_string()));
+                *self = PaneLayout::Split { orient, a, b };
+                true
+            }
+            PaneLayout::Leaf(_) => false,
+            PaneLayout::Split { a, b, .. } => {
+                a.split_leaf(target, new_id, orient) || b.split_leaf(target, new_id, orient)
+            }
+        }
+    }
+
+    /// Remove leaf `id`, collapsing its parent split into the sibling. Returns the new tree
+    /// (`None` if the whole tree was just that leaf).
+    fn without(self, id: &str) -> Option<PaneLayout> {
+        match self {
+            PaneLayout::Leaf(l) if l == id => None,
+            PaneLayout::Leaf(l) => Some(PaneLayout::Leaf(l)),
+            PaneLayout::Split { orient, a, b } => {
+                let a2 = a.without(id);
+                let b2 = b.without(id);
+                match (a2, b2) {
+                    (Some(a), Some(b)) => Some(PaneLayout::Split {
+                        orient,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                    }),
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+
+    /// Compute each leaf's rectangle within `area` (shared by render + spatial focus + resize).
+    pub fn leaf_rects(&self, area: Rect) -> Vec<(String, Rect)> {
+        let mut out = Vec::new();
+        self.collect_rects(area, &mut out);
+        out
+    }
+
+    fn collect_rects(&self, area: Rect, out: &mut Vec<(String, Rect)>) {
+        match self {
+            PaneLayout::Leaf(id) => out.push((id.clone(), area)),
+            PaneLayout::Split { orient, a, b } => {
+                let dir = match orient {
+                    Orient::Cols => Direction::Horizontal,
+                    Orient::Rows => Direction::Vertical,
+                };
+                let parts = Layout::default()
+                    .direction(dir)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(area);
+                a.collect_rects(parts[0], out);
+                b.collect_rects(parts[1], out);
+            }
+        }
+    }
+}
+
 /// The top-level views. One home layout + modals (SUM-127).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -186,10 +343,11 @@ pub enum Effect {
         /// Whether this is a plain shell rather than an agent.
         shell: bool,
     },
-    /// Open an agent (SUM-130): reuse a live provider, else start a queued one, else restart a
-    /// dead/failed one — then attach if any of those yields a running provider. The runtime owns
-    /// this fallback chain because only the daemon knows whether a provider is actually alive.
-    OpenTask(String),
+    /// Open an agent as a pane (SUM-132): the runtime starts-or-restarts the provider, then opens
+    /// a live Attach session and adds it to the pane layout (focus moves to the pane grid). The
+    /// pure layout mutation already happened in `update`/`open_pane`; this tells the runtime to
+    /// bring the provider up and wire the session.
+    OpenPane(String),
     /// Terminate a running/queued agent (SUM-130).
     TerminateTask(String),
     /// Forget a terminal agent, removing it from the registry (SUM-130).
@@ -198,8 +356,6 @@ pub enum Effect {
     ListDir(String),
     /// Register a folder as a workspace (SUM-124).
     AddWorkspace(String),
-    /// Enter interactive raw passthrough for a task (SUM-125; runtime owns the terminal).
-    Attach(String),
 }
 
 /// The full application model.
@@ -231,6 +387,20 @@ pub struct Model {
     pub browse_selected: usize,
     /// A destructive action awaiting confirmation (SUM-130).
     pub pending: Option<PendingAction>,
+    /// Whether keyboard focus is on the sidebar or the pane grid (SUM-132).
+    pub focus: Focus,
+    /// Ctrl-a prefix pressed inside the pane grid, awaiting a command key (SUM-132).
+    pub prefix_active: bool,
+    /// The open agent panes as a tiling tree (`None` = none open) (SUM-132).
+    pub panes: Option<PaneLayout>,
+    /// The focused pane's task id (SUM-132).
+    pub focused_pane: Option<String>,
+    /// Orientation for the next opened pane (toggled by Ctrl-a v / Ctrl-a -) (SUM-132).
+    pub split_orient: Orient,
+    /// Whether the focused pane is zoomed to fill the grid area (SUM-132).
+    pub zoomed: bool,
+    /// Live styled screens for open panes, snapshotted by the runtime each frame (SUM-132).
+    pub pane_screens: std::collections::HashMap<String, StyledGrid>,
     /// Status line message.
     pub status: String,
     /// Whether to exit.
@@ -252,6 +422,13 @@ impl Default for Model {
             browse_entries: Vec::new(),
             browse_selected: 0,
             pending: None,
+            focus: Focus::Sidebar,
+            prefix_active: false,
+            panes: None,
+            focused_pane: None,
+            split_orient: Orient::Cols,
+            zoomed: false,
+            pane_screens: std::collections::HashMap::new(),
             status: "connected".to_string(),
             should_quit: false,
         }
@@ -331,6 +508,111 @@ impl Model {
             self.selected = len.saturating_sub(1);
         }
     }
+
+    // ---- pane multiplexer ops (pure; SUM-132) -------------------------------------------------
+
+    /// Open `id` as a pane and focus it. First pane fills the grid; subsequent panes split the
+    /// currently-focused pane using `split_orient`. Re-opening an already-open pane just focuses
+    /// it. Focus moves to the pane grid. Idempotent on the tree for an existing id.
+    pub fn open_pane(&mut self, id: &str) {
+        self.focus = Focus::Panes;
+        self.zoomed = false;
+        match &mut self.panes {
+            None => self.panes = Some(PaneLayout::Leaf(id.to_string())),
+            Some(layout) => {
+                if !layout.contains(id) {
+                    let target = self
+                        .focused_pane
+                        .clone()
+                        .filter(|f| layout.contains(f))
+                        .or_else(|| layout.leaves().last().cloned());
+                    if let Some(target) = target {
+                        layout.split_leaf(&target, id, self.split_orient);
+                    }
+                }
+            }
+        }
+        self.focused_pane = Some(id.to_string());
+    }
+
+    /// Close the pane for `id`. Re-focuses a surviving sibling; if none remain, returns focus to
+    /// the sidebar. Also drops its cached screen.
+    pub fn close_pane(&mut self, id: &str) {
+        self.pane_screens.remove(id);
+        self.panes = self.panes.take().and_then(|l| l.without(id));
+        match &self.panes {
+            Some(layout) => {
+                if self.focused_pane.as_deref() == Some(id) || self.focused_pane.is_none() {
+                    self.focused_pane = layout.leaves().first().cloned();
+                }
+                if !layout.contains(self.focused_pane.as_deref().unwrap_or("")) {
+                    self.focused_pane = layout.leaves().first().cloned();
+                }
+            }
+            None => {
+                self.focused_pane = None;
+                self.focus = Focus::Sidebar;
+                self.zoomed = false;
+            }
+        }
+    }
+
+    /// The focused pane id, if any is open.
+    pub fn focused_pane(&self) -> Option<&str> {
+        self.focused_pane.as_deref()
+    }
+
+    /// Toggle zoom of the focused pane (fills the whole grid area).
+    pub fn toggle_zoom(&mut self) {
+        if self.focused_pane.is_some() {
+            self.zoomed = !self.zoomed;
+        }
+    }
+
+    /// Move pane focus spatially within `area` (the grid rect). Picks the nearest leaf whose
+    /// centre lies in `dir` from the focused pane's centre.
+    pub fn focus_dir(&mut self, dir: Dir, area: Rect) {
+        let Some(layout) = &self.panes else { return };
+        let rects = layout.leaf_rects(area);
+        let Some(cur) = self
+            .focused_pane
+            .as_ref()
+            .and_then(|f| rects.iter().find(|(id, _)| id == f))
+            .map(|(_, r)| *r)
+        else {
+            return;
+        };
+        let (cx, cy) = (
+            cur.x as i32 + cur.width as i32 / 2,
+            cur.y as i32 + cur.height as i32 / 2,
+        );
+        let mut best: Option<(i32, String)> = None;
+        for (id, r) in &rects {
+            if Some(id.as_str()) == self.focused_pane.as_deref() {
+                continue;
+            }
+            let (rx, ry) = (
+                r.x as i32 + r.width as i32 / 2,
+                r.y as i32 + r.height as i32 / 2,
+            );
+            let ok = match dir {
+                Dir::Left => rx < cx,
+                Dir::Right => rx > cx,
+                Dir::Up => ry < cy,
+                Dir::Down => ry > cy,
+            };
+            if !ok {
+                continue;
+            }
+            let dist = (rx - cx).pow(2) + (ry - cy).pow(2);
+            if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
+                best = Some((dist, id.clone()));
+            }
+        }
+        if let Some((_, id)) = best {
+            self.focused_pane = Some(id);
+        }
+    }
 }
 
 /// The pure state transition. Returns effects the runtime should execute.
@@ -405,9 +687,10 @@ fn activate_selection(model: &mut Model) -> Vec<Effect> {
                 if is_terminated_state(&state) {
                     model.status = "agent terminated — press x to remove".to_string();
                 } else {
-                    // OpenTask both launches (start-or-restart) and, on success, drives the attach
-                    // — so a dead agent no longer flashes an empty screen (SUM-130).
-                    return vec![Effect::OpenTask(id)];
+                    // Open the agent as a pane and focus it (SUM-132). The runtime starts/restarts
+                    // the provider and wires the live Attach session behind OpenPane.
+                    model.open_pane(&id);
+                    return vec![Effect::OpenPane(id)];
                 }
             }
         }
@@ -720,13 +1003,71 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_agent_opens_it() {
+    fn enter_on_agent_opens_it_as_a_focused_pane() {
         let mut m = model_with_data();
         m.selected = 1; // Agent(0) == t1
         let effects = update(&mut m, Key::Enter);
-        // OpenTask expands in the runtime to start-or-restart and attaches only if a live provider
-        // results (SUM-130) — no separate unconditional Attach.
-        assert_eq!(effects, vec![Effect::OpenTask("t1".into())]);
+        // Enter opens the agent as a pane (SUM-132): pure layout mutated + OpenPane for the runtime.
+        assert_eq!(effects, vec![Effect::OpenPane("t1".into())]);
+        assert_eq!(m.focus, Focus::Panes);
+        assert_eq!(m.focused_pane(), Some("t1"));
+        assert_eq!(m.panes, Some(PaneLayout::Leaf("t1".into())));
+    }
+
+    #[test]
+    fn opening_a_second_agent_splits_and_focuses_it() {
+        let mut m = model_with_data();
+        m.open_pane("t1");
+        m.split_orient = Orient::Cols;
+        m.open_pane("t2");
+        assert_eq!(m.focused_pane(), Some("t2"));
+        assert_eq!(m.panes.as_ref().unwrap().leaves(), vec!["t1", "t2"]);
+        // Re-opening an already-open pane just refocuses (no duplicate leaf).
+        m.open_pane("t1");
+        assert_eq!(m.focused_pane(), Some("t1"));
+        assert_eq!(m.panes.as_ref().unwrap().leaves(), vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn closing_a_pane_collapses_the_split_and_refocuses() {
+        let mut m = model_with_data();
+        m.open_pane("t1");
+        m.open_pane("t2");
+        m.close_pane("t2");
+        assert_eq!(m.panes, Some(PaneLayout::Leaf("t1".into())));
+        assert_eq!(m.focused_pane(), Some("t1"));
+        assert_eq!(m.focus, Focus::Panes);
+        // Closing the last pane returns focus to the sidebar.
+        m.close_pane("t1");
+        assert_eq!(m.panes, None);
+        assert_eq!(m.focus, Focus::Sidebar);
+        assert_eq!(m.focused_pane(), None);
+    }
+
+    #[test]
+    fn focus_dir_moves_spatially_across_a_column_split() {
+        use ratatui::layout::Rect;
+        let mut m = model_with_data();
+        m.open_pane("t1");
+        m.split_orient = Orient::Cols;
+        m.open_pane("t2"); // t1 | t2, focus t2
+        let area = Rect::new(0, 0, 80, 24);
+        m.focus_dir(Dir::Left, area);
+        assert_eq!(m.focused_pane(), Some("t1"));
+        m.focus_dir(Dir::Right, area);
+        assert_eq!(m.focused_pane(), Some("t2"));
+    }
+
+    #[test]
+    fn zoom_toggles_only_when_a_pane_is_open() {
+        let mut m = model_with_data();
+        m.toggle_zoom();
+        assert!(!m.zoomed, "no pane → no zoom");
+        m.open_pane("t1");
+        m.toggle_zoom();
+        assert!(m.zoomed);
+        m.toggle_zoom();
+        assert!(!m.zoomed);
     }
 
     #[test]
