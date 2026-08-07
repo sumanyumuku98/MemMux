@@ -50,6 +50,11 @@ pub fn termination_targets(tree: &ProcessTree, root: Pid) -> Vec<Pid> {
 }
 
 /// Terminate the process subtree rooted at `root`, escalating from `SIGTERM` to `SIGKILL`.
+///
+/// Targets are sampled from the tree *now*, so the root must still be alive — once it exits its
+/// descendants reparent to init and the subtree link is lost. To reap a task whose root has
+/// already exited (natural exit), pass the previously-recorded descendant pids to
+/// [`terminate_pids`] instead.
 #[cfg(unix)]
 pub fn terminate_subtree(
     sampler: &dyn ProcessSampler,
@@ -65,6 +70,31 @@ pub fn terminate_subtree(
 
     let tree = ProcessTree::from_samples(sampler.snapshot()?.samples);
     let targeted = termination_targets(&tree, root);
+    terminate_pids(sampler, &targeted, grace)
+}
+
+/// SIGTERM → grace → SIGKILL an explicit set of pids, reporting the cleanup fraction (SUM-76).
+///
+/// Unlike [`terminate_subtree`] this does not resolve a subtree — the caller supplies the exact
+/// pids to reap, which is how a task whose root already exited is cleaned up from its recorded
+/// descendant set. Pids ≤ 1 (init/kernel) are never signalled.
+#[cfg(unix)]
+pub fn terminate_pids(
+    sampler: &dyn ProcessSampler,
+    pids: &[Pid],
+    grace: Duration,
+) -> std::io::Result<TerminationReport> {
+    let mut targeted: Vec<Pid> = pids.iter().copied().filter(|&p| p > 1).collect();
+    targeted.sort_unstable();
+    targeted.dedup();
+
+    if targeted.is_empty() {
+        return Ok(TerminationReport {
+            targeted,
+            survivors: Vec::new(),
+            used_sigkill: false,
+        });
+    }
 
     // Phase 1: polite SIGTERM to every target (children before parents helps some shells).
     for &pid in targeted.iter().rev() {
@@ -113,6 +143,19 @@ pub fn terminate_subtree(
     ))
 }
 
+/// Non-Unix stub for [`terminate_pids`] (see [`terminate_subtree`]).
+#[cfg(not(unix))]
+pub fn terminate_pids(
+    _sampler: &dyn ProcessSampler,
+    _pids: &[Pid],
+    _grace: Duration,
+) -> std::io::Result<TerminationReport> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "recursive termination is only implemented on Unix",
+    ))
+}
+
 #[cfg(unix)]
 fn signal(pid: Pid, sig: libc::c_int) {
     // SAFETY: `kill` is always safe to call; an invalid pid simply returns ESRCH, which we ignore.
@@ -150,6 +193,17 @@ mod tests {
         let targets = termination_targets(&tree, 100);
         assert_eq!(targets, vec![100, 101, 102, 103]);
         assert!(!targets.contains(&1), "init must never be targeted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_pids_with_no_targets_is_clean() {
+        // pids ≤ 1 are filtered out, leaving nothing to signal — a trivially clean report.
+        let sampler = crate::default_sampler();
+        let report = terminate_pids(sampler.as_ref(), &[0, 1], Duration::from_millis(0)).unwrap();
+        assert!(report.targeted.is_empty());
+        assert!(report.fully_cleaned());
+        assert!(!report.used_sigkill);
     }
 
     #[test]

@@ -29,5 +29,5 @@ pub use attribution::{attribute, Attribution, AttributionReport, Owner, RootSpec
 pub use platform::default_sampler;
 pub use sample::{ProcessSample, ProcessSampler, Snapshot};
 pub use sweep::{reconcile, reconcile_tree, FlaggedProcess, ReconciliationReport};
-pub use terminate::{terminate_subtree, termination_targets, TerminationReport};
+pub use terminate::{terminate_pids, terminate_subtree, termination_targets, TerminationReport};
 pub use tree::ProcessTree;
