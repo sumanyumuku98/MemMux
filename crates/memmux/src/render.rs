@@ -47,25 +47,34 @@ pub fn render(f: &mut Frame, model: &Model) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, model: &Model) {
-    let budget = model
-        .data
-        .daemon
-        .as_ref()
-        .map(|d| format!("{} MiB", d.agent_budget_bytes / (1024 * 1024)))
-        .unwrap_or_else(|| "—".to_string());
-    let (pct, stage) = model
+    let budget = model.data.daemon.as_ref().map(|d| d.agent_budget_bytes);
+    // Real usage from the daemon's live attribution sample (SUM-29).
+    let (used, pct, stage) = model
         .data
         .pressure
         .as_ref()
-        .map(|p| (p.utilization_pct, p.stage.clone()))
-        .unwrap_or((0, "—".to_string()));
+        .map(|p| (Some(p.used_bytes), p.utilization_pct, p.stage.clone()))
+        .unwrap_or((None, 0, "—".to_string()));
 
     // The wordmark sweeps violet→cyan (the brand gradient) across "◆ MemMux" (SUM-131).
     let mut spans = theme::gradient_line("◆ MemMux", theme::ACCENT, theme::ACCENT2);
+    let mem = match (used, budget) {
+        (Some(u), Some(b)) => format!("{} / {}", fmt_bytes(u), fmt_bytes(b)),
+        (_, Some(b)) => format!("— / {}", fmt_bytes(b)),
+        _ => "—".to_string(),
+    };
+    // Colour the % by pressure stage so spikes read at a glance.
+    let pct_color = match stage.as_str() {
+        s if s.eq_ignore_ascii_case("critical") || s.eq_ignore_ascii_case("hard") => theme::ERROR,
+        s if s.eq_ignore_ascii_case("elevated") || s.eq_ignore_ascii_case("warning") => theme::WARN,
+        _ => theme::ACCENT2,
+    };
     spans.extend([
-        Span::styled("  memory budget ", theme::dim()),
-        Span::styled(budget, Style::default().fg(theme::ACCENT2)),
-        Span::styled(format!("  ·  {pct}% used · {stage}"), theme::dim()),
+        Span::styled("  memory ", theme::dim()),
+        Span::styled(mem, Style::default().fg(theme::ACCENT2)),
+        Span::styled("  ·  ", theme::dim()),
+        Span::styled(format!("{pct}%"), Style::default().fg(pct_color)),
+        Span::styled(format!(" used · {stage}"), theme::dim()),
     ]);
     let left = Line::from(spans);
     f.render_widget(Paragraph::new(left), pad(area));
@@ -254,10 +263,17 @@ fn render_agents_panel(f: &mut Frame, area: Rect, model: &Model) {
             NavItem::Agent(ti) => {
                 let t = &model.data.tasks[ti];
                 let selected = i == model.agent_selected;
+                // Show live memory (SUM-29) once sampled; blank until then.
+                let mem = if t.accounted_bytes > 0 {
+                    format!("  {}", fmt_bytes(t.accounted_bytes))
+                } else {
+                    String::new()
+                };
                 let line = Line::from(vec![
                     Span::raw("  "),
                     Span::styled("● ", Style::default().fg(theme::state_color(&t.state))),
-                    Span::styled(short(&t.title, 22), Style::default().fg(theme::FG)),
+                    Span::styled(short(&t.title, 16), Style::default().fg(theme::FG)),
+                    Span::styled(mem, theme::dim()),
                 ]);
                 selectable_row(line, selected, focused, inner_w)
             }
@@ -341,6 +357,18 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model) {
                     ),
                 ]),
                 kv("workspace", &workspace_name(model, &t.repository)),
+                kv(
+                    "memory",
+                    &if t.accounted_bytes > 0 {
+                        format!(
+                            "{} (rss {})",
+                            fmt_bytes(t.accounted_bytes),
+                            fmt_bytes(t.rss_bytes)
+                        )
+                    } else {
+                        "—".to_string()
+                    },
+                ),
                 Line::from(""),
                 Line::from(Span::styled(
                     format!(
@@ -730,6 +758,22 @@ fn workspace_name(model: &Model, repo_id: &str) -> String {
         .unwrap_or_else(|| short(repo_id, 16))
 }
 
+/// Format a byte count compactly for the TUI (KiB/MiB/GiB), e.g. `123 MiB`, `1.4 GiB` (SUM-29).
+fn fmt_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn short(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -801,6 +845,8 @@ mod tests {
                 base_branch: "main".into(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                rss_bytes: 0,
+                accounted_bytes: 0,
             }],
             ..Default::default()
         });
@@ -818,7 +864,7 @@ mod tests {
     fn home_shows_header_sidebar_and_agent() {
         let s = text_of(&model());
         assert!(s.contains("MemMux"));
-        assert!(s.contains("memory budget"));
+        assert!(s.contains("memory"));
         assert!(s.contains("WORKSPACES"));
         assert!(s.contains("product")); // workspace name in sidebar
         assert!(s.contains("Refactor auth")); // agent title
@@ -880,6 +926,8 @@ mod tests {
                     base_branch: "main".into(),
                     created_at_ms: 0,
                     updated_at_ms: 0,
+                    rss_bytes: 0,
+                    accounted_bytes: 0,
                 },
                 TaskView {
                     id: "b1".into(),
@@ -890,6 +938,8 @@ mod tests {
                     base_branch: "main".into(),
                     created_at_ms: 0,
                     updated_at_ms: 0,
+                    rss_bytes: 0,
+                    accounted_bytes: 0,
                 },
             ],
             ..Default::default()
@@ -987,6 +1037,33 @@ mod tests {
         assert!(s.contains("codex"));
         assert!(s.contains("shell"));
         assert!(s.contains("/src/product"));
+    }
+
+    #[test]
+    fn fmt_bytes_scales_units() {
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(2 * 1024), "2 KiB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024), "3 MiB");
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024 + 512 * 1024 * 1024), "1.5 GiB");
+    }
+
+    #[test]
+    fn header_and_agent_show_real_memory() {
+        let mut m = model();
+        // Seed a pressure figure + a per-task accounted sample.
+        m.data.pressure = Some(memmux_proto::PressureView {
+            agent_budget_bytes: 20 * 1024 * 1024 * 1024,
+            used_bytes: 512 * 1024 * 1024,
+            utilization_pct: 3,
+            stage: "Normal".into(),
+        });
+        if let Some(t) = m.data.tasks.first_mut() {
+            t.accounted_bytes = 123 * 1024 * 1024;
+            t.rss_bytes = 130 * 1024 * 1024;
+        }
+        let s = text_of(&m);
+        assert!(s.contains("512 MiB"), "header shows used memory");
+        assert!(s.contains("123 MiB"), "agent row shows its memory");
     }
 
     #[test]

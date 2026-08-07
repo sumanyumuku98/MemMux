@@ -397,6 +397,27 @@ impl Store {
         Ok(())
     }
 
+    /// Read up to `limit` most-recent resource samples for `task_id` (newest first), for memory
+    /// timelines / the benchmark harness (SUM-29). Returns `(ts_ms, rss_bytes, accounted_bytes)`.
+    pub fn read_recent_samples(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms, rss_bytes, accounted_bytes FROM resource_samples \
+             WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![task_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// Count of tasks (diagnostics).
     pub fn task_count(&self) -> anyhow::Result<u64> {
         Ok(self
@@ -538,6 +559,23 @@ mod tests {
         assert!(store.load_task("task_1").unwrap().is_none());
         // History is gone too, so a recycled id can't inherit stale transitions.
         assert!(store.load_task("task_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn resource_samples_round_trip_newest_first() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_sample(1000, Some("task_1"), 100, 90).unwrap();
+        store.record_sample(2000, Some("task_1"), 200, 180).unwrap();
+        store.record_sample(1500, Some("task_2"), 50, 45).unwrap();
+        let s1 = store.read_recent_samples("task_1", 10).unwrap();
+        assert_eq!(s1.len(), 2);
+        assert_eq!(s1[0], (2000, 200, 180)); // newest first
+        assert_eq!(s1[1], (1000, 100, 90));
+        assert_eq!(
+            store.read_recent_samples("task_2", 10).unwrap(),
+            vec![(1500, 50, 45)]
+        );
+        assert!(store.read_recent_samples("nope", 10).unwrap().is_empty());
     }
 
     #[test]

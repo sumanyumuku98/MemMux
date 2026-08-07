@@ -1379,6 +1379,8 @@ mod tests {
             base_branch: "main".into(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            rss_bytes: 0,
+            accounted_bytes: 0,
         }
     }
 
