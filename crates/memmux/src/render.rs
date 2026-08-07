@@ -6,7 +6,7 @@ use crate::theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 const SIDEBAR_WIDTH: u16 = 30;
@@ -57,18 +57,14 @@ fn render_header(f: &mut Frame, area: Rect, model: &Model) {
         .map(|p| (p.utilization_pct, p.stage.clone()))
         .unwrap_or((0, "—".to_string()));
 
-    let left = Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(theme::ACCENT)),
-        Span::styled(
-            "MemMux",
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
+    // The wordmark sweeps violet→cyan (the brand gradient) across "◆ MemMux" (SUM-131).
+    let mut spans = theme::gradient_line("◆ MemMux", theme::ACCENT, theme::ACCENT2);
+    spans.extend([
         Span::styled("  memory budget ", theme::dim()),
         Span::styled(budget, Style::default().fg(theme::ACCENT2)),
         Span::styled(format!("  ·  {pct}% used · {stage}"), theme::dim()),
     ]);
+    let left = Line::from(spans);
     f.render_widget(Paragraph::new(left), pad(area));
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -126,6 +122,14 @@ fn render_sidebar(f: &mut Frame, area: Rect, model: &Model) {
             } else {
                 Style::default()
             };
+            // A left glow bar marks the selected row (SUM-131); a space keeps others aligned.
+            let mut line = line;
+            let bar = if selected {
+                Span::styled("▐", Style::default().fg(theme::ACCENT2))
+            } else {
+                Span::raw(" ")
+            };
+            line.spans.insert(0, bar);
             // Pad to full width so the selection highlight spans the row.
             ListItem::new(pad_line(line, inner_w)).style(style)
         })
@@ -429,16 +433,25 @@ fn render_status(f: &mut Frame, area: Rect, model: &Model) {
 
 // --- helpers ---------------------------------------------------------------------------------
 
-/// A bordered panel with a themed title.
-fn panel(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::SURFACE))
-        .title(Span::styled(title.to_string(), theme::title()))
+/// A rounded, themed panel with a title (SUM-131). Border defaults to the surface colour.
+fn panel(title: &str) -> Block<'static> {
+    panel_accent(title, theme::SURFACE)
 }
 
-/// Render a centered modal box over `area`.
+/// A rounded panel whose border uses `border` — e.g. `ACCENT` for a focused pane (SUM-131).
+fn panel_accent(title: &str, border: ratatui::style::Color) -> Block<'static> {
+    theme::rounded(border).title(Span::styled(title.to_string(), theme::title()))
+}
+
+/// Render a centered modal box over `area`, dimming the body behind it with a scrim so the modal
+/// pops (a fake for the "background blur" we can't do in a terminal — SUM-131).
 fn modal(f: &mut Frame, area: Rect, title: &str, text: Vec<Line>) {
+    // Scrim: repaint the whole body area in a darker-than-background colour.
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::SCRIM)),
+        area,
+    );
+
     let w = area.width.min(72);
     let h = (text.len() as u16 + 2).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
