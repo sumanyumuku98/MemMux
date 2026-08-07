@@ -1,7 +1,9 @@
 //! Rendering for the Home view + modals (SUM-126/127). Pure ratatui drawing over the [`Model`];
 //! no I/O. All colours come from [`crate::theme`] so the look stays cohesive.
 
-use crate::app::{FormField, Model, NavItem, PendingAction, View, LAUNCH_ITEMS, PROVIDERS};
+use crate::app::{
+    FormField, Model, NavItem, PendingAction, SidebarSection, View, WsRow, LAUNCH_ITEMS, PROVIDERS,
+};
 use crate::theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -83,18 +85,20 @@ fn render_home(f: &mut Frame, area: Rect, model: &Model) {
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(10)])
         .split(area);
     render_sidebar(f, cols[0], model);
-    // With panes open, the main area is the pane grid; otherwise the agent/workspace detail.
-    if model.panes.is_some() {
+    // With panes open in the active group, the main area is the pane grid; otherwise the detail.
+    if model.active_panes().is_some() {
         render_pane_grid(f, cols[1], model);
     } else {
         render_detail(f, cols[1], model);
     }
 }
 
-/// Render the open agent panes into `area` (SUM-132): the tiling tree, or just the focused pane
-/// when zoomed.
+/// Render the active workspace group's panes into `area` (SUM-132/134): the tiling tree, or just
+/// the focused pane when zoomed.
 fn render_pane_grid(f: &mut Frame, area: Rect, model: &Model) {
-    let Some(layout) = &model.panes else { return };
+    let Some(layout) = model.active_panes() else {
+        return;
+    };
     if model.zoomed {
         if let Some(id) = model.focused_pane() {
             render_pane(f, area, id, model);
@@ -169,16 +173,26 @@ fn render_pane(f: &mut Frame, area: Rect, id: &str, model: &Model) {
     }
 }
 
+/// Draw the two stacked sidebar panels (SUM-134): WORKSPACES on top, AGENTS below. The focused
+/// section's selection glows bright; the other section's selection is shown dim.
 fn render_sidebar(f: &mut Frame, area: Rect, model: &Model) {
-    let nav = model.nav_items();
+    let (top, bottom) = model.sidebar_split(area);
+    render_ws_panel(f, top, model);
+    render_agents_panel(f, bottom, model);
+}
+
+/// The WORKSPACES panel: one row per registered workspace plus an "Other" row for ungrouped agents.
+fn render_ws_panel(f: &mut Frame, area: Rect, model: &Model) {
+    let focused = model.sidebar == SidebarSection::Workspaces;
     let inner_w = area.width.saturating_sub(2) as usize;
-    let items: Vec<ListItem> = nav
+    let rows = model.ws_items();
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, item)| {
-            let selected = i == model.selected;
-            let line = match *item {
-                NavItem::Workspace(wi) => {
+        .map(|(i, row)| {
+            let selected = i == model.ws_selected;
+            let line = match *row {
+                WsRow::Workspace(wi) => {
                     let w = &model.data.workspaces[wi];
                     Line::from(vec![
                         Span::styled("▸ ", Style::default().fg(theme::ACCENT)),
@@ -191,38 +205,69 @@ fn render_sidebar(f: &mut Frame, area: Rect, model: &Model) {
                         Span::styled(format!("  {}", w.task_count), theme::dim()),
                     ])
                 }
-                NavItem::Unregistered => Line::from(Span::styled("▸ other", theme::dim())),
-                NavItem::Agent(ti) => {
-                    let t = &model.data.tasks[ti];
-                    Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled("● ", Style::default().fg(theme::state_color(&t.state))),
-                        Span::styled(short(&t.title, 22), Style::default().fg(theme::FG)),
-                    ])
-                }
+                WsRow::Other => Line::from(Span::styled("▸ Other", theme::dim())),
             };
-            let style = if selected {
-                theme::selected()
-            } else {
-                Style::default()
-            };
-            // A left glow bar marks the selected row (SUM-131); a space keeps others aligned.
-            let mut line = line;
-            let bar = if selected {
-                Span::styled("▐", Style::default().fg(theme::ACCENT2))
-            } else {
-                Span::raw(" ")
-            };
-            line.spans.insert(0, bar);
-            // Pad to full width so the selection highlight spans the row.
-            ListItem::new(pad_line(line, inner_w)).style(style)
+            selectable_row(line, selected, focused, inner_w)
         })
         .collect();
 
-    let list = List::new(items).block(panel(" WORKSPACES "));
+    let list = List::new(items).block(section_panel(" WORKSPACES ", focused));
     f.render_widget(list, area);
 
-    if nav.is_empty() {
+    if rows.is_empty() {
+        let hint = Paragraph::new(Line::from(Span::styled(
+            "press o to add a workspace",
+            theme::dim(),
+        )))
+        .alignment(Alignment::Center);
+        f.render_widget(hint, centered_v(area));
+    }
+}
+
+/// The AGENTS panel: agents grouped under dim workspace headers. Only agent rows are selectable.
+fn render_agents_panel(f: &mut Frame, area: Rect, model: &Model) {
+    let focused = model.sidebar == SidebarSection::Agents;
+    let nav = model.nav_items();
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let items: Vec<ListItem> = nav
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match *item {
+            NavItem::Workspace(wi) => {
+                let w = &model.data.workspaces[wi];
+                // Headers are dim, non-selectable labels.
+                let line = Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        short(&w.name, 20),
+                        Style::default()
+                            .fg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                ListItem::new(pad_line(line, inner_w))
+            }
+            NavItem::Unregistered => {
+                let line = Line::from(vec![Span::raw(" "), Span::styled("other", theme::dim())]);
+                ListItem::new(pad_line(line, inner_w))
+            }
+            NavItem::Agent(ti) => {
+                let t = &model.data.tasks[ti];
+                let selected = i == model.agent_selected;
+                let line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("● ", Style::default().fg(theme::state_color(&t.state))),
+                    Span::styled(short(&t.title, 22), Style::default().fg(theme::FG)),
+                ]);
+                selectable_row(line, selected, focused, inner_w)
+            }
+        })
+        .collect();
+
+    let list = List::new(items).block(section_panel(" AGENTS ", focused));
+    f.render_widget(list, area);
+
+    if !nav.iter().any(|n| matches!(n, NavItem::Agent(_))) {
         let hint = Paragraph::new(Line::from(Span::styled(
             "press c to launch an agent",
             theme::dim(),
@@ -232,9 +277,57 @@ fn render_sidebar(f: &mut Frame, area: Rect, model: &Model) {
     }
 }
 
+/// Style a selectable sidebar row (SUM-134): a bright glow + highlight when it's the focused
+/// section's selection, a dim glow when it's the unfocused section's selection.
+fn selectable_row(
+    mut line: Line<'static>,
+    selected: bool,
+    focused: bool,
+    width: usize,
+) -> ListItem<'static> {
+    let style = if selected && focused {
+        theme::selected()
+    } else {
+        Style::default()
+    };
+    // A left glow bar marks the selected row (SUM-131); a space keeps others aligned.
+    let bar = if selected {
+        let color = if focused {
+            theme::ACCENT2
+        } else {
+            theme::SURFACE
+        };
+        Span::styled("▐", Style::default().fg(color))
+    } else {
+        Span::raw(" ")
+    };
+    line.spans.insert(0, bar);
+    ListItem::new(pad_line(line, width)).style(style)
+}
+
+/// A detail row descriptor: whichever sidebar section is focused decides what to show (SUM-134).
+enum DetailFocus {
+    Agent(usize),
+    Workspace(usize),
+    None,
+}
+
+fn detail_focus(model: &Model) -> DetailFocus {
+    match model.sidebar {
+        SidebarSection::Agents => match model.selected_nav() {
+            Some(NavItem::Agent(ti)) => DetailFocus::Agent(ti),
+            _ => DetailFocus::None,
+        },
+        SidebarSection::Workspaces => match model.selected_ws() {
+            Some(WsRow::Workspace(wi)) => DetailFocus::Workspace(wi),
+            _ => DetailFocus::None,
+        },
+    }
+}
+
 fn render_detail(f: &mut Frame, area: Rect, model: &Model) {
-    let body: Vec<Line> = match model.selected_nav() {
-        Some(NavItem::Agent(ti)) => {
+    let body: Vec<Line> = match detail_focus(model) {
+        DetailFocus::Agent(ti) => {
             let t = &model.data.tasks[ti];
             vec![
                 kv("agent", &t.title),
@@ -258,7 +351,7 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model) {
                 )),
             ]
         }
-        Some(NavItem::Workspace(wi)) => {
+        DetailFocus::Workspace(wi) => {
             let w = &model.data.workspaces[wi];
             vec![
                 kv("workspace", &w.name),
@@ -266,12 +359,12 @@ fn render_detail(f: &mut Frame, area: Rect, model: &Model) {
                 kv("agents", &w.task_count.to_string()),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enter / n → launch an agent here",
+                    "Enter / c → launch an agent here",
                     Style::default().fg(theme::ACCENT2),
                 )),
             ]
         }
-        _ => vec![
+        DetailFocus::None => vec![
             Line::from(Span::styled("No agent selected.", theme::dim())),
             Line::from(""),
             Line::from(Span::styled(
@@ -474,10 +567,17 @@ fn render_confirm(f: &mut Frame, area: Rect, model: &Model) {
 fn render_help(f: &mut Frame, area: Rect, model: &Model) {
     let p = model.prefix.label(); // configurable leader, e.g. "Ctrl-b"
     let keys: Vec<(String, String)> = vec![
-        ("j / k".into(), "move sidebar selection".into()),
+        (
+            "tab".into(),
+            "switch sidebar section (WORKSPACES ⇆ AGENTS)".into(),
+        ),
+        (
+            "j / k".into(),
+            "move selection within the focused section".into(),
+        ),
         (
             "enter".into(),
-            "open the selected agent as a pane · or launch into a workspace".into(),
+            "AGENTS: open the agent as a pane · WORKSPACES: launch into it".into(),
         ),
         (
             "c".into(),
@@ -554,6 +654,16 @@ fn panel(title: &str) -> Block<'static> {
 /// A rounded panel whose border uses `border` — e.g. `ACCENT` for a focused pane (SUM-131).
 fn panel_accent(title: &str, border: ratatui::style::Color) -> Block<'static> {
     theme::rounded(border).title(Span::styled(title.to_string(), theme::title()))
+}
+
+/// A sidebar section panel (SUM-134): an accent border marks the focused section, else the surface.
+fn section_panel(title: &str, focused: bool) -> Block<'static> {
+    let border = if focused {
+        theme::ACCENT
+    } else {
+        theme::SURFACE
+    };
+    panel_accent(title, border)
 }
 
 /// Render a centered modal box over `area`, dimming the body behind it with a scrim so the modal
@@ -706,10 +816,95 @@ mod tests {
 
     #[test]
     fn selecting_an_agent_shows_the_open_pane_hint() {
+        use crate::app::SidebarSection;
         let mut m = model();
-        m.selected = 1; // the agent row
+        m.sidebar = SidebarSection::Agents;
+        m.agent_selected = 1; // the agent row (0 is the workspace header)
         let s = text_of(&m);
         assert!(s.contains("open as a pane"));
+    }
+
+    #[test]
+    fn sidebar_shows_both_sections() {
+        let s = text_of(&model());
+        assert!(s.contains("WORKSPACES"));
+        assert!(s.contains("AGENTS"));
+    }
+
+    #[test]
+    fn only_the_active_workspace_group_is_rendered() {
+        use crate::app::Data;
+        let mut m = Model::default();
+        m.set_data(Data {
+            workspaces: vec![
+                WorkspaceView {
+                    id: "repo_a".into(),
+                    path: "/src/a".into(),
+                    name: "alpha".into(),
+                    created_at_ms: 0,
+                    task_count: 1,
+                },
+                WorkspaceView {
+                    id: "repo_b".into(),
+                    path: "/src/b".into(),
+                    name: "beta".into(),
+                    created_at_ms: 0,
+                    task_count: 1,
+                },
+            ],
+            tasks: vec![
+                TaskView {
+                    id: "a1".into(),
+                    title: "Alpha agent".into(),
+                    provider: "codex".into(),
+                    state: "ACTIVE".into(),
+                    repository: "repo_a".into(),
+                    base_branch: "main".into(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+                TaskView {
+                    id: "b1".into(),
+                    title: "Beta agent".into(),
+                    provider: "codex".into(),
+                    state: "ACTIVE".into(),
+                    repository: "repo_b".into(),
+                    base_branch: "main".into(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            ],
+            ..Default::default()
+        });
+        m.open_pane("a1"); // repo_a group
+        m.open_pane("b1"); // repo_b group — now the active group
+                           // Distinct screen content per pane; only pane bodies (never the sidebar) show it.
+        let cell = |ch: char| crate::app::GridCell {
+            ch,
+            fg: theme::FG,
+            bg: theme::BG,
+            mods: Modifier::empty(),
+        };
+        m.pane_screens.insert(
+            "a1".into(),
+            crate::app::StyledGrid {
+                rows: vec![vec![cell('A'), cell('A'), cell('A')]],
+                cursor: (0, 0),
+                alive: true,
+            },
+        );
+        m.pane_screens.insert(
+            "b1".into(),
+            crate::app::StyledGrid {
+                rows: vec![vec![cell('B'), cell('B'), cell('B')]],
+                cursor: (0, 0),
+                alive: true,
+            },
+        );
+        let s = text_of(&m);
+        // Only the active group's pane (b1) renders its live screen; a1's screen is hidden.
+        assert!(s.contains("BBB"));
+        assert!(!s.contains("AAA"));
     }
 
     #[test]

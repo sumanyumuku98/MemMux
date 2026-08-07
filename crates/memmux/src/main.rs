@@ -130,10 +130,10 @@ fn run<B: ratatui::backend::Backend>(
         terminal.draw(|f| render(f, model))?;
 
         // Redraw quickly while panes stream output; idle otherwise.
-        let timeout = if model.panes.is_some() {
-            Duration::from_millis(33)
-        } else {
+        let timeout = if model.panes.is_empty() {
             Duration::from_millis(250)
+        } else {
+            Duration::from_millis(33)
         };
         if event::poll(timeout)? {
             match event::read()? {
@@ -202,9 +202,10 @@ fn handle_mouse_click(model: &mut Model, col: u16, row: u16) {
     model.focus_pane_at(col, row, grid_area());
 }
 
-/// Each open pane's inner content size `(rows, cols)` (rect minus its 1-cell border).
+/// Each visible pane's inner content size `(rows, cols)` for the active group (SUM-134): its rects
+/// minus each 1-cell border. Only the active group is laid out on screen, so only it is resized.
 fn pane_sizes(model: &Model) -> Vec<(String, (u16, u16))> {
-    let Some(layout) = &model.panes else {
+    let Some(layout) = model.active_panes() else {
         return Vec::new();
     };
     let area = grid_area();
@@ -222,17 +223,22 @@ fn pane_sizes(model: &Model) -> Vec<(String, (u16, u16))> {
         .collect()
 }
 
-/// Resize live pane PTYs to their rects, snapshot them into the model, and drop closed sessions.
+/// Resize + snapshot live pane PTYs each frame (SUM-134). Sessions are *retained* for every task
+/// across *all* groups so hidden-workspace agents keep running, but only the active group's panes
+/// are on screen — so only those get resized/snapshotted.
 fn sync_panes(model: &mut Model, panes: &mut PaneManager) {
-    let ids: Vec<String> = model.panes.as_ref().map(|l| l.leaves()).unwrap_or_default();
-    panes.retain(&ids);
+    // Keep sessions for every open pane in every group alive.
+    let all_ids: Vec<String> = model.panes.values().flat_map(|l| l.leaves()).collect();
+    panes.retain(&all_ids);
     for (id, (rows, cols)) in pane_sizes(model) {
         panes.resize(&id, rows, cols);
         if let Some(grid) = panes.snapshot(&id) {
             model.pane_screens.insert(id, grid);
         }
     }
-    model.pane_screens.retain(|k, _| ids.iter().any(|i| i == k));
+    model
+        .pane_screens
+        .retain(|k, _| all_ids.iter().any(|i| i == k));
 }
 
 /// Bring a task's provider up (start, else restart) and open it as a live pane (SUM-132).
@@ -378,7 +384,9 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
         KeyCode::Right => Key::Right,
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Esc,
-        KeyCode::Tab => Key::Tab,
+        // Both directions of the sidebar section toggle map to a single `Key::Tab` (SUM-134): a
+        // two-section switch is its own inverse, so `Tab` and `BackTab` are interchangeable.
+        KeyCode::Tab | KeyCode::BackTab => Key::Tab,
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Char(c) => Key::Char(c),
         _ => return None,
