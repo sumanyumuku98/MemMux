@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -14,15 +14,15 @@ description = "MemMux — the memory-aware local runtime for parallel AI coding 
 
 [workspace.dependencies]
 # Internal crates
-memmux-core = { path = "crates/memmux-core", version = "0.5.4" }
-memmux-metrics = { path = "crates/memmux-metrics", version = "0.5.4" }
-memmux-proto = { path = "crates/memmux-proto", version = "0.5.4" }
-memmux-sched = { path = "crates/memmux-sched", version = "0.5.4" }
-memmux-pty = { path = "crates/memmux-pty", version = "0.5.4" }
-memmux-worktree = { path = "crates/memmux-worktree", version = "0.5.4" }
-memmux-store = { path = "crates/memmux-store", version = "0.5.4" }
-memmux-adapters = { path = "crates/memmux-adapters", version = "0.5.4" }
-memmux-lifecycle = { path = "crates/memmux-lifecycle", version = "0.5.4" }
+memmux-core = { path = "crates/memmux-core", version = "0.6.0" }
+memmux-metrics = { path = "crates/memmux-metrics", version = "0.6.0" }
+memmux-proto = { path = "crates/memmux-proto", version = "0.6.0" }
+memmux-sched = { path = "crates/memmux-sched", version = "0.6.0" }
+memmux-pty = { path = "crates/memmux-pty", version = "0.6.0" }
+memmux-worktree = { path = "crates/memmux-worktree", version = "0.6.0" }
+memmux-store = { path = "crates/memmux-store", version = "0.6.0" }
+memmux-adapters = { path = "crates/memmux-adapters", version = "0.6.0" }
+memmux-lifecycle = { path = "crates/memmux-lifecycle", version = "0.6.0" }
 
 # External (all pinned to mature, long-published minor lines; see ORG dependency policy)
 anyhow = "1.0"
