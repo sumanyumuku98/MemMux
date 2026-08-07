@@ -25,6 +25,8 @@ const HISTORY_CHUNK_LINES: usize = 500;
 
 /// How often the pump checks running providers against their RSS recycle threshold (SUM-94).
 const RECYCLE_CHECK_INTERVAL_MS: u64 = 5_000;
+/// How often the pump samples per-task memory (SUM-29). One host snapshot per tick.
+const SAMPLE_INTERVAL_MS: u64 = 1_000;
 
 /// Grace period for verifying a provider's process subtree is gone during recycle (SUM-95).
 const TREE_VERIFY_GRACE: Duration = Duration::from_millis(300);
@@ -47,7 +49,22 @@ pub struct DaemonState {
     worktrees: HashMap<String, WorktreeHandle>,
     /// Last time the pump checked running providers against their recycle threshold.
     last_recycle_check_ms: u64,
+    /// Latest per-task memory sample, keyed by task id (SUM-29; refreshed by `sample_tick`).
+    samples: HashMap<String, TaskSample>,
+    /// Agent-attributed used memory across all running tasks, bytes (SUM-29; feeds `pressure`).
+    used_bytes: u64,
+    /// Last time `sample_tick` ran, for throttling.
+    last_sample_ms: u64,
     seq: u64,
+}
+
+/// A task's latest memory sample (SUM-29).
+#[derive(Clone, Copy, Debug, Default)]
+struct TaskSample {
+    /// Resident memory of the task's subtree, bytes.
+    rss_bytes: u64,
+    /// Platform-best accounted memory of the task's subtree, bytes.
+    accounted_bytes: u64,
 }
 
 impl DaemonState {
@@ -74,6 +91,9 @@ impl DaemonState {
             worktree_mgr,
             worktrees: HashMap::new(),
             last_recycle_check_ms: 0,
+            samples: HashMap::new(),
+            used_bytes: 0,
+            last_sample_ms: 0,
             seq: 0,
         };
         state.audit(
@@ -101,12 +121,14 @@ impl DaemonState {
             }),
             Request::CreateTask(req) => self.create_task(req),
             Request::GetTask { id } => match self.tasks.get(&id) {
-                Some(t) => Response::Task(view(t)),
+                Some(t) => Response::Task(self.task_view(t)),
                 None => Response::Error {
                     message: format!("no such task: {id}"),
                 },
             },
-            Request::ListTasks => Response::Tasks(self.tasks.values().map(view).collect()),
+            Request::ListTasks => {
+                Response::Tasks(self.tasks.values().map(|t| self.task_view(t)).collect())
+            }
             Request::TerminateTask { id } => self.terminate(&id),
             Request::ForgetTask { id } => self.forget(&id),
             Request::RestartTask { id } => self.restart(&id),
@@ -339,9 +361,9 @@ impl DaemonState {
     }
 
     fn pressure(&mut self) -> Response {
-        // Per-task provider RSS sampling into the pressure figure is a Phase-3 concern; until
-        // then managed usage is reported as zero rather than fabricating a number.
-        let used_bytes = 0u64;
+        // Real agent-attributed usage from the latest sample tick (SUM-29). Swap-pressure and
+        // hard-limit signals are a later ticket; pass false for now.
+        let used_bytes = self.used_bytes;
         let utilization = self.envelope.utilization(used_bytes);
         let stage = PressureStage::classify(utilization, false, false);
         Response::Pressure(PressureView {
@@ -350,6 +372,17 @@ impl DaemonState {
             utilization_pct: (utilization * 100.0).round() as u32,
             stage: format!("{stage:?}"),
         })
+    }
+
+    /// A [`TaskView`] with the latest memory sample overlaid (SUM-29). Used on the read paths the
+    /// TUI polls (`GetTask`/`ListTasks`); mutation responses use the base `view`.
+    fn task_view(&self, task: &Task) -> TaskView {
+        let mut v = view(task);
+        if let Some(s) = self.samples.get(v.id.as_str()) {
+            v.rss_bytes = s.rss_bytes;
+            v.accounted_bytes = s.accounted_bytes;
+        }
+        v
     }
 
     fn read_events(&self, after_seq: u64, limit: u32) -> Response {
@@ -1087,7 +1120,60 @@ impl DaemonState {
             self.event(Some(&id), "process", "process_exited", "info", "daemon");
         }
 
+        self.sample_tick(now);
         self.check_recycle_triggers(now);
+    }
+
+    /// Throttled per-task memory sampling (SUM-29/31). Takes ONE host process snapshot per tick,
+    /// builds the tree once, and attributes each running task's whole provider **subtree** to that
+    /// task — caching per-task bytes + the agent-attributed total for `pressure` and `TaskView`,
+    /// and persisting each sample to the durable store for history/benchmarking.
+    ///
+    /// Host-wide attribution with the ≥0.95 gate + escaped/unknown surfacing (SUM-30/77) needs
+    /// launch-wrapper-reported pids to be meaningful (otherwise every unrelated host process reads
+    /// as "unknown"); that lands with the reconciliation-sweep ticket. Here we only attribute the
+    /// processes MemMux actually launched.
+    fn sample_tick(&mut self, now: u64) {
+        if now.saturating_sub(self.last_sample_ms) < SAMPLE_INTERVAL_MS {
+            return;
+        }
+        self.last_sample_ms = now;
+
+        // Roots = each running task's provider pid. Nothing running → clear and bail.
+        let roots: Vec<(String, i32)> = self
+            .runtimes
+            .iter()
+            .filter_map(|(id, rt)| rt.pid().map(|p| (id.clone(), p as i32)))
+            .collect();
+        if roots.is_empty() {
+            self.samples.clear();
+            self.used_bytes = 0;
+            return;
+        }
+
+        let sampler = memmux_metrics::default_sampler();
+        let Ok(snap) = sampler.snapshot() else {
+            return;
+        };
+        let tree = memmux_metrics::ProcessTree::from_samples(snap.samples);
+
+        self.samples.clear();
+        let mut total_accounted = 0u64;
+        for (id, pid) in &roots {
+            let s = TaskSample {
+                rss_bytes: tree.subtree_rss_bytes(*pid),
+                accounted_bytes: tree.subtree_accounted_bytes(*pid),
+            };
+            total_accounted += s.accounted_bytes;
+            let _ = self
+                .store
+                .record_sample(now, Some(id), s.rss_bytes, s.accounted_bytes);
+            self.samples.insert(id.clone(), s);
+        }
+        self.used_bytes = total_accounted;
+        let _ = self
+            .store
+            .record_sample(now, None, self.used_bytes, self.used_bytes);
     }
 
     /// Throttled RSS-threshold recycle trigger (SUM-94): every `RECYCLE_CHECK_INTERVAL_MS`, sample
@@ -1331,6 +1417,8 @@ fn view(task: &Task) -> TaskView {
         base_branch: task.spec.base_branch.clone(),
         created_at_ms: task.created_at_ms,
         updated_at_ms: task.updated_at_ms,
+        rss_bytes: 0,
+        accounted_bytes: 0,
     }
 }
 
@@ -1819,8 +1907,84 @@ mod tests {
             Response::Pressure(p) => {
                 assert!(p.agent_budget_bytes > 0);
                 assert_eq!(p.stage, "Normal");
+                assert_eq!(p.used_bytes, 0, "no running tasks → zero used");
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn pressure_reflects_seeded_used_bytes() {
+        let mut s = state();
+        s.used_bytes = s.envelope.agent_budget_bytes / 2; // ~50%
+        match s.handle(Request::SystemPressure) {
+            Response::Pressure(p) => {
+                assert_eq!(p.used_bytes, s.used_bytes);
+                assert!(
+                    (49..=51).contains(&p.utilization_pct),
+                    "got {}",
+                    p.utilization_pct
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// End-to-end (real PTY, per the TDD DoD): a running shell task is sampled, its memory shows up
+    /// in the TaskView, and `pressure().used_bytes` equals the summed per-task attribution (SUM-29).
+    #[test]
+    fn sampling_attributes_a_running_shell_to_its_task() {
+        let tmp = std::env::temp_dir().join(format!("memmuxd-sample-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("repo")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
+        let mut s = DaemonState::boot(store, envelope, tmp.clone()).unwrap();
+
+        let created = match s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "shell".into(),
+            repository_path: tmp.join("repo").to_string_lossy().into_owned(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: None,
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]),
+        })) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            s.handle(Request::StartTask {
+                id: created.id.clone()
+            }),
+            Response::Task(_)
+        ));
+
+        // Force a sample tick (throttle uses last_sample_ms; a large `now` guarantees it runs).
+        s.sample_tick(10_000);
+
+        // The task's view now carries real memory.
+        let tv = match s.handle(Request::GetTask {
+            id: created.id.clone(),
+        }) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert!(tv.accounted_bytes > 0, "task should have sampled memory");
+        assert!(tv.rss_bytes > 0);
+
+        // Pressure's used_bytes equals the summed per-task attribution.
+        match s.handle(Request::SystemPressure) {
+            Response::Pressure(p) => assert_eq!(p.used_bytes, tv.accounted_bytes),
+            other => panic!("{other:?}"),
+        }
+        // A per-task sample row was persisted.
+        assert!(!s
+            .store
+            .read_recent_samples(&created.id, 10)
+            .unwrap()
+            .is_empty());
+
+        s.handle(Request::TerminateTask { id: created.id });
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

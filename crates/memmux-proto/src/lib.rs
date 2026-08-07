@@ -275,6 +275,14 @@ pub struct TaskView {
     pub created_at_ms: u64,
     /// Last update time (ms since epoch).
     pub updated_at_ms: u64,
+    /// Latest sampled resident memory of the task's whole process subtree, in bytes (SUM-29).
+    /// `0` when not yet sampled / not running. `serde(default)` keeps older records readable.
+    #[serde(default)]
+    pub rss_bytes: u64,
+    /// Latest platform-best accounted memory (Linux PSS / macOS phys_footprint, else RSS) of the
+    /// task's subtree, in bytes (SUM-29). `0` when not yet sampled / not running.
+    #[serde(default)]
+    pub accounted_bytes: u64,
 }
 
 /// A snapshot of system memory pressure.
@@ -388,6 +396,8 @@ mod tests {
             base_branch: "main".into(),
             created_at_ms: 1,
             updated_at_ms: 2,
+            rss_bytes: 0,
+            accounted_bytes: 0,
         }]);
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
