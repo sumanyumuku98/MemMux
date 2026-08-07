@@ -2,9 +2,11 @@
 //! `update` that returns the next model plus [`Effect`]s for the runtime to execute. Keeping
 //! `update` free of terminal and socket I/O makes the whole interaction layer unit-testable.
 //!
-//! The UI is a single **Home** view (SUM-127): a sidebar of workspaces with their agents grouped
-//! underneath, plus modals for creating a task / opening a folder / help. There are no numbered
-//! tabs — navigation is the sidebar, and Enter on an agent drops into an interactive session.
+//! The UI is a single **Home** view (SUM-127/134): a two-section sidebar — a WORKSPACES panel on
+//! top and an AGENTS panel (agents grouped under workspace headers) below — plus modals for
+//! creating a task / opening a folder / help. There are no numbered tabs. `Tab` toggles the
+//! focused section; Enter on an agent opens it as a pane, and open panes are scoped per workspace
+//! (only the active group is shown).
 
 use memmux_proto::{
     CreateTaskRequest, DaemonInfo, EventView, PressureView, TaskView, WorkspaceView,
@@ -377,7 +379,7 @@ pub struct Data {
     pub workspaces: Vec<WorkspaceView>,
 }
 
-/// A row in the sidebar's flattened workspace→agent navigation.
+/// A row in the sidebar's grouped AGENTS panel: workspace headers followed by their agents (SUM-134).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavItem {
     /// A registered workspace header (index into [`Data::workspaces`]).
@@ -387,6 +389,30 @@ pub enum NavItem {
     /// An agent (index into [`Data::tasks`]).
     Agent(usize),
 }
+
+/// A row in the sidebar's top WORKSPACES panel (SUM-134): a registered workspace or the catch-all
+/// "Other" bucket for agents with no registered workspace (only present when such agents exist).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsRow {
+    /// A registered workspace (index into [`Data::workspaces`]).
+    Workspace(usize),
+    /// The catch-all group for ungrouped agents.
+    Other,
+}
+
+/// Which stacked sidebar section currently has keyboard focus (SUM-134). `Tab`/`BackTab` toggles
+/// it; `j/k`/arrows move within the focused section only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarSection {
+    /// The top WORKSPACES panel (drives the active pane group).
+    Workspaces,
+    /// The bottom AGENTS panel (agents grouped under workspace headers).
+    Agents,
+}
+
+/// Sentinel workspace key for agents with no registered workspace (SUM-134). Uses a NUL prefix so
+/// it can never collide with a real repository id and sorts first in the [`Model::panes`] map.
+pub const OTHER_WS_KEY: &str = "\u{0}other";
 
 /// A side effect for the runtime to perform (I/O the pure `update` cannot do).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -427,8 +453,13 @@ pub struct Model {
     pub view: View,
     /// Loaded data.
     pub data: Data,
-    /// Selected row index into the sidebar nav list.
-    pub selected: usize,
+    /// Which stacked sidebar section has keyboard focus (SUM-134).
+    pub sidebar: SidebarSection,
+    /// Selected row index into the WORKSPACES panel ([`Model::ws_items`]) (SUM-134).
+    pub ws_selected: usize,
+    /// Selected row index into the AGENTS panel ([`Model::nav_items`]); only ever lands on an
+    /// [`NavItem::Agent`] row (SUM-134).
+    pub agent_selected: usize,
     /// New-task form.
     pub form: NewTaskForm,
     /// The git root of the directory `memmux` was launched from, if any — the default repo for the
@@ -455,9 +486,13 @@ pub struct Model {
     pub prefix: Prefix,
     /// Leader pressed inside the pane grid, awaiting a command key (SUM-132).
     pub prefix_active: bool,
-    /// The open agent panes as a tiling tree (`None` = none open) (SUM-132).
-    pub panes: Option<PaneLayout>,
-    /// The focused pane's task id (SUM-132).
+    /// Open agent panes, one tiling tree per workspace group (SUM-134), keyed by workspace key
+    /// ([`Model::ws_key`]). Only the [`Model::active_ws`] group is shown; hidden groups keep their
+    /// agents running. A group's key is dropped when its last pane closes.
+    pub panes: std::collections::BTreeMap<String, PaneLayout>,
+    /// The workspace key of the group currently shown in the grid (SUM-134).
+    pub active_ws: Option<String>,
+    /// The focused pane's task id, within the active group (SUM-132).
     pub focused_pane: Option<String>,
     /// Orientation for the next opened pane (toggled by leader v / leader -) (SUM-132).
     pub split_orient: Orient,
@@ -476,7 +511,9 @@ impl Default for Model {
         Self {
             view: View::Home,
             data: Data::default(),
-            selected: 0,
+            sidebar: SidebarSection::Workspaces,
+            ws_selected: 0,
+            agent_selected: 0,
             form: NewTaskForm::default(),
             cwd_repo: None,
             cwd: None,
@@ -489,7 +526,8 @@ impl Default for Model {
             focus: Focus::Sidebar,
             prefix: Prefix::default(),
             prefix_active: false,
-            panes: None,
+            panes: std::collections::BTreeMap::new(),
+            active_ws: None,
             focused_pane: None,
             split_orient: Orient::Cols,
             zoomed: false,
@@ -501,7 +539,32 @@ impl Default for Model {
 }
 
 impl Model {
-    /// The flattened sidebar list: each registered workspace header followed by its agents, then
+    /// Whether any agent has no registered workspace (i.e. the "Other" group applies) (SUM-134).
+    fn has_ungrouped(&self) -> bool {
+        self.data
+            .tasks
+            .iter()
+            .any(|t| !self.data.workspaces.iter().any(|w| w.id == t.repository))
+    }
+
+    /// The rows of the top WORKSPACES panel (SUM-134): every registered workspace, then an `Other`
+    /// row when any agent is ungrouped. Drives the active pane group.
+    pub fn ws_items(&self) -> Vec<WsRow> {
+        let mut items: Vec<WsRow> = (0..self.data.workspaces.len())
+            .map(WsRow::Workspace)
+            .collect();
+        if self.has_ungrouped() {
+            items.push(WsRow::Other);
+        }
+        items
+    }
+
+    /// The currently selected WORKSPACES row, if any (SUM-134).
+    pub fn selected_ws(&self) -> Option<WsRow> {
+        self.ws_items().get(self.ws_selected).copied()
+    }
+
+    /// The flattened AGENTS list: each registered workspace header followed by its agents, then
     /// any agents with no registered workspace under an "unregistered" header.
     pub fn nav_items(&self) -> Vec<NavItem> {
         let mut items = Vec::new();
@@ -527,30 +590,145 @@ impl Model {
         items
     }
 
-    /// The currently selected nav row, if any.
+    /// The currently selected AGENTS row (SUM-134). Selection only ever lands on an agent, so this
+    /// is that [`NavItem::Agent`]; `None` when there are no agents.
     pub fn selected_nav(&self) -> Option<NavItem> {
-        self.nav_items().get(self.selected).copied()
+        self.nav_items().get(self.agent_selected).copied()
     }
 
-    /// Default repo path for a new task (SUM-119): the selected workspace (or the selected agent's
-    /// workspace), else the launch directory's git root.
+    /// Whether a nav row is an agent (the only selectable AGENTS rows — headers are dim labels).
+    fn nav_is_agent(item: NavItem) -> bool {
+        matches!(item, NavItem::Agent(_))
+    }
+
+    /// Nudge the AGENTS selection off a header onto the nearest agent, searching in `dir` (+1 down,
+    /// -1 up) then the other way. No-op when there are no agents (SUM-134).
+    fn snap_agent_to_selectable(&mut self, dir: isize) {
+        let nav = self.nav_items();
+        if nav.is_empty() {
+            self.agent_selected = 0;
+            return;
+        }
+        let idx = self.agent_selected.min(nav.len() - 1);
+        if nav.get(idx).copied().map(Self::nav_is_agent) == Some(true) {
+            self.agent_selected = idx;
+            return;
+        }
+        // Search forward in the requested direction, then fall back the other way.
+        for &step in &[dir, -dir] {
+            let mut i = idx as isize;
+            loop {
+                i += step;
+                if i < 0 || i >= nav.len() as isize {
+                    break;
+                }
+                if Self::nav_is_agent(nav[i as usize]) {
+                    self.agent_selected = i as usize;
+                    return;
+                }
+            }
+        }
+        self.agent_selected = idx;
+    }
+
+    /// Toggle the focused sidebar section (SUM-134).
+    pub fn toggle_section(&mut self) {
+        self.sidebar = match self.sidebar {
+            SidebarSection::Workspaces => SidebarSection::Agents,
+            SidebarSection::Agents => SidebarSection::Workspaces,
+        };
+    }
+
+    /// Move the selection within the focused section by `delta` rows (SUM-134). In AGENTS the
+    /// selection skips header rows, landing only on agents. A WORKSPACES move re-points the active
+    /// pane group at the newly selected row.
+    pub fn move_selection(&mut self, delta: isize) {
+        match self.sidebar {
+            SidebarSection::Workspaces => {
+                let len = self.ws_items().len();
+                if len == 0 {
+                    return;
+                }
+                let next = (self.ws_selected as isize + delta).clamp(0, len as isize - 1);
+                self.ws_selected = next as usize;
+                self.sync_active_ws();
+            }
+            SidebarSection::Agents => {
+                let nav = self.nav_items();
+                if nav.is_empty() {
+                    return;
+                }
+                // Step over header rows so the selection always lands on an agent.
+                let step = delta.signum();
+                if step == 0 {
+                    return;
+                }
+                let mut i = self.agent_selected as isize;
+                loop {
+                    let next = i + step;
+                    if next < 0 || next >= nav.len() as isize {
+                        break;
+                    }
+                    i = next;
+                    if Self::nav_is_agent(nav[i as usize]) {
+                        self.agent_selected = i as usize;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The workspace key for the WORKSPACES row at `ws_selected`, if any (SUM-134).
+    fn selected_ws_key(&self) -> Option<String> {
+        match self.selected_ws()? {
+            WsRow::Workspace(wi) => self.data.workspaces.get(wi).map(|w| w.id.clone()),
+            WsRow::Other => Some(OTHER_WS_KEY.to_string()),
+        }
+    }
+
+    /// Point [`Model::active_ws`] (and the focused pane) at the WORKSPACES selection's group
+    /// (SUM-134). Focuses that group's first leaf, or `None` when it has no open panes.
+    pub fn sync_active_ws(&mut self) {
+        let Some(key) = self.selected_ws_key() else {
+            return;
+        };
+        self.active_ws = Some(key.clone());
+        self.focused_pane = self
+            .panes
+            .get(&key)
+            .and_then(|l| l.leaves().first().cloned());
+        self.zoomed = false;
+    }
+
+    /// The registered workspace path for the WORKSPACES selection, if it names a real workspace.
+    fn selected_ws_path(&self) -> Option<String> {
+        match self.selected_ws() {
+            Some(WsRow::Workspace(wi)) => self.data.workspaces.get(wi).map(|w| w.path.clone()),
+            _ => None,
+        }
+    }
+
+    /// Default repo path for a new task (SUM-119/134): driven by the focused section — the selected
+    /// workspace's path (WORKSPACES), or the selected agent's workspace (AGENTS) — else the launch
+    /// directory's git root.
     pub fn default_repo(&self) -> String {
-        match self.selected_nav() {
-            Some(NavItem::Workspace(wi)) => self
-                .data
-                .workspaces
-                .get(wi)
-                .map(|w| w.path.clone())
-                .unwrap_or_default(),
-            Some(NavItem::Agent(ti)) => self
-                .data
-                .tasks
-                .get(ti)
-                .and_then(|t| self.data.workspaces.iter().find(|w| w.id == t.repository))
-                .map(|w| w.path.clone())
+        match self.sidebar {
+            SidebarSection::Workspaces => self
+                .selected_ws_path()
                 .or_else(|| self.cwd_repo.clone())
                 .unwrap_or_default(),
-            _ => self.cwd_repo.clone().unwrap_or_default(),
+            SidebarSection::Agents => match self.selected_nav() {
+                Some(NavItem::Agent(ti)) => self
+                    .data
+                    .tasks
+                    .get(ti)
+                    .and_then(|t| self.data.workspaces.iter().find(|w| w.id == t.repository))
+                    .map(|w| w.path.clone())
+                    .or_else(|| self.cwd_repo.clone())
+                    .unwrap_or_default(),
+                _ => self.cwd_repo.clone().unwrap_or_default(),
+            },
         }
     }
 
@@ -565,59 +743,108 @@ impl Model {
         }
     }
 
-    /// Apply loaded data, clamping the selection against the nav list.
+    /// Apply loaded data, clamping both section selections and snapping the AGENTS selection onto
+    /// the nearest agent row (SUM-134).
     pub fn set_data(&mut self, data: Data) {
         self.data = data;
-        let len = self.nav_items().len();
-        if self.selected >= len {
-            self.selected = len.saturating_sub(1);
+        let ws_len = self.ws_items().len();
+        if self.ws_selected >= ws_len {
+            self.ws_selected = ws_len.saturating_sub(1);
+        }
+        let nav_len = self.nav_items().len();
+        if self.agent_selected >= nav_len {
+            self.agent_selected = nav_len.saturating_sub(1);
+        }
+        self.snap_agent_to_selectable(1);
+    }
+
+    // ---- pane multiplexer ops (pure; SUM-132/134) ---------------------------------------------
+
+    /// The workspace key a task belongs to (SUM-134): its `repository` id when that names a
+    /// registered workspace, else the [`OTHER_WS_KEY`] sentinel. Mirrors [`Model::nav_items`]'
+    /// grouping so the WORKSPACES panel and the pane groups stay in lockstep.
+    pub fn ws_key(&self, task_id: &str) -> String {
+        let repo = self
+            .data
+            .tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.repository.clone());
+        match repo {
+            Some(r) if self.data.workspaces.iter().any(|w| w.id == r) => r,
+            _ => OTHER_WS_KEY.to_string(),
         }
     }
 
-    // ---- pane multiplexer ops (pure; SUM-132) -------------------------------------------------
+    /// The pane group currently shown in the grid (SUM-134): [`Model::active_ws`]'s tree, if open.
+    pub fn active_panes(&self) -> Option<&PaneLayout> {
+        self.active_ws.as_ref().and_then(|k| self.panes.get(k))
+    }
 
-    /// Open `id` as a pane and focus it. First pane fills the grid; subsequent panes split the
-    /// currently-focused pane using `split_orient`. Re-opening an already-open pane just focuses
-    /// it. Focus moves to the pane grid. Idempotent on the tree for an existing id.
+    /// Open `id` as a pane in its workspace group and focus it (SUM-132/134). Makes that group the
+    /// active one. The group's first pane fills the grid; subsequent panes split the currently
+    /// focused pane using `split_orient`. Re-opening an already-open pane just focuses it. Focus
+    /// moves to the pane grid.
     pub fn open_pane(&mut self, id: &str) {
         self.focus = Focus::Panes;
         self.zoomed = false;
-        match &mut self.panes {
-            None => self.panes = Some(PaneLayout::Leaf(id.to_string())),
+        let key = self.ws_key(id);
+        let split_orient = self.split_orient;
+        let prev_focus = self.focused_pane.clone();
+        match self.panes.get_mut(&key) {
+            None => {
+                self.panes
+                    .insert(key.clone(), PaneLayout::Leaf(id.to_string()));
+            }
             Some(layout) => {
                 if !layout.contains(id) {
-                    let target = self
-                        .focused_pane
-                        .clone()
+                    let target = prev_focus
                         .filter(|f| layout.contains(f))
                         .or_else(|| layout.leaves().last().cloned());
                     if let Some(target) = target {
-                        layout.split_leaf(&target, id, self.split_orient);
+                        layout.split_leaf(&target, id, split_orient);
                     }
                 }
             }
         }
+        self.active_ws = Some(key);
         self.focused_pane = Some(id.to_string());
     }
 
-    /// Close the pane for `id`. Re-focuses a surviving sibling; if none remain, returns focus to
-    /// the sidebar. Also drops its cached screen.
+    /// Close the pane for `id` from its group (SUM-132/134). Re-focuses a surviving sibling in the
+    /// active group; drops the group's key when it empties; returns focus to the sidebar when no
+    /// groups remain. Also drops its cached screen.
     pub fn close_pane(&mut self, id: &str) {
         self.pane_screens.remove(id);
-        self.panes = self.panes.take().and_then(|l| l.without(id));
-        match &self.panes {
+        let key = self.ws_key(id);
+        if let Some(layout) = self.panes.remove(&key) {
+            if let Some(next) = layout.without(id) {
+                self.panes.insert(key, next);
+            }
+        }
+        // Refocus within the active group, else fall back to any remaining group.
+        let active = self.active_ws.clone().and_then(|k| self.panes.get(&k));
+        match active {
             Some(layout) => {
-                if self.focused_pane.as_deref() == Some(id) || self.focused_pane.is_none() {
-                    self.focused_pane = layout.leaves().first().cloned();
-                }
-                if !layout.contains(self.focused_pane.as_deref().unwrap_or("")) {
+                let focus_ok = self
+                    .focused_pane
+                    .as_deref()
+                    .map(|f| layout.contains(f))
+                    .unwrap_or(false);
+                if !focus_ok {
                     self.focused_pane = layout.leaves().first().cloned();
                 }
             }
             None => {
-                self.focused_pane = None;
-                self.focus = Focus::Sidebar;
-                self.zoomed = false;
+                if let Some((k, layout)) = self.panes.iter().next() {
+                    self.active_ws = Some(k.clone());
+                    self.focused_pane = layout.leaves().first().cloned();
+                } else {
+                    self.active_ws = None;
+                    self.focused_pane = None;
+                    self.focus = Focus::Sidebar;
+                    self.zoomed = false;
+                }
             }
         }
     }
@@ -635,9 +862,11 @@ impl Model {
     }
 
     /// Move pane focus spatially within `area` (the grid rect). Picks the nearest leaf whose
-    /// centre lies in `dir` from the focused pane's centre.
+    /// centre lies in `dir` from the focused pane's centre, within the active group.
     pub fn focus_dir(&mut self, dir: Dir, area: Rect) {
-        let Some(layout) = &self.panes else { return };
+        let Some(layout) = self.active_panes() else {
+            return;
+        };
         let rects = layout.leaf_rects(area);
         let Some(cur) = self
             .focused_pane
@@ -679,30 +908,66 @@ impl Model {
         }
     }
 
-    /// Left-click hit-test for the sidebar (SUM-133): if `(col,row)` falls on a nav row within the
-    /// bordered sidebar `area`, select it and focus the sidebar. Returns whether it hit.
+    /// Split the sidebar `area` into the stacked WORKSPACES (top) and AGENTS (bottom) panels
+    /// (SUM-134). The WORKSPACES panel is sized to its rows plus a top/bottom border, capped at
+    /// half the sidebar so the AGENTS panel always gets room. Shared by render + mouse hit-testing.
+    pub fn sidebar_split(&self, area: Rect) -> (Rect, Rect) {
+        let ws_rows = self.ws_items().len() as u16;
+        let cap = area.height.saturating_sub(3).max(3);
+        let ws_h = (ws_rows + 2)
+            .clamp(3, area.height.saturating_sub(3).max(3))
+            .min(cap);
+        let top = Rect {
+            height: ws_h.min(area.height),
+            ..area
+        };
+        let bottom = Rect {
+            y: area.y + top.height,
+            height: area.height.saturating_sub(top.height),
+            ..area
+        };
+        (top, bottom)
+    }
+
+    /// Left-click hit-test for the sidebar (SUM-133/134): map `(col,row)` to a row in whichever
+    /// stacked panel it lands in, select it, focus that section + the sidebar. Returns whether it
+    /// hit. A click in AGENTS on a header snaps to the nearest agent.
     pub fn select_nav_at(&mut self, col: u16, row: u16, area: Rect) -> bool {
-        let inside = col >= area.x
-            && col < area.x + area.width
-            && row > area.y // first row is the panel's top border/title
-            && row < area.y + area.height.saturating_sub(1);
-        if !inside {
+        if col < area.x || col >= area.x + area.width {
             return false;
         }
-        let idx = (row - area.y - 1) as usize; // list starts one row below the top border
-        let len = self.nav_items().len();
-        if idx >= len {
-            return false;
+        let (top, bottom) = self.sidebar_split(area);
+        // WORKSPACES panel.
+        if row > top.y && row + 1 < top.y + top.height {
+            let idx = (row - top.y - 1) as usize;
+            if idx >= self.ws_items().len() {
+                return false;
+            }
+            self.ws_selected = idx;
+            self.sidebar = SidebarSection::Workspaces;
+            self.focus = Focus::Sidebar;
+            self.sync_active_ws();
+            return true;
         }
-        self.selected = idx;
-        self.focus = Focus::Sidebar;
-        true
+        // AGENTS panel.
+        if row > bottom.y && row + 1 < bottom.y + bottom.height {
+            let idx = (row - bottom.y - 1) as usize;
+            if idx >= self.nav_items().len() {
+                return false;
+            }
+            self.agent_selected = idx;
+            self.sidebar = SidebarSection::Agents;
+            self.focus = Focus::Sidebar;
+            self.snap_agent_to_selectable(1);
+            return true;
+        }
+        false
     }
 
     /// Left-click hit-test for the pane grid (SUM-133): focus the pane whose rect contains
-    /// `(col,row)` within `area`. Returns whether it hit a pane.
+    /// `(col,row)` within `area`. Returns whether it hit a pane in the active group.
     pub fn focus_pane_at(&mut self, col: u16, row: u16, area: Rect) -> bool {
-        let Some(layout) = &self.panes else {
+        let Some(layout) = self.active_panes() else {
             return false;
         };
         for (id, r) in layout.leaf_rects(area) {
@@ -756,6 +1021,7 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
             model.view = View::NewTask;
         }
         // Close (SUM-130): terminate a running agent or forget a dead one, via a confirm prompt.
+        // Acts on the AGENTS selection regardless of which section is focused.
         Key::Char('x') => {
             if let Some(NavItem::Agent(ti)) = model.selected_nav() {
                 if let Some(t) = model.data.tasks.get(ti) {
@@ -770,34 +1036,37 @@ pub fn update(model: &mut Model, key: Key) -> Vec<Effect> {
                 }
             }
         }
-        Key::Up | Key::Char('k') => move_selection(model, -1),
-        Key::Down | Key::Char('j') => move_selection(model, 1),
+        // Toggle the focused sidebar section (SUM-134). `BackTab` maps to `Key::Tab` upstream too,
+        // so a single arm covers both directions of a two-section toggle.
+        Key::Tab => model.toggle_section(),
+        Key::Up | Key::Char('k') => model.move_selection(-1),
+        Key::Down | Key::Char('j') => model.move_selection(1),
         Key::Enter => return activate_selection(model),
         _ => {}
     }
     Vec::new()
 }
 
-/// Act on the selected sidebar row: open an agent (start-or-restart + attach), or open the
-/// quick-launch palette into the selected workspace.
+/// Act on the focused sidebar section (SUM-134): in AGENTS open the selected agent as a pane
+/// (start-or-restart + attach); in WORKSPACES open the quick-launch palette into that workspace.
 fn activate_selection(model: &mut Model) -> Vec<Effect> {
-    match model.selected_nav() {
-        Some(NavItem::Agent(ti)) => {
-            if let Some(t) = model.data.tasks.get(ti) {
-                let (id, state) = (t.id.clone(), t.state.clone());
-                if is_terminated_state(&state) {
-                    model.status = "agent terminated — press x to remove".to_string();
-                } else {
-                    // Open the agent as a pane and focus it (SUM-132). The runtime starts/restarts
-                    // the provider and wires the live Attach session behind OpenPane.
-                    model.open_pane(&id);
-                    return vec![Effect::OpenPane(id)];
+    match model.sidebar {
+        SidebarSection::Agents => {
+            if let Some(NavItem::Agent(ti)) = model.selected_nav() {
+                if let Some(t) = model.data.tasks.get(ti) {
+                    let (id, state) = (t.id.clone(), t.state.clone());
+                    if is_terminated_state(&state) {
+                        model.status = "agent terminated — press x to remove".to_string();
+                    } else {
+                        // Open the agent as a pane and focus it (SUM-132). The runtime
+                        // starts/restarts the provider and wires the live Attach session.
+                        model.open_pane(&id);
+                        return vec![Effect::OpenPane(id)];
+                    }
                 }
             }
         }
-        Some(NavItem::Workspace(_)) | Some(NavItem::Unregistered) | None => {
-            open_launch(model, model.default_repo());
-        }
+        SidebarSection::Workspaces => open_launch(model, model.default_repo()),
     }
     Vec::new()
 }
@@ -818,15 +1087,6 @@ fn open_launch(model: &mut Model, repo: String) {
     model.launch_repo = repo;
     model.launch_selected = 0;
     model.view = View::Launch;
-}
-
-fn move_selection(model: &mut Model, delta: isize) {
-    let len = model.nav_items().len();
-    if len == 0 {
-        return;
-    }
-    let next = (model.selected as isize + delta).clamp(0, len as isize - 1);
-    model.selected = next as usize;
 }
 
 /// Keys for the quick-launch palette (SUM-130): number keys pick directly; ↑/↓ + Enter also work.
@@ -1070,6 +1330,50 @@ mod tests {
     }
 
     #[test]
+    fn ws_items_list_only_workspaces_and_add_other_when_ungrouped() {
+        // With every agent grouped, there is no Other row.
+        let m = model_with_data();
+        assert_eq!(m.ws_items(), vec![WsRow::Workspace(0), WsRow::Workspace(1)]);
+
+        // An ungrouped agent adds a trailing Other row.
+        let mut m = Model::default();
+        m.set_data(Data {
+            workspaces: vec![workspace("repo_a", "/src/a")],
+            tasks: vec![task("t1", "repo_a"), task("t2", "repo_x")],
+            ..Default::default()
+        });
+        assert_eq!(m.ws_items(), vec![WsRow::Workspace(0), WsRow::Other]);
+    }
+
+    #[test]
+    fn tab_toggles_the_focused_sidebar_section() {
+        let mut m = model_with_data();
+        assert_eq!(m.sidebar, SidebarSection::Workspaces);
+        update(&mut m, Key::Tab);
+        assert_eq!(m.sidebar, SidebarSection::Agents);
+        update(&mut m, Key::Tab);
+        assert_eq!(m.sidebar, SidebarSection::Workspaces);
+    }
+
+    #[test]
+    fn j_k_move_within_the_focused_section_only() {
+        let mut m = model_with_data();
+        // WORKSPACES focused: moves the ws selection, not the agent selection.
+        assert_eq!(m.selected_ws(), Some(WsRow::Workspace(0)));
+        update(&mut m, Key::Char('j'));
+        assert_eq!(m.selected_ws(), Some(WsRow::Workspace(1)));
+        assert_eq!(m.agent_selected, 1, "agent selection untouched");
+
+        // Switch to AGENTS: j/k step over headers onto agents.
+        update(&mut m, Key::Tab);
+        assert_eq!(m.selected_nav(), Some(NavItem::Agent(0)));
+        update(&mut m, Key::Char('j'));
+        assert_eq!(m.selected_nav(), Some(NavItem::Agent(1)));
+        update(&mut m, Key::Char('j')); // skips the repo_b header onto t3
+        assert_eq!(m.selected_nav(), Some(NavItem::Agent(2)));
+    }
+
+    #[test]
     fn ungrouped_agents_land_under_an_unregistered_header() {
         let mut m = Model::default();
         m.set_data(Data {
@@ -1093,40 +1397,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn j_k_navigate_the_sidebar() {
-        let mut m = model_with_data();
-        assert_eq!(m.selected, 0); // repo_a header
-        update(&mut m, Key::Char('j'));
-        assert_eq!(m.selected_nav(), Some(NavItem::Agent(0)));
-        update(&mut m, Key::Char('j'));
-        assert_eq!(m.selected_nav(), Some(NavItem::Agent(1)));
+    /// The `agent_selected` index of the AGENTS row that is `NavItem::Agent(ti)`.
+    fn agent_row(m: &Model, ti: usize) -> usize {
+        m.nav_items()
+            .iter()
+            .position(|n| *n == NavItem::Agent(ti))
+            .unwrap()
     }
 
     #[test]
     fn enter_on_agent_opens_it_as_a_focused_pane() {
         let mut m = model_with_data();
-        m.selected = 1; // Agent(0) == t1
+        m.sidebar = SidebarSection::Agents;
+        m.agent_selected = agent_row(&m, 0); // Agent(0) == t1
         let effects = update(&mut m, Key::Enter);
         // Enter opens the agent as a pane (SUM-132): pure layout mutated + OpenPane for the runtime.
         assert_eq!(effects, vec![Effect::OpenPane("t1".into())]);
         assert_eq!(m.focus, Focus::Panes);
         assert_eq!(m.focused_pane(), Some("t1"));
-        assert_eq!(m.panes, Some(PaneLayout::Leaf("t1".into())));
+        // t1 lives in the repo_a group.
+        assert_eq!(m.active_ws.as_deref(), Some("repo_a"));
+        assert_eq!(m.active_panes(), Some(&PaneLayout::Leaf("t1".into())));
     }
 
     #[test]
-    fn opening_a_second_agent_splits_and_focuses_it() {
+    fn opening_a_second_agent_in_the_same_workspace_splits_and_focuses_it() {
         let mut m = model_with_data();
-        m.open_pane("t1");
+        m.open_pane("t1"); // repo_a
         m.split_orient = Orient::Cols;
-        m.open_pane("t2");
+        m.open_pane("t2"); // repo_a
         assert_eq!(m.focused_pane(), Some("t2"));
-        assert_eq!(m.panes.as_ref().unwrap().leaves(), vec!["t1", "t2"]);
+        assert_eq!(m.active_panes().unwrap().leaves(), vec!["t1", "t2"]);
+        // Only one group, holding both agents.
+        assert_eq!(m.panes.len(), 1);
         // Re-opening an already-open pane just refocuses (no duplicate leaf).
         m.open_pane("t1");
         assert_eq!(m.focused_pane(), Some("t1"));
-        assert_eq!(m.panes.as_ref().unwrap().leaves(), vec!["t1", "t2"]);
+        assert_eq!(m.active_panes().unwrap().leaves(), vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn opening_agents_in_two_workspaces_makes_two_isolated_groups() {
+        let mut m = model_with_data();
+        m.open_pane("t1"); // repo_a
+        m.open_pane("t3"); // repo_b
+        assert_eq!(m.panes.len(), 2);
+        assert_eq!(m.panes.get("repo_a").unwrap().leaves(), vec!["t1"]);
+        assert_eq!(m.panes.get("repo_b").unwrap().leaves(), vec!["t3"]);
+        // Opening t3 made repo_b active and focused it.
+        assert_eq!(m.active_ws.as_deref(), Some("repo_b"));
+        assert_eq!(m.focused_pane(), Some("t3"));
+        assert_eq!(m.active_panes().unwrap().leaves(), vec!["t3"]);
+    }
+
+    #[test]
+    fn unregistered_agent_lands_in_the_other_group() {
+        let mut m = Model::default();
+        m.set_data(Data {
+            workspaces: vec![workspace("repo_a", "/src/a")],
+            tasks: vec![task("t1", "repo_a"), task("t2", "repo_x")],
+            ..Default::default()
+        });
+        assert_eq!(m.ws_key("t2"), OTHER_WS_KEY);
+        m.open_pane("t2");
+        assert_eq!(m.active_ws.as_deref(), Some(OTHER_WS_KEY));
+        assert_eq!(m.panes.get(OTHER_WS_KEY).unwrap().leaves(), vec!["t2"]);
     }
 
     #[test]
@@ -1135,14 +1470,48 @@ mod tests {
         m.open_pane("t1");
         m.open_pane("t2");
         m.close_pane("t2");
-        assert_eq!(m.panes, Some(PaneLayout::Leaf("t1".into())));
+        assert_eq!(m.active_panes(), Some(&PaneLayout::Leaf("t1".into())));
         assert_eq!(m.focused_pane(), Some("t1"));
         assert_eq!(m.focus, Focus::Panes);
-        // Closing the last pane returns focus to the sidebar.
+        // Closing the last pane drops the group key and returns focus to the sidebar.
         m.close_pane("t1");
-        assert_eq!(m.panes, None);
+        assert!(m.panes.is_empty());
+        assert_eq!(m.active_ws, None);
         assert_eq!(m.focus, Focus::Sidebar);
         assert_eq!(m.focused_pane(), None);
+    }
+
+    #[test]
+    fn closing_a_groups_last_pane_drops_only_that_key() {
+        let mut m = model_with_data();
+        m.open_pane("t1"); // repo_a
+        m.open_pane("t3"); // repo_b (now active)
+        m.close_pane("t3");
+        // repo_b's key is gone; repo_a survives and becomes the fallback active group.
+        assert!(!m.panes.contains_key("repo_b"));
+        assert!(m.panes.contains_key("repo_a"));
+        assert_eq!(m.active_ws.as_deref(), Some("repo_a"));
+        assert_eq!(m.focused_pane(), Some("t1"));
+        assert_eq!(m.focus, Focus::Panes);
+    }
+
+    #[test]
+    fn active_ws_and_active_panes_follow_workspace_selection() {
+        let mut m = model_with_data();
+        m.open_pane("t1"); // repo_a
+        m.open_pane("t3"); // repo_b, now active
+        assert_eq!(m.active_ws.as_deref(), Some("repo_b"));
+        // Select repo_a in the WORKSPACES panel: the grid + focus follow to that group.
+        m.sidebar = SidebarSection::Workspaces;
+        m.ws_selected = 0; // repo_a
+        m.sync_active_ws();
+        assert_eq!(m.active_ws.as_deref(), Some("repo_a"));
+        assert_eq!(m.focused_pane(), Some("t1"));
+        assert_eq!(m.active_panes().unwrap().leaves(), vec!["t1"]);
+        // A WORKSPACES j/k move re-points the active group too.
+        update(&mut m, Key::Char('j')); // -> repo_b
+        assert_eq!(m.active_ws.as_deref(), Some("repo_b"));
+        assert_eq!(m.focused_pane(), Some("t3"));
     }
 
     #[test]
@@ -1229,31 +1598,43 @@ mod tests {
     fn mouse_click_focuses_a_pane_and_selects_a_sidebar_row() {
         use ratatui::layout::Rect;
         let mut m = model_with_data();
-        m.open_pane("t1");
+        m.open_pane("t1"); // repo_a
         m.split_orient = Orient::Cols;
-        m.open_pane("t2"); // t1 | t2
+        m.open_pane("t2"); // repo_a: t1 | t2
         let grid = Rect::new(30, 1, 60, 22);
-        // A click in the right half hits t2, the left half hits t1.
+        // A click in the right half hits t2, the left half hits t1 (within the active group).
         assert!(m.focus_pane_at(80, 10, grid));
         assert_eq!(m.focused_pane(), Some("t2"));
         assert!(m.focus_pane_at(35, 10, grid));
         assert_eq!(m.focused_pane(), Some("t1"));
 
-        // Sidebar: row maps to a nav index (list starts one row below the border at area.y).
+        // Sidebar hit-testing splits the rect into WORKSPACES (top) / AGENTS (bottom).
         let sidebar = Rect::new(0, 1, 30, 22);
-        // nav_items() = [Workspace(0), Agent(0)=t1, Agent(1)=t2, Workspace(1), Agent(2)=t3]
-        assert!(m.select_nav_at(5, 3, sidebar)); // row 3 → idx (3-1-1)=1 → Agent(0)
-        assert_eq!(m.selected_nav(), Some(NavItem::Agent(0)));
+        let (top, bottom) = m.sidebar_split(sidebar);
+        // A WORKSPACES click selects a workspace row and focuses that section.
+        assert!(m.select_nav_at(5, top.y + 2, sidebar)); // idx (row-top.y-1)=1 → Workspace(1)
+        assert_eq!(m.selected_ws(), Some(WsRow::Workspace(1)));
+        assert_eq!(m.sidebar, SidebarSection::Workspaces);
         assert_eq!(m.focus, Focus::Sidebar);
-        // A click above the first row (on the border) doesn't select.
-        assert!(!m.select_nav_at(5, 1, sidebar));
+        // Selecting repo_b made it the active group.
+        assert_eq!(m.active_ws.as_deref(), Some("repo_b"));
+
+        // An AGENTS click selects an agent row and focuses that section.
+        // nav_items() = [Workspace(0), Agent(0)=t1, Agent(1)=t2, Workspace(1), Agent(2)=t3]
+        assert!(m.select_nav_at(5, bottom.y + 2, sidebar)); // idx 1 → Agent(0)
+        assert_eq!(m.selected_nav(), Some(NavItem::Agent(0)));
+        assert_eq!(m.sidebar, SidebarSection::Agents);
+        assert_eq!(m.focus, Focus::Sidebar);
+        // A click on the WORKSPACES top border doesn't select.
+        assert!(!m.select_nav_at(5, top.y, sidebar));
     }
 
     #[test]
     fn enter_on_a_terminated_agent_does_not_attach() {
         let mut m = model_with_data();
         m.data.tasks[0].state = "TERMINATED".into();
-        m.selected = 1; // Agent(0) == t1
+        m.sidebar = SidebarSection::Agents;
+        m.agent_selected = agent_row(&m, 0); // Agent(0) == t1
         let effects = update(&mut m, Key::Enter);
         assert!(effects.is_empty(), "must not attach to a terminated agent");
         assert!(m.status.contains("terminated"));
@@ -1261,8 +1642,8 @@ mod tests {
 
     #[test]
     fn enter_on_workspace_opens_launch_palette_prefilled() {
-        let mut m = model_with_data();
-        m.selected = 0; // Workspace(0) == repo_a @ /src/a
+        let mut m = model_with_data(); // WORKSPACES focused by default
+        m.ws_selected = 0; // Workspace(0) == repo_a @ /src/a
         update(&mut m, Key::Enter);
         assert_eq!(m.view, View::Launch);
         assert_eq!(m.launch_repo, "/src/a");
@@ -1271,7 +1652,7 @@ mod tests {
     #[test]
     fn c_opens_launch_palette_and_picks_an_agent() {
         let mut m = model_with_data();
-        m.selected = 3; // Workspace(1) == repo_b @ /src/b
+        m.ws_selected = 1; // Workspace(1) == repo_b @ /src/b
         update(&mut m, Key::Char('c'));
         assert_eq!(m.view, View::Launch);
         assert_eq!(m.launch_repo, "/src/b");
@@ -1303,8 +1684,9 @@ mod tests {
 
     #[test]
     fn x_terminates_a_running_agent_after_confirm() {
-        let mut m = model_with_data(); // t1 is QUEUED
-        m.selected = 1; // Agent(0) == t1
+        let mut m = model_with_data(); // t1 is ACTIVE
+        m.sidebar = SidebarSection::Agents;
+        m.agent_selected = agent_row(&m, 0); // Agent(0) == t1
         update(&mut m, Key::Char('x'));
         assert_eq!(m.view, View::Confirm);
         assert_eq!(m.pending, Some(PendingAction::Terminate("t1".into())));
@@ -1318,7 +1700,8 @@ mod tests {
     fn x_forgets_a_terminal_agent_and_esc_cancels() {
         let mut m = model_with_data();
         m.data.tasks[0].state = "FAILED".into();
-        m.selected = 1; // Agent(0) == t1
+        m.sidebar = SidebarSection::Agents;
+        m.agent_selected = agent_row(&m, 0); // Agent(0) == t1
         update(&mut m, Key::Char('x'));
         assert_eq!(m.pending, Some(PendingAction::Forget("t1".into())));
         let effects = update(&mut m, Key::Esc);
@@ -1329,8 +1712,8 @@ mod tests {
 
     #[test]
     fn n_prefills_repo_from_selected_workspace() {
-        let mut m = model_with_data();
-        m.selected = 3; // Workspace(1) == repo_b @ /src/b
+        let mut m = model_with_data(); // WORKSPACES focused
+        m.ws_selected = 1; // Workspace(1) == repo_b @ /src/b
         update(&mut m, Key::Char('n'));
         assert_eq!(m.view, View::NewTask);
         assert_eq!(m.form.repo, "/src/b");
