@@ -165,6 +165,8 @@ pub enum PaneLayout {
     Split {
         /// Split orientation.
         orient: Orient,
+        /// Percent of the split given to child `a` (left/top); `b` gets the rest. Clamped to `10..=90`.
+        ratio: u16,
         /// First child (left/top).
         a: Box<PaneLayout>,
         /// Second child (right/bottom).
@@ -196,7 +198,12 @@ impl PaneLayout {
             PaneLayout::Leaf(id) if id == target => {
                 let a = Box::new(PaneLayout::Leaf(id.clone()));
                 let b = Box::new(PaneLayout::Leaf(new_id.to_string()));
-                *self = PaneLayout::Split { orient, a, b };
+                *self = PaneLayout::Split {
+                    orient,
+                    ratio: 50,
+                    a,
+                    b,
+                };
                 true
             }
             PaneLayout::Leaf(_) => false,
@@ -212,12 +219,18 @@ impl PaneLayout {
         match self {
             PaneLayout::Leaf(l) if l == id => None,
             PaneLayout::Leaf(l) => Some(PaneLayout::Leaf(l)),
-            PaneLayout::Split { orient, a, b } => {
+            PaneLayout::Split {
+                orient,
+                ratio,
+                a,
+                b,
+            } => {
                 let a2 = a.without(id);
                 let b2 = b.without(id);
                 match (a2, b2) {
                     (Some(a), Some(b)) => Some(PaneLayout::Split {
                         orient,
+                        ratio,
                         a: Box::new(a),
                         b: Box::new(b),
                     }),
@@ -238,19 +251,54 @@ impl PaneLayout {
     fn collect_rects(&self, area: Rect, out: &mut Vec<(String, Rect)>) {
         match self {
             PaneLayout::Leaf(id) => out.push((id.clone(), area)),
-            PaneLayout::Split { orient, a, b } => {
+            PaneLayout::Split {
+                orient,
+                ratio,
+                a,
+                b,
+            } => {
                 let dir = match orient {
                     Orient::Cols => Direction::Horizontal,
                     Orient::Rows => Direction::Vertical,
                 };
+                let r = (*ratio).clamp(10, 90);
                 let parts = Layout::default()
                     .direction(dir)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .constraints([Constraint::Percentage(r), Constraint::Percentage(100 - r)])
                     .split(area);
                 a.collect_rects(parts[0], out);
                 b.collect_rects(parts[1], out);
             }
         }
+    }
+
+    /// Move the boundary of the split governing `focused` along `axis_cols` by `delta` percent
+    /// (SUM-135). Adjusts the *nearest* ancestor split whose orientation matches the axis
+    /// (`Cols`↔horizontal). Returns whether a split was adjusted; ratio is clamped to `10..=90`.
+    fn resize(&mut self, focused: &str, axis_cols: bool, delta: i16) -> bool {
+        let PaneLayout::Split {
+            orient,
+            ratio,
+            a,
+            b,
+        } = self
+        else {
+            return false;
+        };
+        let in_a = a.contains(focused);
+        if !in_a && !b.contains(focused) {
+            return false;
+        }
+        // Prefer the split closest to the focused leaf.
+        let child = if in_a { a } else { b };
+        if child.resize(focused, axis_cols, delta) {
+            return true;
+        }
+        if (*orient == Orient::Cols) == axis_cols {
+            *ratio = (*ratio as i16 + delta).clamp(10, 90) as u16;
+            return true;
+        }
+        false
     }
 }
 
@@ -498,6 +546,8 @@ pub struct Model {
     pub split_orient: Orient,
     /// Whether the focused pane is zoomed to fill the grid area (SUM-132).
     pub zoomed: bool,
+    /// Whether resize mode is active (leader `r`): h/j/k/l adjust the focused split (SUM-135).
+    pub resizing: bool,
     /// Live styled screens for open panes, snapshotted by the runtime each frame (SUM-132).
     pub pane_screens: std::collections::HashMap<String, StyledGrid>,
     /// Status line message.
@@ -531,6 +581,7 @@ impl Default for Model {
             focused_pane: None,
             split_orient: Orient::Cols,
             zoomed: false,
+            resizing: false,
             pane_screens: std::collections::HashMap::new(),
             status: "connected".to_string(),
             should_quit: false,
@@ -859,6 +910,23 @@ impl Model {
         if self.focused_pane.is_some() {
             self.zoomed = !self.zoomed;
         }
+    }
+
+    /// Resize the focused pane's governing split by moving its boundary toward `dir` (SUM-135):
+    /// Right/Down grow child `a`, Left/Up shrink it, by 5% (clamped to `10..=90`).
+    pub fn resize_focused(&mut self, dir: Dir) {
+        let Some(focused) = self.focused_pane.clone() else {
+            return;
+        };
+        let Some(layout) = self.active_ws.clone().and_then(|k| self.panes.get_mut(&k)) else {
+            return;
+        };
+        let axis_cols = matches!(dir, Dir::Left | Dir::Right);
+        let delta = match dir {
+            Dir::Right | Dir::Down => 5,
+            Dir::Left | Dir::Up => -5,
+        };
+        layout.resize(&focused, axis_cols, delta);
     }
 
     /// Move pane focus spatially within `area` (the grid rect). Picks the nearest leaf whose
@@ -1538,6 +1606,60 @@ mod tests {
         assert!(m.zoomed);
         m.toggle_zoom();
         assert!(!m.zoomed);
+    }
+
+    #[test]
+    fn splits_default_to_50_50_and_resize_adjusts_the_ratio() {
+        use ratatui::layout::Rect;
+        let mut m = model_with_data();
+        m.open_pane("t1");
+        m.split_orient = Orient::Cols;
+        m.open_pane("t2"); // t1 | t2, focus t2
+        let area = Rect::new(0, 0, 100, 24);
+        // Default 50/50 → t1 gets the left 50 cols.
+        let rects = m.active_panes().unwrap().leaf_rects(area);
+        let t1 = rects.iter().find(|(id, _)| id == "t1").unwrap().1;
+        assert_eq!(t1.width, 50);
+        // Move the boundary left twice (−5 each) → child a (t1) shrinks to 40%.
+        m.resize_focused(Dir::Left);
+        m.resize_focused(Dir::Left);
+        let rects = m.active_panes().unwrap().leaf_rects(area);
+        let t1 = rects.iter().find(|(id, _)| id == "t1").unwrap().1;
+        assert_eq!(t1.width, 40);
+    }
+
+    #[test]
+    fn resize_clamps_and_ignores_the_wrong_axis() {
+        use ratatui::layout::Rect;
+        let mut m = model_with_data();
+        m.open_pane("t1");
+        m.split_orient = Orient::Cols;
+        m.open_pane("t2");
+        let area = Rect::new(0, 0, 100, 24);
+        // Vertical resize on a purely horizontal (Cols) split is a no-op.
+        m.resize_focused(Dir::Down);
+        let t1 = m
+            .active_panes()
+            .unwrap()
+            .leaf_rects(area)
+            .into_iter()
+            .find(|(id, _)| id == "t1")
+            .unwrap()
+            .1;
+        assert_eq!(t1.width, 50);
+        // Growing child a past the cap clamps at 90%.
+        for _ in 0..20 {
+            m.resize_focused(Dir::Right);
+        }
+        let t1 = m
+            .active_panes()
+            .unwrap()
+            .leaf_rects(area)
+            .into_iter()
+            .find(|(id, _)| id == "t1")
+            .unwrap()
+            .1;
+        assert_eq!(t1.width, 90);
     }
 
     #[test]

@@ -599,6 +599,7 @@ fn render_help(f: &mut Frame, area: Rect, model: &Model) {
             "split: launch a new pane right / down".into(),
         ),
         (format!("{p} z"), "zoom the focused pane".into()),
+        (format!("{p} r"), "resize mode (then h/j/k/l · esc)".into()),
         (format!("{p} x"), "close the focused pane".into()),
         (format!("{p} o / d"), "return focus to the sidebar".into()),
         (
@@ -630,6 +631,23 @@ fn render_help(f: &mut Frame, area: Rect, model: &Model) {
 }
 
 fn render_status(f: &mut Frame, area: Rect, model: &Model) {
+    // Resize mode takes over the status line with a prominent hint (SUM-135).
+    if model.resizing {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " -- RESIZE -- ",
+                    Style::default()
+                        .fg(theme::BG)
+                        .bg(theme::ACCENT2)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" h/j/k/l move the split · esc/enter done", theme::dim()),
+            ])),
+            area,
+        );
+        return;
+    }
     let dot = if model.status.starts_with("daemon") && model.status.contains("unreachable") {
         Span::styled(" ● ", Style::default().fg(theme::ERROR))
     } else {

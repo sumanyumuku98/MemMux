@@ -273,6 +273,18 @@ fn handle_pane_key(
 ) {
     let pfx = model.prefix;
     let prefix = mods.contains(KeyModifiers::CONTROL) == pfx.ctrl && code == KeyCode::Char(pfx.ch);
+    // Resize mode (leader r): h/j/k/l / arrows adjust the focused split; Esc/Enter/r exit (SUM-135).
+    if model.resizing {
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('r') => model.resizing = false,
+            KeyCode::Char('h') | KeyCode::Left => model.resize_focused(Dir::Left),
+            KeyCode::Char('j') | KeyCode::Down => model.resize_focused(Dir::Down),
+            KeyCode::Char('k') | KeyCode::Up => model.resize_focused(Dir::Up),
+            KeyCode::Char('l') | KeyCode::Right => model.resize_focused(Dir::Right),
+            _ => {}
+        }
+        return;
+    }
     if model.prefix_active {
         model.prefix_active = false;
         match code {
@@ -288,6 +300,8 @@ fn handle_pane_key(
                     panes.close(&id);
                 }
             }
+            // Enter resize mode: subsequent h/j/k/l adjust the focused split.
+            KeyCode::Char('r') => model.resizing = true,
             // Split: choose orientation for the next opened pane, then pick an agent to launch.
             KeyCode::Char('v') => {
                 model.split_orient = Orient::Cols;
