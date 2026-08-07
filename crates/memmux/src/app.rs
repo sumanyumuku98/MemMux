@@ -794,6 +794,32 @@ impl Model {
         }
     }
 
+    /// The registered-workspace path of the focused pane's agent, if any (SUM-136). Used so a
+    /// pane split (leader v / leader -) launches the new agent into the *same* workspace and
+    /// therefore tiles beside the focused pane, instead of opening in another workspace group.
+    pub fn focused_pane_repo(&self) -> Option<String> {
+        let fid = self.focused_pane.as_deref()?;
+        let repo_id = self
+            .data
+            .tasks
+            .iter()
+            .find(|t| t.id == fid)?
+            .repository
+            .clone();
+        self.data
+            .workspaces
+            .iter()
+            .find(|w| w.id == repo_id)
+            .map(|w| w.path.clone())
+    }
+
+    /// The repo a pane split should launch into: the focused pane's workspace, else the usual
+    /// quick-launch target (SUM-136).
+    pub fn split_target_repo(&self) -> String {
+        self.focused_pane_repo()
+            .unwrap_or_else(|| self.launch_target_repo())
+    }
+
     /// Apply loaded data, clamping both section selections and snapping the AGENTS selection onto
     /// the nearest agent row (SUM-134).
     pub fn set_data(&mut self, data: Data) {
@@ -1516,6 +1542,21 @@ mod tests {
         assert_eq!(m.active_ws.as_deref(), Some("repo_b"));
         assert_eq!(m.focused_pane(), Some("t3"));
         assert_eq!(m.active_panes().unwrap().leaves(), vec!["t3"]);
+    }
+
+    #[test]
+    fn split_launch_targets_the_focused_panes_workspace() {
+        // Regression (SUM-136): splitting from a focused pane must launch into that pane's
+        // workspace so the new agent tiles beside it, not open in another workspace group.
+        let mut m = model_with_data(); // repo_a @ /src/a (t1,t2), repo_b @ /src/b (t3)
+        m.open_pane("t1"); // active_ws = repo_a
+        assert_eq!(m.focused_pane_repo().as_deref(), Some("/src/a"));
+        assert_eq!(m.split_target_repo(), "/src/a");
+        // Launching another agent in the same workspace joins the active group (a real split).
+        m.open_pane("t2"); // t2 is also repo_a
+        assert_eq!(m.active_ws.as_deref(), Some("repo_a"));
+        assert_eq!(m.active_panes().unwrap().leaves(), vec!["t1", "t2"]);
+        assert_eq!(m.panes.len(), 1, "no new workspace group was created");
     }
 
     #[test]
