@@ -1560,6 +1560,28 @@ mod tests {
     }
 
     #[test]
+    fn newly_created_agent_groups_with_focus_only_after_it_is_in_data() {
+        // Guards the open_agent_pane ordering (SUM-137): a freshly-created agent must be present
+        // in `data` (via refresh) BEFORE open_pane, or ws_key can't resolve its workspace and it
+        // lands in the "other" group instead of splitting beside the focused pane.
+        let mut m = model_with_data(); // repo_a (t1,t2), repo_b (t3)
+        m.open_pane("t1"); // active_ws = repo_a
+                           // Bug path: opening before the task is in `data` → "other" group.
+        m.open_pane("t9");
+        assert_eq!(m.active_ws.as_deref(), Some(OTHER_WS_KEY));
+        // Corrected path: refresh brings t9 (repo_a) into data first, then it joins repo_a.
+        m.close_pane("t9");
+        m.active_ws = Some("repo_a".into());
+        m.focused_pane = Some("t1".into());
+        let mut data = m.data.clone();
+        data.tasks.push(task("t9", "repo_a"));
+        m.set_data(data);
+        m.open_pane("t9");
+        assert_eq!(m.active_ws.as_deref(), Some("repo_a"));
+        assert_eq!(m.active_panes().unwrap().leaves(), vec!["t1", "t9"]);
+    }
+
+    #[test]
     fn unregistered_agent_lands_in_the_other_group() {
         let mut m = Model::default();
         m.set_data(Data {
