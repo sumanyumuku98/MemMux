@@ -13,7 +13,11 @@ use memmux_proto::{
     ScreenView, TaskView, WorkspaceView, PROTOCOL_VERSION,
 };
 use memmux_pty::ChunkStore;
-use memmux_sched::{class_reservation, pressure::PressureStage, ResourceEnvelope};
+use memmux_sched::{
+    class_reservation,
+    pressure::{PressureAction, PressureStage},
+    ResourceEnvelope,
+};
 use memmux_store::{CheckpointRef, Decision, EventInput, Store, Workspace};
 use memmux_worktree::{ManagedLayout, TaskSlug, WorktreeHandle, WorktreeManager};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,6 +31,8 @@ const HISTORY_CHUNK_LINES: usize = 500;
 const RECYCLE_CHECK_INTERVAL_MS: u64 = 5_000;
 /// How often the pump samples per-task memory (SUM-29). One host snapshot per tick.
 const SAMPLE_INTERVAL_MS: u64 = 1_000;
+/// How often the pump classifies memory pressure and applies the ladder (SUM-48).
+const PRESSURE_CHECK_INTERVAL_MS: u64 = 2_000;
 
 /// Grace period for verifying a provider's process subtree is gone during recycle (SUM-95).
 const TREE_VERIFY_GRACE: Duration = Duration::from_millis(300);
@@ -62,6 +68,12 @@ pub struct DaemonState {
     escaped_reported: HashSet<i32>,
     /// Fraction of managed-set memory attributed to a task in the last sweep (SUM-30 gate ≥ 0.95).
     attributed_fraction: f64,
+    /// Last time `pressure_tick` ran, for throttling (SUM-48).
+    last_pressure_check_ms: u64,
+    /// Last observed swap usage, bytes — a rising value across ticks flags `swap_growing` (SUM-48).
+    last_swap_used_bytes: Option<u64>,
+    /// The pressure stage from the last tick; also gates low-priority admission in `start_task`.
+    pressure_stage: PressureStage,
     seq: u64,
 }
 
@@ -104,6 +116,9 @@ impl DaemonState {
             seen_pids: HashMap::new(),
             escaped_reported: HashSet::new(),
             attributed_fraction: 1.0,
+            last_pressure_check_ms: 0,
+            last_swap_used_bytes: None,
+            pressure_stage: PressureStage::Normal,
             seq: 0,
         };
         state.audit(
@@ -375,11 +390,13 @@ impl DaemonState {
     }
 
     fn pressure(&mut self) -> Response {
-        // Real agent-attributed usage from the latest sample tick (SUM-29). Swap-pressure and
-        // hard-limit signals are a later ticket; pass false for now.
+        // Real agent-attributed usage from the latest sample tick (SUM-29). Hard-limit is derived
+        // here so on-demand reports match enforcement; the swap-growth signal is only tracked in
+        // the throttled `pressure_tick` (it needs a cross-tick delta), so report it as false.
         let used_bytes = self.used_bytes;
         let utilization = self.envelope.utilization(used_bytes);
-        let stage = PressureStage::classify(utilization, false, false);
+        let hard_limit = used_bytes > self.envelope.agent_budget_bytes;
+        let stage = PressureStage::classify(utilization, false, hard_limit);
         Response::Pressure(PressureView {
             agent_budget_bytes: self.envelope.agent_budget_bytes,
             used_bytes,
@@ -442,6 +459,24 @@ impl DaemonState {
             return Response::Error {
                 message: format!("task {id} is not startable from {}", snapshot.state),
             };
+        }
+        // Pressure-ladder admission gate (SUM-48 BlockLowPriorityStarts): while under High+ memory
+        // pressure, hold new low-priority starts in QUEUED with a visible reason rather than piling
+        // on. (Full scoring/admission queue is SUM-47.)
+        if snapshot.spec.priority == Priority::Low && self.pressure_stage >= PressureStage::High {
+            let reason = format!(
+                "start deferred: system under {:?} memory pressure; low-priority starts are blocked",
+                self.pressure_stage
+            );
+            self.audit(Some(id), "start_blocked", &reason, None);
+            self.event(
+                Some(id),
+                "pressure",
+                "block_low_priority_starts",
+                "warn",
+                "daemon",
+            );
+            return Response::Error { message: reason };
         }
         self.launch_queued(id, &snapshot, now)
     }
@@ -1193,6 +1228,7 @@ impl DaemonState {
         }
 
         self.sample_tick(now);
+        self.pressure_tick(now);
         self.check_recycle_triggers(now);
     }
 
@@ -1333,6 +1369,275 @@ impl DaemonState {
             // recycle() re-checks the safe point and rolls back on failure.
             let _ = self.recycle(&id);
         }
+    }
+
+    /// Throttled pressure-ladder tick (SUM-48 / §7.5): classify the memory-pressure stage from the
+    /// live budget signals and, above `Normal`, execute the stage's graduated reclamation actions.
+    /// Runs after `sample_tick` so `used_bytes`/`escaped_reported` are fresh.
+    fn pressure_tick(&mut self, now: u64) {
+        if now.saturating_sub(self.last_pressure_check_ms) < PRESSURE_CHECK_INTERVAL_MS {
+            return;
+        }
+        self.last_pressure_check_ms = now;
+
+        let used = self.used_bytes;
+        let budget = self.envelope.agent_budget_bytes;
+        let utilization = self.envelope.utilization(used);
+        let hard_limit = used > budget;
+
+        // Leading swap indicator: a rising swap-used value between ticks escalates one stage.
+        let swap_now = memmux_metrics::swap_used_bytes();
+        let swap_growing =
+            matches!((swap_now, self.last_swap_used_bytes), (Some(n), Some(p)) if n > p);
+        if swap_now.is_some() {
+            self.last_swap_used_bytes = swap_now;
+        }
+
+        let stage = PressureStage::classify(utilization, swap_growing, hard_limit);
+        let prev = self.pressure_stage;
+        self.pressure_stage = stage;
+
+        let evidence = serde_json::json!({
+            "stage": format!("{stage:?}"),
+            "utilization_pct": (utilization * 100.0).round() as u64,
+            "used_bytes": used,
+            "budget_bytes": budget,
+            "swap_growing": swap_growing,
+        })
+        .to_string();
+
+        if stage != prev {
+            let severity = match stage {
+                PressureStage::Normal | PressureStage::Elevated => "info",
+                PressureStage::High | PressureStage::Critical => "warn",
+                PressureStage::Emergency => "error",
+            };
+            self.audit(
+                None,
+                "pressure_stage",
+                &format!("memory pressure {prev:?} -> {stage:?}"),
+                Some(evidence.clone()),
+            );
+            self.event(None, "pressure", "pressure_stage", severity, "daemon");
+        }
+
+        if stage == PressureStage::Normal {
+            return;
+        }
+        self.apply_pressure_stage(stage, &evidence);
+    }
+
+    /// Execute the deterministic actions for `stage`, mapping each abstract [`PressureAction`] to a
+    /// real daemon capability. Destructive termination only runs after Git state is preserved for
+    /// the same victim (the `Emergency` action order guarantees this). Actions with no actionable
+    /// subsystem in this build are surfaced as advisory events — never claimed as executed.
+    fn apply_pressure_stage(&mut self, stage: PressureStage, evidence: &str) {
+        // Victim chosen by `PreserveGitState`, consumed by `TerminateLowestPriorityTree`.
+        let mut preserved_victim: Option<String> = None;
+        for action in stage.actions() {
+            match action {
+                PressureAction::ReclaimIdleChildren => self.act_reclaim_escaped(evidence),
+                PressureAction::HibernateLowPriority => self.act_hibernate_low_priority(evidence),
+                PressureAction::RecycleBloatedProviders => self.act_recycle_bloated(evidence),
+                PressureAction::PreserveGitState => {
+                    preserved_victim = self.act_preserve_git_state(evidence);
+                }
+                PressureAction::TerminateLowestPriorityTree => {
+                    if let Some(id) = preserved_victim.take() {
+                        self.act_terminate_victim(&id, evidence);
+                    }
+                }
+                PressureAction::BlockLowPriorityStarts => {
+                    // Enforced passively in `start_task` via `self.pressure_stage`; record intent.
+                    self.event(
+                        None,
+                        "pressure",
+                        "block_low_priority_starts",
+                        "warn",
+                        "daemon",
+                    );
+                }
+                PressureAction::NotifyOperator => {
+                    self.audit(
+                        None,
+                        "operator_attention",
+                        action.describe(),
+                        Some(evidence.to_string()),
+                    );
+                    self.event(None, "pressure", "operator_attention", "error", "daemon");
+                }
+                // No actionable subsystem yet (cache trim, buffer rotation, worker concurrency):
+                // surface honestly rather than pretend it ran.
+                other => {
+                    self.audit(
+                        None,
+                        "pressure_action_advisory",
+                        other.describe(),
+                        Some(evidence.to_string()),
+                    );
+                    self.event(
+                        None,
+                        "pressure",
+                        "pressure_action_advisory",
+                        "info",
+                        "daemon",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reclaim processes that escaped their task's subtree (SUM-77 surfaced them; here we act).
+    fn act_reclaim_escaped(&mut self, evidence: &str) {
+        let pids: Vec<i32> = self.escaped_reported.iter().copied().collect();
+        if pids.is_empty() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let sampler = memmux_metrics::default_sampler();
+            if let Ok(report) =
+                memmux_metrics::terminate_pids(sampler.as_ref(), &pids, TREE_VERIFY_GRACE)
+            {
+                let reclaimed = report.targeted.len().saturating_sub(report.survivors.len());
+                self.audit(
+                    None,
+                    "reclaim_idle_children",
+                    &format!("reclaimed {reclaimed} escaped process(es)"),
+                    Some(evidence.to_string()),
+                );
+                self.event(None, "pressure", "reclaim_idle_children", "warn", "daemon");
+            }
+        }
+        // Drop them so a dead pid isn't retargeted next tick; a still-escaped one re-alerts via reconcile.
+        for p in pids {
+            self.escaped_reported.remove(&p);
+        }
+    }
+
+    /// Hibernate the single lowest-priority running task that is at a safe point (one per tick).
+    fn act_hibernate_low_priority(&mut self, evidence: &str) {
+        let mut candidates = self.running_candidates();
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+        let victim = candidates
+            .into_iter()
+            .find(|(id, _, _)| self.is_safe_point(id));
+        if let Some((id, _, _)) = victim {
+            self.audit(
+                Some(&id),
+                "hibernate_low_priority",
+                PressureAction::HibernateLowPriority.describe(),
+                Some(evidence.to_string()),
+            );
+            let _ = self.hibernate(&id);
+            self.event(
+                Some(&id),
+                "pressure",
+                "hibernate_low_priority",
+                "warn",
+                "daemon",
+            );
+        }
+    }
+
+    /// Recycle the running provider with the largest sampled subtree RSS, at a safe point.
+    fn act_recycle_bloated(&mut self, evidence: &str) {
+        let victim = self
+            .samples
+            .iter()
+            .filter(|(id, _)| self.runtimes.contains_key(id.as_str()))
+            .max_by_key(|(_, s)| s.rss_bytes)
+            .map(|(id, s)| (id.clone(), s.rss_bytes));
+        if let Some((id, rss)) = victim {
+            if self.is_safe_point(&id) {
+                self.audit(
+                    Some(&id),
+                    "recycle_bloated",
+                    &format!("recycling largest provider ({rss} bytes rss)"),
+                    Some(evidence.to_string()),
+                );
+                let _ = self.recycle(&id);
+                self.event(Some(&id), "pressure", "recycle_bloated", "warn", "daemon");
+            }
+        }
+    }
+
+    /// Preserve the lowest-priority running victim's Git state before any termination, returning the
+    /// victim id only if the checkpoint persisted — so we never terminate without saving work (§2.4).
+    fn act_preserve_git_state(&mut self, evidence: &str) -> Option<String> {
+        let candidates = self.running_candidates();
+        let victim_id = pick_lowest_priority_victim(&candidates)?;
+        let now = now_ms();
+        let task = self.tasks.get(&victim_id)?.clone();
+        let cp = self.capture_checkpoint(&victim_id, &task, now);
+        match self.persist_checkpoint(&cp) {
+            Ok(()) => {
+                self.audit(
+                    Some(&victim_id),
+                    "preserve_git_state",
+                    &format!(
+                        "Git state preserved (patch {}) before termination",
+                        cp.git_patch_hash
+                    ),
+                    Some(evidence.to_string()),
+                );
+                self.event(
+                    Some(&victim_id),
+                    "pressure",
+                    "preserve_git_state",
+                    "warn",
+                    "daemon",
+                );
+                Some(victim_id)
+            }
+            Err(e) => {
+                self.audit(
+                    Some(&victim_id),
+                    "preserve_git_state_failed",
+                    &format!("checkpoint failed, refusing to terminate: {e}"),
+                    None,
+                );
+                None
+            }
+        }
+    }
+
+    /// Terminate a victim whose Git state has already been preserved (SUM-48 Emergency terminal).
+    fn act_terminate_victim(&mut self, id: &str, evidence: &str) {
+        self.audit(
+            Some(id),
+            "terminate_lowest_priority",
+            PressureAction::TerminateLowestPriorityTree.describe(),
+            Some(evidence.to_string()),
+        );
+        let _ = self.terminate(id);
+        self.event(
+            Some(id),
+            "pressure",
+            "terminate_lowest_priority",
+            "error",
+            "daemon",
+        );
+    }
+
+    /// `(id, priority, created_at_ms)` for every task with a live provider — the reclamation pool.
+    fn running_candidates(&self) -> Vec<(String, Priority, u64)> {
+        self.runtimes
+            .keys()
+            .filter_map(|id| {
+                self.tasks
+                    .get(id)
+                    .map(|t| (id.clone(), t.spec.priority, t.created_at_ms))
+            })
+            .collect()
+    }
+
+    /// Whether task `id` is currently at a safe point for a freeze/recycle (never mid-tool-call).
+    fn is_safe_point(&self, id: &str) -> bool {
+        self.tasks
+            .get(id)
+            .map(|t| matches!(assess(&self.activity(t)), SafePoint::Ready))
+            .unwrap_or(false)
     }
 
     /// Current screen grid of a running task.
@@ -1575,6 +1880,15 @@ fn managed_reconcile(
         }
     }
     memmux_metrics::reconcile_tree(&managed_tree, &root_specs, &expected)
+}
+
+/// Pick the reclamation victim from `(id, priority, created_at_ms)` candidates: the lowest priority,
+/// breaking ties toward the oldest task, then by id for determinism (SUM-48). Pure + unit-tested.
+fn pick_lowest_priority_victim(candidates: &[(String, Priority, u64)]) -> Option<String> {
+    candidates
+        .iter()
+        .min_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)))
+        .map(|(id, _, _)| id.clone())
 }
 
 fn view(task: &Task) -> TaskView {
@@ -2300,6 +2614,182 @@ mod tests {
             "root {root_pid} should have been reaped"
         );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ----- Pressure ladder (SUM-48) -----
+
+    /// Victim selection: lowest priority wins, ties broken toward the oldest task then by id.
+    #[test]
+    fn victim_is_lowest_priority_then_oldest() {
+        let c = vec![
+            ("b".to_string(), Priority::Normal, 100),
+            ("a".to_string(), Priority::Low, 200),
+            ("c".to_string(), Priority::Low, 150), // older Low beats "a"
+            ("d".to_string(), Priority::High, 50),
+        ];
+        assert_eq!(pick_lowest_priority_victim(&c).as_deref(), Some("c"));
+        assert_eq!(pick_lowest_priority_victim(&[]), None);
+    }
+
+    /// Seeding `used_bytes` over the hard limit drives `pressure_tick` to Emergency and surfaces a
+    /// stage-change + operator-attention event; with no running tasks nothing is terminated.
+    #[test]
+    fn pressure_tick_classifies_and_surfaces_emergency() {
+        let mut s = state();
+        s.used_bytes = s.envelope.agent_budget_bytes + 1;
+        s.pressure_tick(10_000);
+        assert_eq!(s.pressure_stage, PressureStage::Emergency);
+        let evs = match s.handle(Request::ReadEvents {
+            after_seq: 0,
+            limit: 100,
+        }) {
+            Response::Events(e) => e,
+            other => panic!("{other:?}"),
+        };
+        assert!(evs.iter().any(|e| e.event_type == "pressure_stage"));
+        assert!(evs.iter().any(|e| e.event_type == "operator_attention"));
+        assert!(!evs
+            .iter()
+            .any(|e| e.event_type == "terminate_lowest_priority"));
+    }
+
+    /// At Normal pressure the tick takes no action and emits no `pressure` events.
+    #[test]
+    fn pressure_tick_normal_is_silent() {
+        let mut s = state();
+        s.used_bytes = 0;
+        s.pressure_tick(10_000);
+        assert_eq!(s.pressure_stage, PressureStage::Normal);
+        let evs = match s.handle(Request::ReadEvents {
+            after_seq: 0,
+            limit: 100,
+        }) {
+            Response::Events(e) => e,
+            other => panic!("{other:?}"),
+        };
+        assert!(!evs.iter().any(|e| e.category == "pressure"));
+    }
+
+    /// End-to-end (real PTY): under Emergency pressure the lowest-priority task's Git state is
+    /// preserved *before* it is terminated, and its provider is torn down (SUM-48 §2.4 safety).
+    #[cfg(unix)]
+    #[test]
+    fn emergency_preserves_git_then_terminates_lowest_priority() {
+        let tmp = std::env::temp_dir().join(format!("memmuxd-ladder-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("repo")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
+        let mut s = DaemonState::boot(store, envelope, tmp.clone()).unwrap();
+
+        let created = match s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "victim".into(),
+            repository_path: tmp.join("repo").to_string_lossy().into_owned(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: Some("low".into()),
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()]),
+        })) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            s.handle(Request::StartTask {
+                id: created.id.clone()
+            }),
+            Response::Task(_)
+        ));
+
+        // Force the hard limit, then run the ladder.
+        s.used_bytes = s.envelope.agent_budget_bytes + 1;
+        s.pressure_tick(10_000);
+
+        // The victim is gone.
+        assert!(!s.runtimes.contains_key(&created.id));
+        match s.handle(Request::GetTask {
+            id: created.id.clone(),
+        }) {
+            Response::Task(v) => assert_eq!(v.state, "TERMINATED"),
+            other => panic!("{other:?}"),
+        }
+
+        // Git state was preserved BEFORE termination.
+        let evs = match s.handle(Request::ReadEvents {
+            after_seq: 0,
+            limit: 200,
+        }) {
+            Response::Events(e) => e,
+            other => panic!("{other:?}"),
+        };
+        let preserve = evs
+            .iter()
+            .position(|e| e.event_type == "preserve_git_state");
+        let terminate = evs
+            .iter()
+            .position(|e| e.event_type == "terminate_lowest_priority");
+        assert!(preserve.is_some(), "expected a preserve_git_state event");
+        assert!(
+            terminate.is_some(),
+            "expected a terminate_lowest_priority event"
+        );
+        assert!(
+            preserve < terminate,
+            "Git state must be preserved before termination"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end (real PTY): while under High pressure a low-priority start is blocked (task stays
+    /// QUEUED with a reason); once pressure clears it starts normally.
+    #[cfg(unix)]
+    #[test]
+    fn high_pressure_blocks_low_priority_start() {
+        let tmp = std::env::temp_dir().join(format!("memmuxd-block-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("repo")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
+        let mut s = DaemonState::boot(store, envelope, tmp.clone()).unwrap();
+
+        let created = match s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "low".into(),
+            repository_path: tmp.join("repo").to_string_lossy().into_owned(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: Some("low".into()),
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()]),
+        })) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+
+        // Blocked under High pressure — stays QUEUED.
+        s.pressure_stage = PressureStage::High;
+        assert!(matches!(
+            s.handle(Request::StartTask {
+                id: created.id.clone()
+            }),
+            Response::Error { .. }
+        ));
+        match s.handle(Request::GetTask {
+            id: created.id.clone(),
+        }) {
+            Response::Task(v) => assert_eq!(v.state, "QUEUED"),
+            other => panic!("{other:?}"),
+        }
+
+        // Pressure clears — it starts.
+        s.pressure_stage = PressureStage::Normal;
+        assert!(matches!(
+            s.handle(Request::StartTask {
+                id: created.id.clone()
+            }),
+            Response::Task(_)
+        ));
+
+        s.handle(Request::TerminateTask { id: created.id });
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

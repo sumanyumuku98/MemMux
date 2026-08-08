@@ -83,6 +83,24 @@ pub fn parse_smaps_rollup_pss(content: &str) -> Option<u64> {
     found.then_some(total_kb * 1024)
 }
 
+/// Parse currently-used swap in **bytes** from `/proc/meminfo` (`SwapTotal - SwapFree`).
+///
+/// Both fields are in kiB. Returns `None` only if either line is absent; a system with swap
+/// disabled reports both as 0 and yields `Some(0)`. Used as the pressure-ladder swap signal
+/// (SUM-48): a rising value across ticks is a leading indicator of thrashing.
+pub fn parse_swap_used_meminfo(content: &str) -> Option<u64> {
+    let mut total_kib: Option<u64> = None;
+    let mut free_kib: Option<u64> = None;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("SwapTotal:") {
+            total_kib = rest.trim().trim_end_matches("kB").trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+            free_kib = rest.trim().trim_end_matches("kB").trim().parse().ok();
+        }
+    }
+    Some(total_kib?.saturating_sub(free_kib?) * 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +137,25 @@ mod tests {
     fn parse_stat_rejects_garbage() {
         assert!(parse_stat("not a stat line").is_none());
         assert!(parse_stat("").is_none());
+    }
+
+    #[test]
+    fn parse_swap_used_computes_total_minus_free() {
+        let meminfo = "\
+MemTotal:       32000000 kB
+MemFree:         1000000 kB
+SwapTotal:       8000000 kB
+SwapFree:        6000000 kB
+";
+        // (8_000_000 - 6_000_000) kiB * 1024 = 2_000_000 * 1024 bytes.
+        assert_eq!(parse_swap_used_meminfo(meminfo), Some(2_000_000 * 1024));
+    }
+
+    #[test]
+    fn parse_swap_used_zero_when_disabled_and_none_when_absent() {
+        let disabled = "SwapTotal:             0 kB\nSwapFree:              0 kB\n";
+        assert_eq!(parse_swap_used_meminfo(disabled), Some(0));
+        assert_eq!(parse_swap_used_meminfo("MemTotal: 32000000 kB\n"), None);
     }
 
     #[test]
