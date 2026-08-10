@@ -283,6 +283,10 @@ pub struct TaskView {
     /// task's subtree, in bytes (SUM-29). `0` when not yet sampled / not running.
     #[serde(default)]
     pub accounted_bytes: u64,
+    /// Why a QUEUED task has not been admitted yet, and what it is waiting on (SUM-47). `None`
+    /// unless the task is queued awaiting headroom. `serde(default)` keeps older records readable.
+    #[serde(default)]
+    pub queued_reason: Option<String>,
 }
 
 /// A snapshot of system memory pressure.
@@ -398,6 +402,7 @@ mod tests {
             updated_at_ms: 2,
             rss_bytes: 0,
             accounted_bytes: 0,
+            queued_reason: None,
         }]);
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();

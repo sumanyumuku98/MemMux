@@ -1381,6 +1381,7 @@ mod tests {
             updated_at_ms: 0,
             rss_bytes: 0,
             accounted_bytes: 0,
+            queued_reason: None,
         }
     }
 

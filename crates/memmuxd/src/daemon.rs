@@ -14,9 +14,10 @@ use memmux_proto::{
 };
 use memmux_pty::ChunkStore;
 use memmux_sched::{
-    class_reservation,
+    class_reservation, plan_admission,
     pressure::{PressureAction, PressureStage},
-    ResourceEnvelope,
+    score::{score, Candidate, ScoreInputs, ScoreWeights},
+    Reservation, ResourceEnvelope,
 };
 use memmux_store::{CheckpointRef, Decision, EventInput, Store, Workspace};
 use memmux_worktree::{ManagedLayout, TaskSlug, WorktreeHandle, WorktreeManager};
@@ -74,6 +75,13 @@ pub struct DaemonState {
     last_swap_used_bytes: Option<u64>,
     /// The pressure stage from the last tick; also gates low-priority admission in `start_task`.
     pressure_stage: PressureStage,
+    /// Predicted-peak reservation per admitted (running) task (SUM-45). Sum gates admission; the
+    /// entry is added on launch and removed on hibernate/terminate/exit.
+    reservations: HashMap<String, Reservation>,
+    /// Tasks the user asked to start that are awaiting headroom, re-planned each pump tick (SUM-47).
+    pending_admission: std::collections::BTreeSet<String>,
+    /// Per-task "waiting on" reason for deferred admissions, surfaced on `TaskView` (SUM-47).
+    queued_reasons: HashMap<String, String>,
     seq: u64,
 }
 
@@ -119,6 +127,9 @@ impl DaemonState {
             last_pressure_check_ms: 0,
             last_swap_used_bytes: None,
             pressure_stage: PressureStage::Normal,
+            reservations: HashMap::new(),
+            pending_admission: std::collections::BTreeSet::new(),
+            queued_reasons: HashMap::new(),
             seq: 0,
         };
         state.audit(
@@ -371,6 +382,8 @@ impl DaemonState {
         // Dirty-protected worktree teardown (SUM-121): clean worktrees are removed, dirty ones
         // are retained so no uncommitted work is lost.
         self.cleanup_worktree(id);
+        // Release this task's budget reservation and any admission bookkeeping (SUM-45).
+        self.release_reservation(id);
 
         let task = self.tasks.get_mut(id).expect("checked above");
         // Drive ANY -> TERMINATING -> TERMINATED.
@@ -413,6 +426,8 @@ impl DaemonState {
             v.rss_bytes = s.rss_bytes;
             v.accounted_bytes = s.accounted_bytes;
         }
+        // Surface why a queued task is waiting on headroom (SUM-47).
+        v.queued_reason = self.queued_reasons.get(v.id.as_str()).cloned();
         v
     }
 
@@ -460,25 +475,111 @@ impl DaemonState {
                 message: format!("task {id} is not startable from {}", snapshot.state),
             };
         }
-        // Pressure-ladder admission gate (SUM-48 BlockLowPriorityStarts): while under High+ memory
-        // pressure, hold new low-priority starts in QUEUED with a visible reason rather than piling
-        // on. (Full scoring/admission queue is SUM-47.)
-        if snapshot.spec.priority == Priority::Low && self.pressure_stage >= PressureStage::High {
-            let reason = format!(
-                "start deferred: system under {:?} memory pressure; low-priority starts are blocked",
-                self.pressure_stage
-            );
-            self.audit(Some(id), "start_blocked", &reason, None);
-            self.event(
-                Some(id),
-                "pressure",
-                "block_low_priority_starts",
-                "warn",
-                "daemon",
-            );
-            return Response::Error { message: reason };
+        // Register the start intent and run the admission planner (SUM-45/47): the task is admitted
+        // now if it scores in and fits the budget, otherwise it stays QUEUED with a visible reason
+        // and is auto-admitted by a later pump tick once headroom frees.
+        self.pending_admission.insert(id.to_string());
+        self.try_admit_pending(now);
+        match self.tasks.get(id) {
+            Some(t) => Response::Task(self.task_view(t)),
+            None => Response::Error {
+                message: format!("no such task: {id}"),
+            },
         }
-        self.launch_queued(id, &snapshot, now)
+    }
+
+    /// Sum of predicted-peak reservations across admitted (running) tasks (SUM-45).
+    fn reserved_bytes(&self) -> u64 {
+        self.reservations
+            .values()
+            .map(Reservation::peak_bytes)
+            .sum()
+    }
+
+    /// Release a task's budget reservation and clear its admission bookkeeping (SUM-45). Called when
+    /// a task stops occupying the budget: terminate, hibernate, or natural provider exit.
+    fn release_reservation(&mut self, id: &str) {
+        self.reservations.remove(id);
+        self.pending_admission.remove(id);
+        self.queued_reasons.remove(id);
+    }
+
+    /// Run one admission pass over `pending_admission` (SUM-45/47 / §7.4): score the queued
+    /// candidates, admit the highest-scoring that fit the remaining budget, and leave the rest
+    /// QUEUED with a visible reason. Low-priority starts are held while under High+ pressure
+    /// (SUM-48 `BlockLowPriorityStarts`). Called from `start_task` and each `pump` tick.
+    fn try_admit_pending(&mut self, now: u64) {
+        if self.pending_admission.is_empty() {
+            return;
+        }
+
+        // Only tasks still QUEUED and not already running remain candidates.
+        let pending: Vec<String> = self.pending_admission.iter().cloned().collect();
+        let weights = ScoreWeights::default();
+        let budget = self.envelope.agent_budget_bytes;
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for id in &pending {
+            let Some(task) = self.tasks.get(id) else {
+                self.pending_admission.remove(id);
+                self.queued_reasons.remove(id);
+                continue;
+            };
+            if task.state != TaskState::Queued || self.runtimes.contains_key(id) {
+                self.pending_admission.remove(id);
+                self.queued_reasons.remove(id);
+                continue;
+            }
+            // Hold low-priority starts under sustained pressure (SUM-48).
+            if task.spec.priority == Priority::Low && self.pressure_stage >= PressureStage::High {
+                self.queued_reasons.insert(
+                    id.clone(),
+                    format!("held: under {:?} memory pressure", self.pressure_stage),
+                );
+                continue;
+            }
+            let peak = class_reservation(task.spec.resource_class).peak_bytes();
+            let inputs = ScoreInputs {
+                priority: task.spec.priority,
+                interactivity: 0.0,
+                age_ms: now.saturating_sub(task.created_at_ms),
+                dependency_criticality: 0.0,
+                predicted_peak_bytes: peak,
+                resume_cost: 0.0,
+                conflict_risk: 0.0,
+            };
+            candidates.push(Candidate {
+                task_id: memmux_core::TaskId::new(id.clone()),
+                score: score(&weights, &inputs, budget),
+                predicted_peak_bytes: peak,
+            });
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let available = self.envelope.headroom_bytes(self.reserved_bytes()).max(0) as u64;
+        let plan = plan_admission(candidates, available);
+
+        for task_id in plan.admitted {
+            let id = task_id.to_string();
+            let Some(snapshot) = self.tasks.get(&id).cloned() else {
+                continue;
+            };
+            self.audit(Some(&id), "admitted", "scored in and fits the budget", None);
+            self.launch_queued(&id, &snapshot, now);
+            self.pending_admission.remove(&id);
+            self.queued_reasons.remove(&id);
+        }
+        for (task_id, reason) in plan.deferred {
+            let id = task_id.to_string();
+            // Emit a deferral event only when the reason changes (avoid per-tick spam).
+            if self.queued_reasons.get(&id) != Some(&reason) {
+                self.audit(Some(&id), "admission_deferred", &reason, None);
+                self.event(Some(&id), "admission", "deferred", "info", "daemon");
+            }
+            self.queued_reasons.insert(id, reason);
+        }
     }
 
     /// Admit and launch a task that is already in `Queued`: cut its worktree, drive
@@ -509,6 +610,12 @@ impl DaemonState {
                 let _ = self.store.upsert_task(task);
                 let v = view(task);
                 self.install_runtime(id, runtime);
+                // Reserve this task's predicted peak against the budget (SUM-45).
+                self.reservations.insert(
+                    id.to_string(),
+                    class_reservation(snapshot.spec.resource_class),
+                );
+                self.queued_reasons.remove(id);
                 self.event(Some(id), "lifecycle", "started", "info", "daemon");
                 self.audit(Some(id), "started", "provider launched in a PTY", None);
                 Response::Task(v)
@@ -893,6 +1000,8 @@ impl DaemonState {
             };
         }
         let cleanup = self.shutdown_runtime(id);
+        // A hibernated task no longer occupies the live budget — release its reservation (SUM-45).
+        self.release_reservation(id);
 
         let task = self.tasks.get_mut(id).expect("checked above");
         for (to, reason) in [
@@ -971,8 +1080,12 @@ impl DaemonState {
                 let _ = self.store.record_transition(id, &t);
             }
         }
+        // The task occupies the live budget again — re-reserve its predicted peak (SUM-45).
+        let resource_class = task.spec.resource_class;
         let _ = self.store.upsert_task(task);
         let v = view(task);
+        self.reservations
+            .insert(id.to_string(), class_reservation(resource_class));
         // The checkpoint has been consumed; the task is live again.
         let _ = self.store.delete_checkpoint_ref(id);
         self.emit_resume_event(id, &outcome);
@@ -1224,12 +1337,16 @@ impl DaemonState {
             }
             // The provider exited on its own — tear down its worktree (dirty-protected).
             self.cleanup_worktree(&id);
+            // Its budget reservation is freed for waiting tasks (SUM-45).
+            self.release_reservation(&id);
             self.event(Some(&id), "process", "process_exited", "info", "daemon");
         }
 
         self.sample_tick(now);
         self.pressure_tick(now);
         self.check_recycle_triggers(now);
+        // Freed headroom (from exit/terminate/hibernate/ladder) may admit a waiting task (SUM-47).
+        self.try_admit_pending(now);
     }
 
     /// Throttled per-task memory sampling (SUM-29/31). Takes ONE host process snapshot per tick,
@@ -1903,6 +2020,7 @@ fn view(task: &Task) -> TaskView {
         updated_at_ms: task.updated_at_ms,
         rss_bytes: 0,
         accounted_bytes: 0,
+        queued_reason: None,
     }
 }
 
@@ -2765,31 +2883,125 @@ mod tests {
             other => panic!("{other:?}"),
         };
 
-        // Blocked under High pressure — stays QUEUED.
+        // Held under High pressure — start returns the task still QUEUED with a visible reason.
         s.pressure_stage = PressureStage::High;
-        assert!(matches!(
-            s.handle(Request::StartTask {
-                id: created.id.clone()
-            }),
-            Response::Error { .. }
-        ));
-        match s.handle(Request::GetTask {
+        match s.handle(Request::StartTask {
             id: created.id.clone(),
         }) {
-            Response::Task(v) => assert_eq!(v.state, "QUEUED"),
+            Response::Task(v) => {
+                assert_eq!(v.state, "QUEUED");
+                assert!(
+                    v.queued_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("pressure")),
+                    "expected a pressure hold reason, got {:?}",
+                    v.queued_reason
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !s.runtimes.contains_key(&created.id),
+            "must not launch under pressure"
+        );
+
+        // Pressure clears — a start admits it.
+        s.pressure_stage = PressureStage::Normal;
+        match s.handle(Request::StartTask {
+            id: created.id.clone(),
+        }) {
+            Response::Task(v) => assert_eq!(v.state, "ACTIVE"),
             other => panic!("{other:?}"),
         }
 
-        // Pressure clears — it starts.
-        s.pressure_stage = PressureStage::Normal;
+        s.handle(Request::TerminateTask { id: created.id });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ----- Admission control (SUM-45 reservations + SUM-47 scoring/queue) -----
+
+    /// The reservation ledger sums each admitted task's predicted peak.
+    #[test]
+    fn reserved_bytes_sums_the_ledger() {
+        let mut s = state();
+        assert_eq!(s.reserved_bytes(), 0);
+        let std_peak = class_reservation(ResourceClass::Standard).peak_bytes();
+        s.reservations
+            .insert("a".into(), class_reservation(ResourceClass::Standard));
+        s.reservations
+            .insert("b".into(), class_reservation(ResourceClass::Small));
+        let small_peak = class_reservation(ResourceClass::Small).peak_bytes();
+        assert_eq!(s.reserved_bytes(), std_peak + small_peak);
+    }
+
+    /// End-to-end (real PTY): with a budget sized for one Standard task, starting two admits the
+    /// first and leaves the second QUEUED with a visible reason + one reservation held. Terminating
+    /// the admitted task frees the reservation and a `pump` auto-admits the waiter (SUM-45/47).
+    #[cfg(unix)]
+    #[test]
+    fn admission_queues_second_task_then_admits_it_when_headroom_frees() {
+        let tmp = std::env::temp_dir().join(format!("memmuxd-admit-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("repo")).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
+        let mut s = DaemonState::boot(store, envelope, tmp.clone()).unwrap();
+
+        // Budget fits exactly one Standard task's predicted peak.
+        let peak = class_reservation(ResourceClass::Standard).peak_bytes();
+        s.envelope.agent_budget_bytes = peak + peak / 4;
+
+        let mk = |s: &mut DaemonState, title: &str| -> String {
+            match s.handle(Request::CreateTask(CreateTaskRequest {
+                title: title.into(),
+                repository_path: tmp.join("repo").to_string_lossy().into_owned(),
+                provider: "generic".into(),
+                base_branch: "main".into(),
+                resource_class: Some("standard".into()),
+                priority: None,
+                command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()]),
+            })) {
+                Response::Task(v) => v.id,
+                other => panic!("{other:?}"),
+            }
+        };
+        let a = mk(&mut s, "first");
+        let b = mk(&mut s, "second");
+
+        // Start both: A is admitted, B is deferred with a reason.
         assert!(matches!(
-            s.handle(Request::StartTask {
-                id: created.id.clone()
-            }),
+            s.handle(Request::StartTask { id: a.clone() }),
             Response::Task(_)
         ));
+        let vb = match s.handle(Request::StartTask { id: b.clone() }) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(vb.state, "QUEUED", "second task must stay queued");
+        assert!(
+            vb.queued_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("insufficient headroom")),
+            "second task must carry a visible waiting reason, got {:?}",
+            vb.queued_reason
+        );
+        assert!(s.runtimes.contains_key(&a));
+        assert!(!s.runtimes.contains_key(&b));
+        assert_eq!(s.reserved_bytes(), peak, "exactly one reservation is held");
 
-        s.handle(Request::TerminateTask { id: created.id });
+        // Terminate A → its reservation frees; a pump admits the waiting B.
+        s.handle(Request::TerminateTask { id: a.clone() });
+        assert_eq!(s.reserved_bytes(), 0);
+        s.pump(now_ms());
+        assert!(s.runtimes.contains_key(&b), "B should be auto-admitted");
+        match s.handle(Request::GetTask { id: b.clone() }) {
+            Response::Task(v) => {
+                assert_eq!(v.state, "ACTIVE");
+                assert!(v.queued_reason.is_none(), "reason cleared once admitted");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        s.handle(Request::TerminateTask { id: b });
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
