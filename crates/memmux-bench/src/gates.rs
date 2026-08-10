@@ -47,6 +47,14 @@ pub struct GateInputs {
     /// Worst-case (minimum) teardown cleanup fraction across MemMux runs (SUM-165 / H2). `None`
     /// when no cleanup data exists this run — the Cleanup gate then stays skipped.
     pub min_cleanup_fraction: Option<f64>,
+    /// MemMux steady total footprint in the overcommit run, bytes (SUM-167 / H4a). `None` when no
+    /// overcommit run was present — the Pressure-avoidance gate then stays skipped.
+    pub overcommit_steady_footprint_bytes: Option<u64>,
+    /// Constrained agent budget for that overcommit run, bytes (SUM-167 / H4a). `None` when unset.
+    pub overcommit_budget_bytes: Option<u64>,
+    /// Worst-case preserved fraction across MemMux pressure reclamations in the overcommit run
+    /// (SUM-168 / H4b). `None` when no victim was reclaimed — the No-lost-work gate stays skipped.
+    pub no_lost_work_fraction: Option<f64>,
 }
 
 impl GateInputs {
@@ -63,6 +71,12 @@ const ATTRIBUTION_MIN: f64 = 0.95;
 const OVERHEAD_MAX: f64 = 0.02;
 /// Minimum teardown cleanup fraction for the Cleanup gate to pass (SUM-165 / H2).
 const CLEANUP_MIN: f64 = 0.995;
+/// Steady footprint may exceed the budget by at most this factor for the Pressure-avoidance gate to
+/// pass on a dev/macOS host (SUM-167 / H4a): governed footprint stays near/under budget.
+const OVERCOMMIT_FOOTPRINT_SLACK: f64 = 1.1;
+/// Minimum preserved fraction for the No-lost-work gate to pass (SUM-168 / H4b): every pressure
+/// reclamation must have captured a checkpoint carrying a non-empty git patch.
+const NO_LOST_WORK_MIN: f64 = 1.0;
 
 /// Evaluate all launch gates against the measured inputs.
 pub fn evaluate_gates(inputs: &GateInputs) -> Vec<GateResult> {
@@ -151,15 +165,65 @@ pub fn evaluate_gates(inputs: &GateInputs) -> Vec<GateResult> {
         None => skipped("Cleanup", "no teardown cleanup measured this run"),
     });
 
-    // 5-7. Gates whose evidence arrives in later phases.
-    results.push(skipped(
-        "No lost work",
-        "fault-injection lifecycle trials arrive in Phase 2",
-    ));
-    results.push(skipped(
-        "Pressure avoidance",
-        "budget + pressure ladder arrive in Phase 1",
-    ));
+    // 5. No lost work (SUM-168 / H4b): every MemMux pressure reclamation must have captured a
+    // checkpoint carrying a non-empty git patch. MEASURED: pass iff the worst-case preserved
+    // fraction >= 1.0. Skipped when no victim was reclaimed this run (honest — nothing to preserve).
+    results.push(match inputs.no_lost_work_fraction {
+        Some(frac) => GateResult {
+            name: "No lost work".into(),
+            status: if frac >= NO_LOST_WORK_MIN {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            detail: format!(
+                "preserved {:.1}% of reclaimed victims vs >= {:.0}%",
+                frac * 100.0,
+                NO_LOST_WORK_MIN * 100.0
+            ),
+        },
+        None => skipped(
+            "No lost work",
+            "no pressure reclamation triggered this run (no victim to preserve)",
+        ),
+    });
+
+    // 6. Pressure avoidance (SUM-167 / H4a): under a constrained budget the governed steady
+    // footprint must stay near/under budget. MEASURED on this (macOS/dev) host as footprint:
+    // pass iff steady footprint <= budget * 1.1. The swap-growth-SLO variant is the Linux
+    // corollary, measured on the Linux reference host via the per-process swap columns. Skipped
+    // when no overcommit run (or no budget) was present.
+    results.push(
+        match (
+            inputs.overcommit_steady_footprint_bytes,
+            inputs.overcommit_budget_bytes,
+        ) {
+            (Some(steady), Some(budget)) if budget > 0 => {
+                let limit = budget as f64 * OVERCOMMIT_FOOTPRINT_SLACK;
+                GateResult {
+                    name: "Pressure avoidance".into(),
+                    status: if steady as f64 <= limit {
+                        GateStatus::Pass
+                    } else {
+                        GateStatus::Fail
+                    },
+                    detail: format!(
+                        "steady footprint {:.1} MiB vs <= {:.1} MiB (budget {:.1} MiB × {:.2})",
+                        steady as f64 / MIB as f64,
+                        limit / MIB as f64,
+                        budget as f64 / MIB as f64,
+                        OVERCOMMIT_FOOTPRINT_SLACK,
+                    ),
+                }
+            }
+            _ => skipped(
+                "Pressure avoidance",
+                "no constrained-budget overcommit run present this run",
+            ),
+        },
+    );
+
+    // 7. Resume — evidence arrives in a later phase.
     results.push(skipped(
         "Resume",
         "checkpoint / native resume arrives in Phase 2",

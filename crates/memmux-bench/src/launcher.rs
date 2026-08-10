@@ -41,12 +41,21 @@ pub enum LauncherKind {
 }
 
 /// Where to find the stub recording and the binary that can execute it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LaunchSpec {
     /// Path to the JSON [`SessionRecording`](crate::stub::SessionRecording).
     pub recording_path: PathBuf,
     /// Path to the `memmux-bench` executable (invoked in `stub` mode).
     pub bench_exe: PathBuf,
+    /// Optional constrained agent budget in bytes to force memory overcommit (SUM-167 / H4). Only
+    /// [`MemMuxLauncher`] honors it (it sets `MEMMUX_AGENT_BUDGET_BYTES` on the spawned `memmuxd`);
+    /// every other launcher ignores it (they are ungoverned by construction).
+    pub agent_budget_bytes: Option<u64>,
+    /// When `true`, [`MemMuxLauncher`] gives each task its own **dirty git repository** (a committed
+    /// file with an uncommitted modification) as its `repository_path`, so the daemon's
+    /// `capture_checkpoint` reads a real git HEAD + non-empty patch hash when it must preserve a
+    /// victim under pressure (SUM-168 / H4b). Baseline launchers ignore it. Off by default.
+    pub dirty_repos: bool,
 }
 
 /// The process topology of a launched session: which pids are agents vs. manager overhead.
@@ -91,6 +100,18 @@ pub trait LaunchedSession {
     /// measured zero. Called once, just before [`stop`](LaunchedSession::stop), while the daemon
     /// still lives.
     fn escaped_pids(&self) -> Option<Vec<Pid>> {
+        None
+    }
+    /// The launcher's own governance evidence for the overcommit run (SUM-167/168 / H4): the
+    /// admission-deferral + pressure-ladder-reclamation counts and the no-lost-work counts, read
+    /// from its audit/event stream.
+    ///
+    /// Only MemMux has a governance mechanism (admission planner + pressure ladder + checkpoints),
+    /// so only its `MemMuxSession` overrides this. The default is `None`, meaning "this launcher has
+    /// no such capability" — which the report renders as *unsupported (ungoverned)*, distinct from a
+    /// measured zero. Called once, just before [`stop`](LaunchedSession::stop), while the daemon
+    /// still lives.
+    fn h4_evidence(&self) -> Option<crate::h4::H4Evidence> {
         None
     }
     /// Tear the whole session down. Best-effort: never panics, never leaves strays behind.
@@ -519,14 +540,20 @@ impl Launcher for MemMuxLauncher {
         let socket = root.join("memmux.sock");
 
         // The real server binary runs its own tokio pump loop, so nothing else is needed here.
-        let daemon = Command::new(&daemon_bin)
+        let mut daemon_cmd = Command::new(&daemon_bin);
+        daemon_cmd
             .arg("--root")
             .arg(&root)
             .arg("serve")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        // Force overcommit by constraining the daemon's agent budget (SUM-167 / H4). Only MemMux
+        // honors this; the daemon reads it from the environment in `run_serve`.
+        if let Some(budget) = spec.agent_budget_bytes {
+            daemon_cmd.env("MEMMUX_AGENT_BUDGET_BYTES", budget.to_string());
+        }
+        let daemon = daemon_cmd.spawn()?;
         let daemon_pid = daemon.id() as Pid;
 
         let result = (|| -> io::Result<(memmuxd::client::Client, Vec<String>, LaunchTopology)> {
@@ -535,16 +562,28 @@ impl Launcher for MemMuxLauncher {
             wait_for_socket(&socket)?;
 
             let argv = stub_argv(spec);
-            // A neutral repo path (a temp dir); the generic provider falls back to it when it is
-            // not a git repo, so no worktree is cut.
-            let repo = root.join("repo");
-            std::fs::create_dir_all(&repo)?;
+            // A neutral shared repo path (a temp dir); the generic provider falls back to it when
+            // it is not a git repo, so no worktree is cut. Used when `dirty_repos` is off.
+            let shared_repo = root.join("repo");
+            std::fs::create_dir_all(&shared_repo)?;
 
             let mut task_ids = Vec::with_capacity(n);
             for i in 0..n {
+                // For H4b (no-lost-work) give each task its own dirty git repo so the daemon's
+                // checkpoint carries a real git HEAD + non-empty patch hash; otherwise share a
+                // neutral non-git dir. A dirty-repo creation failure falls back to the shared dir
+                // (the run stays honest — that agent simply has no git patch to preserve).
+                let repository_path = if spec.dirty_repos {
+                    match make_dirty_repo(&root.join(format!("repo-{i}"))) {
+                        Ok(p) => p,
+                        Err(_) => shared_repo.to_string_lossy().into_owned(),
+                    }
+                } else {
+                    shared_repo.to_string_lossy().into_owned()
+                };
                 let req = memmux_proto::Request::CreateTask(memmux_proto::CreateTaskRequest {
                     title: format!("bench-{i}"),
-                    repository_path: repo.to_string_lossy().into_owned(),
+                    repository_path,
                     provider: "generic".to_string(),
                     base_branch: "main".to_string(),
                     resource_class: None,
@@ -588,7 +627,12 @@ impl Launcher for MemMuxLauncher {
 
             // The provider processes are the memmuxd daemon's direct children in the live tree.
             let agent_roots = daemon_provider_children(daemon_pid);
-            if agent_roots.is_empty() {
+            // Zero providers is normally a launch failure — EXCEPT under a constrained overcommit
+            // budget (SUM-167 / H4), where the admission planner deliberately defers every start
+            // that would not fit. That is the *governed* case, not a failure: keep the session (with
+            // no agent roots) alive so the run still samples the manager footprint and reads the
+            // daemon's admission-deferral governance evidence over `ReadEvents`.
+            if agent_roots.is_empty() && spec.agent_budget_bytes.is_none() {
                 return Err(io::Error::other("memmuxd launched no provider processes"));
             }
 
@@ -657,6 +701,23 @@ impl MemMuxSession {
         }
         pids
     }
+
+    /// Read the daemon's full event stream and classify it into H4 governance + no-lost-work
+    /// evidence (SUM-167/168 / H4).
+    ///
+    /// Pages every event (`after_seq: 0`) and delegates to [`crate::h4::evidence_from_events`]. A
+    /// client/transport error yields all-zero evidence (never fabricates governance), which the
+    /// report treats as "governed, but nothing to reclaim this run" — honest.
+    pub fn read_h4_evidence(&self) -> crate::h4::H4Evidence {
+        let resp = match self.client.call(&memmux_proto::Request::ReadEvents {
+            after_seq: 0,
+            limit: 100_000,
+        }) {
+            Ok(memmux_proto::Response::Events(events)) => events,
+            _ => return crate::h4::H4Evidence::default(),
+        };
+        crate::h4::evidence_from_events(&resp)
+    }
 }
 
 /// Parse the `pid` field out of a `process_escaped` event payload (a JSON object like
@@ -672,6 +733,9 @@ impl LaunchedSession for MemMuxSession {
     }
     fn escaped_pids(&self) -> Option<Vec<Pid>> {
         Some(self.read_escaped_pids())
+    }
+    fn h4_evidence(&self) -> Option<crate::h4::H4Evidence> {
+        Some(self.read_h4_evidence())
     }
     fn stop(self: Box<Self>) {
         // Best-effort: terminate each task, then kill+reap the daemon and clean the root.
@@ -759,6 +823,42 @@ fn wait_for_socket(socket: &Path) -> io::Result<()> {
 /// Convert an `anyhow::Error` from the client into an `io::Error` for the launcher API.
 fn anyhow_to_io(e: anyhow::Error) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// Create a git repository at `dir` with an **uncommitted (dirty) change** and return its path
+/// (SUM-168 / H4b).
+///
+/// Initializes a repo, commits a tracked file, then modifies that file so `git status`/`git diff
+/// HEAD` report a dirty working tree — exactly the pre-condition the daemon's `capture_checkpoint`
+/// reads (a real git HEAD plus a non-empty patch hash) when it preserves a victim under pressure.
+/// The commit is made with a fixed local identity so it works on hosts with no global git config.
+fn make_dirty_repo(dir: &Path) -> io::Result<String> {
+    std::fs::create_dir_all(dir)?;
+    let git = |args: &[&str]| -> io::Result<()> {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("git {args:?} failed: {status}")))
+        }
+    };
+    git(&["init", "-q"])?;
+    git(&["config", "user.email", "bench@memmux.local"])?;
+    git(&["config", "user.name", "memmux-bench"])?;
+    git(&["config", "commit.gpgsign", "false"])?;
+    let tracked = dir.join("work.txt");
+    std::fs::write(&tracked, b"committed baseline\n")?;
+    git(&["add", "work.txt"])?;
+    git(&["commit", "-q", "-m", "baseline"])?;
+    // Now dirty the tracked file so `git diff HEAD` is non-empty.
+    std::fs::write(&tracked, b"committed baseline\nuncommitted agent edit\n")?;
+    Ok(dir.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -185,7 +185,18 @@ fn main() -> anyhow::Result<()> {
 fn run_serve(root: &std::path::Path, socket: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(root)?;
     let store = Store::open(root.join("state.db")).context("open durable store")?;
-    let envelope = ResourceEnvelope::with_default_reserves(detect_physical_bytes());
+    let mut envelope = ResourceEnvelope::with_default_reserves(detect_physical_bytes());
+    // Optional agent-budget override (H4 / SUM-167): the benchmark forces memory overcommit by
+    // constraining the daemon's agent budget below the aggregate predicted peak of N agents, so the
+    // admission planner + pressure ladder must govern. A zero or unparseable value is ignored.
+    if let Ok(raw) = std::env::var("MEMMUX_AGENT_BUDGET_BYTES") {
+        if let Ok(v) = raw.parse::<u64>() {
+            if v > 0 {
+                envelope.agent_budget_bytes = v;
+                tracing::info!(agent_budget_bytes = v, "agent budget overridden via env");
+            }
+        }
+    }
     let state = Arc::new(Mutex::new(DaemonState::boot(
         store,
         envelope,
