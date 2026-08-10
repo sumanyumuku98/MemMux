@@ -1698,13 +1698,27 @@ impl DaemonState {
                     ),
                     Some(evidence.to_string()),
                 );
-                self.event(
-                    Some(&victim_id),
-                    "pressure",
-                    "preserve_git_state",
-                    "warn",
-                    "daemon",
-                );
+                // Emit the checkpoint evidence on the EVENT stream (not just the audit trail) so an
+                // out-of-process observer (e.g. the benchmark over `ReadEvents`) can verify the
+                // captured checkpoint's git HEAD + patch hash and whether the patch is non-empty
+                // (SUM-168 / H4b). `git_dirty` distinguishes a real uncommitted-work patch from the
+                // empty-diff sentinel hash.
+                let payload = serde_json::json!({
+                    "git_head": cp.git_head,
+                    "git_patch_hash": cp.git_patch_hash,
+                    "git_dirty": is_dirty_patch(&cp.git_patch_hash),
+                    "checkpoint_integrity": cp.integrity,
+                })
+                .to_string();
+                let _ = self.store.append_event(&EventInput {
+                    task_id: Some(victim_id.clone()),
+                    ts_ms: now_ms(),
+                    category: "pressure".to_string(),
+                    event_type: "preserve_git_state".to_string(),
+                    severity: "warn".to_string(),
+                    source: "daemon".to_string(),
+                    payload_json: Some(payload),
+                });
                 Some(victim_id)
             }
             Err(e) => {
@@ -1913,6 +1927,14 @@ fn git_head(repo: &std::path::Path) -> Option<String> {
 fn git_patch_hash(repo: &std::path::Path) -> String {
     let diff = memmux_worktree::gitcmd::git_ok(repo, &["diff", "HEAD"]).unwrap_or_default();
     memmux_lifecycle::content_hash(diff.as_bytes())
+}
+
+/// Whether a checkpoint's `git_patch_hash` corresponds to a **non-empty** working-tree patch
+/// (i.e. real uncommitted work was captured), as opposed to the deterministic hash of an empty
+/// diff. Used to make the preserved-checkpoint evidence self-describing on the event stream
+/// (SUM-168 / H4b) without leaking the patch contents.
+fn is_dirty_patch(patch_hash: &str) -> bool {
+    patch_hash != memmux_lifecycle::content_hash(b"")
 }
 
 /// Resident bytes of the process subtree rooted at `pid` (0 if the sampler can't see it).
@@ -2325,6 +2347,20 @@ mod tests {
         assert!(s2.tasks.contains_key(&id));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_dirty_patch_flags_nonempty_diffs_only() {
+        // The empty-diff sentinel hash is NOT dirty; any other hash is (SUM-168 / H4b evidence).
+        assert!(!is_dirty_patch(&memmux_lifecycle::content_hash(b"")));
+        assert!(is_dirty_patch(&git_patch_hash_of(
+            "diff --git a/x b/x\n+edit\n"
+        )));
+    }
+
+    /// Test helper: the patch hash of an arbitrary diff string (mirrors `git_patch_hash`).
+    fn git_patch_hash_of(diff: &str) -> String {
+        memmux_lifecycle::content_hash(diff.as_bytes())
     }
 
     #[test]
@@ -2858,6 +2894,88 @@ mod tests {
         assert!(
             preserve < terminate,
             "Git state must be preserved before termination"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The Emergency `preserve_git_state` event carries the checkpoint evidence (git HEAD + patch
+    /// hash + `git_dirty`) on the EVENT stream so an out-of-process observer can verify a
+    /// non-empty-patch checkpoint was captured for the reclaimed victim (SUM-168 / H4b).
+    #[cfg(unix)]
+    #[test]
+    fn preserve_git_state_event_reports_dirty_patch_for_a_dirty_repo() {
+        let tmp = std::env::temp_dir().join(format!("memmuxd-h4b-{}", std::process::id()));
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Build a dirty git repo: init, commit a file, then modify it (uncommitted change).
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        };
+        if !git(&["init", "-q"]) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return; // git unavailable — skip rather than fail the suite.
+        }
+        assert!(git(&["config", "user.email", "t@t.local"]));
+        assert!(git(&["config", "user.name", "t"]));
+        std::fs::write(repo.join("work.txt"), b"baseline\n").unwrap();
+        assert!(git(&["add", "work.txt"]));
+        assert!(git(&["commit", "-q", "-m", "baseline"]));
+        std::fs::write(repo.join("work.txt"), b"baseline\ndirty edit\n").unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
+        let mut s = DaemonState::boot(store, envelope, tmp.clone()).unwrap();
+
+        let created = match s.handle(Request::CreateTask(CreateTaskRequest {
+            title: "victim".into(),
+            repository_path: repo.to_string_lossy().into_owned(),
+            provider: "generic".into(),
+            base_branch: "main".into(),
+            resource_class: None,
+            priority: Some("low".into()),
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()]),
+        })) {
+            Response::Task(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            s.handle(Request::StartTask {
+                id: created.id.clone()
+            }),
+            Response::Task(_)
+        ));
+
+        s.used_bytes = s.envelope.agent_budget_bytes + 1;
+        s.pressure_tick(10_000);
+
+        let evs = match s.handle(Request::ReadEvents {
+            after_seq: 0,
+            limit: 200,
+        }) {
+            Response::Events(e) => e,
+            other => panic!("{other:?}"),
+        };
+        let preserve = evs
+            .iter()
+            .find(|e| e.event_type == "preserve_git_state")
+            .expect("expected a preserve_git_state event");
+        let payload = preserve
+            .payload_json
+            .as_deref()
+            .expect("preserve event must carry a payload");
+        assert!(
+            payload.contains("\"git_dirty\":true"),
+            "dirty repo must report git_dirty:true, got {payload}"
+        );
+        assert!(
+            payload.contains("\"git_patch_hash\""),
+            "payload must carry the git patch hash"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

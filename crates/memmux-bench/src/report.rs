@@ -7,6 +7,7 @@
 use crate::cleanup::CleanupResult;
 use crate::escape::EscapeResult;
 use crate::gates::{GateResult, GateStatus};
+use crate::h4::{H4Evidence, NoLostWork, OvercommitGovernance};
 use crate::sampler::TimeSeries;
 use crate::stats::{summarize, TrialStats};
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,62 @@ impl EscapeSummary {
     }
 }
 
+/// Aggregated H4 governance + no-lost-work evidence for one launcher × overcommit run
+/// (SUM-167/168). Governance counts are deterministic per trial, so this takes the **maximum**
+/// across trials (the strongest evidence that the mechanism engaged); the no-lost-work fraction is
+/// the **worst-case (min)** across trials so a single flaky trial can only look worse, never better.
+/// `None` on a [`RunSummary`] when the launcher is ungoverned (rendered *unsupported*, never a
+/// fabricated zero).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct H4Summary {
+    /// Worst-case (max) admission deferrals + pressure reclamations across trials.
+    pub governance: OvercommitGovernance,
+    /// Worst-case (min-preserved) no-lost-work counts across trials with a reclamation.
+    pub no_lost_work: NoLostWork,
+}
+
+impl H4Summary {
+    /// Aggregate per-trial [`H4Evidence`], ignoring trials with no evidence (ungoverned launchers).
+    ///
+    /// Returns `None` when no trial produced evidence (the launcher is unsupported / ungoverned).
+    /// Governance counts take the max across trials; the no-lost-work counts take the trial with the
+    /// lowest preserved fraction (ties broken toward more victims) so the reported fraction is the
+    /// worst observed.
+    pub fn from_trials(trials: &[Option<H4Evidence>]) -> Option<Self> {
+        let present: Vec<&H4Evidence> = trials.iter().filter_map(|h| h.as_ref()).collect();
+        if present.is_empty() {
+            return None;
+        }
+        let governance = OvercommitGovernance {
+            admission_deferrals: present
+                .iter()
+                .map(|e| e.governance.admission_deferrals)
+                .max()
+                .unwrap_or(0),
+            reclamations: present
+                .iter()
+                .map(|e| e.governance.reclamations)
+                .max()
+                .unwrap_or(0),
+        };
+        // Worst-case no-lost-work: the trial with the lowest preserved fraction. Trials with no
+        // reclamation (fraction n/a) are treated as fraction 1.0 for ranking so they never win the
+        // "worst" slot over a trial that actually reclaimed something.
+        let worst = present
+            .iter()
+            .min_by(|a, b| {
+                let fa = a.no_lost_work.preserved_fraction().unwrap_or(1.0);
+                let fb = b.no_lost_work.preserved_fraction().unwrap_or(1.0);
+                fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("present is non-empty");
+        Some(Self {
+            governance,
+            no_lost_work: worst.no_lost_work,
+        })
+    }
+}
+
 /// Report-level metadata cited at the top of the Markdown report (SUM-37 core).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReportMeta {
@@ -182,6 +239,12 @@ pub struct RunSummary {
     /// Aggregated escaped-process visibility stats (SUM-166 / H3); `None` when the scenario injected
     /// no escapes (the "Escaped-process detection" table then omits this launcher×scenario).
     pub escape: Option<EscapeSummary>,
+    /// Constrained agent budget in MiB for the overcommit run (SUM-167 / H4a), or `None` outside the
+    /// overcommit scenario (or when no budget override was set). Shown in the H4a table.
+    pub overcommit_budget_mib: Option<f64>,
+    /// Aggregated H4 governance + no-lost-work stats (SUM-167/168); `None` for an ungoverned launcher
+    /// or outside the overcommit scenario (the H4 tables then render this launcher as unsupported).
+    pub h4: Option<H4Summary>,
 }
 
 impl RunSummary {
@@ -202,6 +265,8 @@ impl RunSummary {
             None,
             &[],
             &[],
+            &[],
+            None,
         )
     }
 
@@ -227,6 +292,8 @@ impl RunSummary {
         manager_cpu_pct: Option<f64>,
         trial_cleanup: &[Option<CleanupResult>],
         trial_escape: &[Option<EscapeResult>],
+        trial_h4: &[Option<H4Evidence>],
+        overcommit_budget_mib: Option<f64>,
     ) -> Self {
         let peak_total: Vec<f64> = trials
             .iter()
@@ -296,6 +363,8 @@ impl RunSummary {
             trials: trials.len(),
             cleanup: CleanupSummary::from_trials(trial_cleanup),
             escape: EscapeSummary::from_trials(trial_escape),
+            overcommit_budget_mib,
+            h4: H4Summary::from_trials(trial_h4),
         }
     }
 }
@@ -451,6 +520,113 @@ left every agent subtree while still alive._\n"
                 out,
                 "| {} | {} | {} | {} | {} |",
                 s.launcher, e.injected, e.injected_confirmed, detected, notes,
+            );
+        }
+    }
+
+    // Overcommit / bounded footprint (H4a, SUM-167) + No-lost-work (H4b, SUM-168): one row per
+    // launcher that ran the overcommit scenario. MemMux is governed (real deferral/reclamation
+    // counts); the baselines are ungoverned (no governance mechanism).
+    let overcommit_rows: Vec<&RunSummary> = summaries
+        .iter()
+        .filter(|s| s.scenario == "overcommit")
+        .collect();
+    if !overcommit_rows.is_empty() {
+        let _ = writeln!(out, "\n## Overcommit / bounded footprint (H4a)\n");
+        let _ = writeln!(
+            out,
+            "_Under a **constrained agent budget** (set below the aggregate predicted peak of N \
+agents) MemMux governs — its admission planner defers starts that would not fit and its pressure \
+ladder reclaims resident agents — so its footprint stays near/under budget. raw/tmux/herdr are \
+**ungoverned**: they run all N agents, so \"Governance actions\" is an honest \"n/a — no such \
+mechanism\", not a measured `0`. \"Budget MiB\" applies only to MemMux (the others have no budget \
+to enforce). Swap-growth SLO is the Linux corollary, measured on the Linux reference host via the \
+per-process swap columns; on this host the gate is evaluated on footprint._\n"
+        );
+        let _ = writeln!(
+            out,
+            "| Launcher | Budget MiB | Peak total MiB | Steady total MiB | Governance actions | Notes |"
+        );
+        let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: | --- |");
+        for s in &overcommit_rows {
+            let budget = s
+                .overcommit_budget_mib
+                .map(|b| format!("{b:.0}"))
+                .unwrap_or_else(|| "n/a".to_string());
+            let (actions, notes) = match &s.h4 {
+                Some(h) => (
+                    h.governance.total_actions().to_string(),
+                    format!(
+                        "governed: {} deferral(s) + {} reclamation(s)",
+                        h.governance.admission_deferrals, h.governance.reclamations
+                    ),
+                ),
+                None => (
+                    "n/a".to_string(),
+                    "none (ungoverned — no admission/pressure mechanism)".to_string(),
+                ),
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} |",
+                s.launcher,
+                budget,
+                fmt_stat(&s.peak_total_mib, 1),
+                fmt_stat(&s.steady_total_mib, 1),
+                actions,
+                notes,
+            );
+        }
+
+        let _ = writeln!(out, "\n## No-lost-work (H4b)\n");
+        let _ = writeln!(
+            out,
+            "_Before the pressure ladder terminates a victim it first captures a durable checkpoint \
+(git HEAD + patch hash + dirty manifest). \"Checkpoints captured\" counts victims for which a \
+checkpoint carrying a **non-empty** git patch hash was persisted first; \"Preserved %\" is \
+captured/reclaimed. raw/tmux/herdr have no checkpoint mechanism, so this is **unsupported** — a \
+capability comparison, NOT a fabricated \"lost N files\". When no victim was reclaimed this run, \
+the metric is n/a (honest — the budget did not force a termination)._\n"
+        );
+        let _ = writeln!(
+            out,
+            "| Launcher | Victims reclaimed | Checkpoints captured | Preserved % | Notes |"
+        );
+        let _ = writeln!(out, "| --- | ---: | ---: | ---: | --- |");
+        for s in &overcommit_rows {
+            let (victims, captured, preserved, notes) = match &s.h4 {
+                Some(h) => {
+                    let n = &h.no_lost_work;
+                    let preserved = match n.preserved_fraction() {
+                        Some(f) => format!("{:.1}%", f * 100.0),
+                        None => "n/a".to_string(),
+                    };
+                    let notes = if n.victims_reclaimed == 0 {
+                        "governed: no reclamation triggered this run".to_string()
+                    } else {
+                        format!(
+                            "governed: {}/{} preserved before termination",
+                            n.checkpoints_captured, n.victims_reclaimed
+                        )
+                    };
+                    (
+                        n.victims_reclaimed.to_string(),
+                        n.checkpoints_captured.to_string(),
+                        preserved,
+                        notes,
+                    )
+                }
+                None => (
+                    "n/a".to_string(),
+                    "n/a".to_string(),
+                    "n/a".to_string(),
+                    "unsupported (no checkpoint mechanism)".to_string(),
+                ),
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                s.launcher, victims, captured, preserved, notes,
             );
         }
     }
@@ -652,6 +828,8 @@ mod tests {
             Some(1.23),
             &[],
             &[],
+            &[],
+            None,
         );
         assert_eq!(s.trials, 2);
         assert_eq!(s.peak_total_mib.n, 2);
@@ -780,6 +958,8 @@ mod tests {
                 None,
                 &raw_cleanup,
                 &[],
+                &[],
+                None,
             ),
             RunSummary::from_trials(
                 "memmux",
@@ -790,6 +970,8 @@ mod tests {
                 None,
                 &mmx_cleanup,
                 &[],
+                &[],
+                None,
             ),
         ];
         let meta = ReportMeta {
@@ -880,6 +1062,8 @@ mod tests {
                 None,
                 &[],
                 &raw_escape,
+                &[],
+                None,
             ),
             RunSummary::from_trials(
                 "memmux",
@@ -890,6 +1074,8 @@ mod tests {
                 None,
                 &[],
                 &mmx_escape,
+                &[],
+                None,
             ),
         ];
         let meta = ReportMeta::default();

@@ -12,6 +12,7 @@
 //! * [`sampler`] — time-series sampling to JSONL + overhead accounting (SUM-33, SUM-31).
 //! * [`cleanup`] — cleanup / leak-on-teardown measurement (SUM-165 / H2).
 //! * [`escape`] — escaped-process visibility measurement (SUM-166 / H3).
+//! * [`h4`] — bounded-footprint-under-overcommit + no-lost-work measurement (SUM-167/168 / H4).
 //! * [`report`] — Markdown + sparkline report generator (SUM-37).
 //! * [`matrix`] — §18.2 test-matrix enumeration (SUM-39).
 //! * [`gates`] — §18.5 launch-gate checks (SUM-40).
@@ -25,6 +26,7 @@
 pub mod cleanup;
 pub mod escape;
 pub mod gates;
+pub mod h4;
 pub mod launcher;
 pub mod matrix;
 pub mod plot;

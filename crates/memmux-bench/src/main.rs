@@ -67,7 +67,7 @@ enum Command {
     },
     /// Run the benchmark across all available launchers and emit a report.
     Run {
-        /// Scenario to run (`all`, `burst`, `soak`, `idle`, `leak`, `hold`, `escape`).
+        /// Scenario to run (`all`, `burst`, `soak`, `idle`, `leak`, `hold`, `escape`, `overcommit`).
         #[arg(long, default_value = "all")]
         scenario: String,
         /// Provider profile to emulate.
@@ -88,6 +88,11 @@ enum Command {
         /// Number of repeated trials per (launcher, scenario) for mean/CI statistics (SUM-162).
         #[arg(long, default_value_t = 1)]
         trials: usize,
+        /// Constrained MemMux agent budget in MiB for the `overcommit` scenario (SUM-167 / H4).
+        /// Set below the aggregate predicted peak of N agents to force overcommit; ignored by every
+        /// other scenario and by non-MemMux launchers. `0`/unset leaves the host-derived default.
+        #[arg(long)]
+        agent_budget_mib: Option<u64>,
         /// Also list competitor launchers (dmux/cmux/agentmux) — currently always skipped.
         #[arg(long, default_value_t = false)]
         include_competitors: bool,
@@ -134,11 +139,13 @@ fn main() -> anyhow::Result<()> {
             max_samples,
             agents,
             trials,
+            agent_budget_mib,
             include_competitors,
             out,
         } => {
             let provider = parse_provider(&provider)?;
             let scenarios = parse_scenarios(&scenario)?;
+            let agent_budget_bytes = agent_budget_mib.filter(|&m| m > 0).map(|m| m * 1024 * 1024);
             let cfg = RunConfig {
                 provider,
                 intensity,
@@ -148,6 +155,7 @@ fn main() -> anyhow::Result<()> {
                 trials,
                 bench_exe: std::env::current_exe()?,
                 workdir: out.clone(),
+                agent_budget_bytes,
             };
             let mut launchers: Vec<Box<dyn Launcher>> = builtin_launchers();
             if include_competitors {
@@ -178,11 +186,11 @@ fn main() -> anyhow::Result<()> {
         Command::Scenarios => {
             // The four canonical scenarios plus the explicitly-selectable `hold`/`escape` extras
             // (not in `ALL`).
-            for s in Scenario::ALL
-                .iter()
-                .copied()
-                .chain([Scenario::Hold, Scenario::Escape])
-            {
+            for s in Scenario::ALL.iter().copied().chain([
+                Scenario::Hold,
+                Scenario::Escape,
+                Scenario::Overcommit,
+            ]) {
                 println!("{:6}  {}", s.slug(), s.description());
             }
         }
@@ -231,6 +239,7 @@ fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
         "leak" => Scenario::Leak,
         "hold" => Scenario::Hold,
         "escape" => Scenario::Escape,
+        "overcommit" => Scenario::Overcommit,
         other => anyhow::bail!("unknown scenario '{other}'"),
     };
     Ok(vec![scenario])

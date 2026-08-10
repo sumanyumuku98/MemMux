@@ -49,6 +49,10 @@ pub struct RunConfig {
     pub bench_exe: PathBuf,
     /// Directory for recordings and JSONL output.
     pub workdir: PathBuf,
+    /// Constrained MemMux agent budget in bytes for the overcommit scenario (SUM-167 / H4). `None`
+    /// leaves the daemon at its host-derived default; only the `overcommit` scenario threads it into
+    /// the [`LaunchSpec`], and only [`MemMuxLauncher`](crate::launcher::MemMuxLauncher) honors it.
+    pub agent_budget_bytes: Option<u64>,
 }
 
 impl Default for RunConfig {
@@ -62,6 +66,7 @@ impl Default for RunConfig {
             trials: 1,
             bench_exe: PathBuf::new(),
             workdir: PathBuf::from("bench-out"),
+            agent_budget_bytes: None,
         }
     }
 }
@@ -89,6 +94,9 @@ pub struct LauncherRun {
     /// Per-trial escaped-process visibility measurements (SUM-166 / H3); `None` for a trial whose
     /// scenario injected no escapes. Aggregated into the report's "Escaped-process detection" table.
     pub trial_escape: Vec<Option<EscapeResult>>,
+    /// Per-trial H4 governance + no-lost-work evidence (SUM-167/168); `None` for a trial outside the
+    /// overcommit scenario or for an ungoverned launcher. Aggregated into the report's H4 tables.
+    pub trial_h4: Vec<Option<crate::h4::H4Evidence>>,
 }
 
 /// Aggregate result of a benchmark across launchers and scenarios.
@@ -140,6 +148,9 @@ pub struct TrialResult {
     /// Escaped-process visibility measurement for this trial (SUM-166 / H3), or `None` when the
     /// scenario injected no escapes (measurement is n/a for it).
     pub escape: Option<EscapeResult>,
+    /// H4 governance + no-lost-work evidence for this trial (SUM-167/168), or `None` when the
+    /// scenario is not `overcommit` OR the launcher is ungoverned (no governance mechanism).
+    pub h4: Option<crate::h4::H4Evidence>,
 }
 
 /// Run one launcher against one scenario, launching `cfg.agents` identical stubs and sampling the
@@ -174,9 +185,19 @@ pub fn run_launcher_scenario_measured(
     ));
     std::fs::write(&recording_path, serde_json::to_vec_pretty(&recording)?)?;
 
+    // The constrained budget + dirty per-agent git repos are enabled ONLY for the overcommit
+    // scenario (SUM-167/168 / H4); every other scenario leaves them at their defaults so its
+    // behaviour is unchanged.
+    let overcommit = scenario.is_overcommit();
     let spec = LaunchSpec {
         recording_path,
         bench_exe: cfg.bench_exe.clone(),
+        agent_budget_bytes: if overcommit {
+            cfg.agent_budget_bytes
+        } else {
+            None
+        },
+        dirty_repos: overcommit,
     };
     let session = launcher.start(cfg.agents.max(1), &spec)?;
     let version = launcher.version();
@@ -231,8 +252,11 @@ pub fn run_launcher_scenario_measured(
         if records.len() >= cfg.max_samples {
             break;
         }
-        // Stop early once every agent process has exited (provider footprint went to zero).
-        if all_agents_gone(session.topology()) {
+        // Stop early once every agent process has exited (provider footprint went to zero) — but
+        // ONLY when the session actually had agent roots to begin with. A session that launched
+        // zero providers is the governed overcommit-deferral case (SUM-167 / H4): keep sampling the
+        // manager footprint to `max_samples` rather than breaking out on the first tick.
+        if !session.topology().agent_roots.is_empty() && all_agents_gone(session.topology()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(cfg.interval_ms));
@@ -262,6 +286,15 @@ pub fn run_launcher_scenario_measured(
         None
     };
 
+    // H4 governance + no-lost-work evidence (SUM-167/168): only meaningful for the overcommit
+    // scenario, and only a governed launcher (MemMux) surfaces any (the trait default is `None`).
+    // Read while the daemon is still alive, before teardown.
+    let h4 = if scenario.is_overcommit() {
+        session.h4_evidence()
+    } else {
+        None
+    };
+
     // Tear the whole session down so we never leak processes (§2.4 "own what you launch"). Each
     // launcher runs its OWN normal teardown here — no MemMux special-casing (fairness is the whole
     // point of H2).
@@ -286,6 +319,7 @@ pub fn run_launcher_scenario_measured(
         proc_rows,
         cleanup,
         escape,
+        h4,
     })
 }
 
@@ -503,6 +537,7 @@ pub fn run_benchmark(
             let mut trial_proc_rows: Vec<Vec<TaggedProc>> = Vec::with_capacity(n_trials);
             let mut trial_cleanup: Vec<Option<CleanupResult>> = Vec::with_capacity(n_trials);
             let mut trial_escape: Vec<Option<EscapeResult>> = Vec::with_capacity(n_trials);
+            let mut trial_h4: Vec<Option<crate::h4::H4Evidence>> = Vec::with_capacity(n_trials);
             let mut cpu_samples: Vec<f64> = Vec::new();
             let mut trial_error: Option<String> = None;
             for trial in 0..n_trials {
@@ -523,6 +558,7 @@ pub fn run_benchmark(
                         trial_proc_rows.push(result.proc_rows);
                         trial_cleanup.push(result.cleanup);
                         trial_escape.push(result.escape);
+                        trial_h4.push(result.h4);
                     }
                     Err(e) => {
                         trial_error = Some(e.to_string());
@@ -546,6 +582,13 @@ pub fn run_benchmark(
                 Some(cpu_samples.iter().sum::<f64>() / cpu_samples.len() as f64)
             };
 
+            // The overcommit budget (MiB) is a run-level constant shown in the H4a table; `None`
+            // outside the overcommit scenario or when no budget override was set.
+            let overcommit_budget_mib = if scenario.is_overcommit() {
+                cfg.agent_budget_bytes.map(|b| b as f64 / MIB as f64)
+            } else {
+                None
+            };
             summaries.push(RunSummary::from_trials(
                 launcher.name(),
                 &version,
@@ -555,6 +598,8 @@ pub fn run_benchmark(
                 manager_cpu_pct,
                 &trial_cleanup,
                 &trial_escape,
+                &trial_h4,
+                overcommit_budget_mib,
             ));
             runs.push(LauncherRun {
                 launcher: launcher.name().to_string(),
@@ -566,6 +611,7 @@ pub fn run_benchmark(
                 manager_cpu_pct,
                 trial_cleanup,
                 trial_escape,
+                trial_h4,
             });
         }
     }
@@ -573,7 +619,11 @@ pub fn run_benchmark(
     // Emit the embedded SVG figures next to the report (SUM-163); failures are non-fatal.
     let figures = write_figures(&cfg.workdir, &runs).unwrap_or_default();
 
-    let gates = evaluate_gates(&derive_gate_inputs(launchers, &runs));
+    let gates = evaluate_gates(&derive_gate_inputs(
+        launchers,
+        &runs,
+        cfg.agent_budget_bytes,
+    ));
     let meta = ReportMeta::now(versions);
     Ok(BenchOutcome {
         runs,
@@ -709,7 +759,14 @@ fn write_figures(workdir: &Path, runs: &[LauncherRun]) -> anyhow::Result<Vec<(St
 }
 
 /// Derive launch-gate inputs from the collected runs.
-fn derive_gate_inputs(launchers: &[Box<dyn Launcher>], runs: &[LauncherRun]) -> GateInputs {
+///
+/// `cfg_agent_budget` is the constrained overcommit agent budget in bytes (SUM-167 / H4a), used to
+/// evaluate the Pressure-avoidance gate against MemMux's overcommit steady footprint.
+fn derive_gate_inputs(
+    launchers: &[Box<dyn Launcher>],
+    runs: &[LauncherRun],
+    cfg_agent_budget: Option<u64>,
+) -> GateInputs {
     let mut inputs = GateInputs::new();
 
     // Attribution: worst launched-tree attribution across every run.
@@ -772,6 +829,33 @@ fn derive_gate_inputs(launchers: &[Box<dyn Launcher>], runs: &[LauncherRun]) -> 
         inputs.min_cleanup_fraction = Some(min_cleanup);
     }
 
+    // H4a Pressure avoidance + H4b No-lost-work (SUM-167/168): from the MemMux overcommit run.
+    // The overcommit run is a governed launcher (MemMux) whose trials carry H4 evidence. The
+    // constrained budget is a run-level constant, so recover it from the config the run threaded in.
+    if let Some(oc) = memmux_runs().find(|r| r.scenario == Scenario::Overcommit) {
+        // Worst-case (max) steady total footprint across trials — the strongest bound to test.
+        let steady = oc
+            .trials
+            .iter()
+            .map(|ts| ts.steady_total_bytes())
+            .max()
+            .unwrap_or(0);
+        inputs.overcommit_steady_footprint_bytes = Some(steady);
+        inputs.overcommit_budget_bytes = cfg_agent_budget;
+
+        // Worst-case preserved fraction across trials that actually reclaimed a victim; `None` when
+        // no trial reclaimed anyone (the gate then stays Skipped — honest, not a fake pass).
+        let worst_preserved = oc
+            .trial_h4
+            .iter()
+            .filter_map(|h| h.as_ref())
+            .filter_map(|h| h.no_lost_work.preserved_fraction())
+            .fold(f64::INFINITY, f64::min);
+        if worst_preserved.is_finite() {
+            inputs.no_lost_work_fraction = Some(worst_preserved);
+        }
+    }
+
     inputs
 }
 
@@ -824,6 +908,7 @@ mod tests {
             manager_cpu_pct,
             trial_cleanup,
             trial_escape: vec![None],
+            trial_h4: vec![None],
         }
     }
 
@@ -831,7 +916,7 @@ mod tests {
     fn gate_inputs_take_worst_attribution() {
         let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
         let runs = vec![memmux_run(None)];
-        let inputs = derive_gate_inputs(&launchers, &runs);
+        let inputs = derive_gate_inputs(&launchers, &runs, None);
         assert_eq!(inputs.min_attributed_fraction, Some(0.95));
         // With no measured CPU%, the overhead falls back to the per-sample proxy.
         assert!(inputs.sampling_overhead_fraction.is_some());
@@ -842,7 +927,7 @@ mod tests {
         let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
         // Measured 1.5% CPU → overhead fraction 0.015 (real number, not the proxy).
         let runs = vec![memmux_run(Some(1.5))];
-        let inputs = derive_gate_inputs(&launchers, &runs);
+        let inputs = derive_gate_inputs(&launchers, &runs, None);
         assert_eq!(inputs.sampling_overhead_fraction, Some(0.015));
     }
 
@@ -864,7 +949,7 @@ mod tests {
             cleanup_fraction: Some(0.75),
         };
         let runs = vec![memmux_run_with_cleanup(None, vec![Some(full), Some(leaky)])];
-        let inputs = derive_gate_inputs(&launchers, &runs);
+        let inputs = derive_gate_inputs(&launchers, &runs, None);
         assert_eq!(inputs.min_cleanup_fraction, Some(0.75));
     }
 
@@ -872,7 +957,7 @@ mod tests {
     fn cleanup_gate_input_absent_when_no_data() {
         let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
         let runs = vec![memmux_run(None)]; // trial_cleanup is [None]
-        let inputs = derive_gate_inputs(&launchers, &runs);
+        let inputs = derive_gate_inputs(&launchers, &runs, None);
         assert_eq!(inputs.min_cleanup_fraction, None);
     }
 

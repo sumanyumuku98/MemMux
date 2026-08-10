@@ -35,6 +35,7 @@ fn short_cfg(dir: PathBuf, agents: usize) -> RunConfig {
         trials: 1,
         bench_exe: bench_exe(),
         workdir: dir,
+        agent_budget_bytes: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn memmux_launcher_creates_two_providers_when_daemon_is_resolvable() {
     let spec = LaunchSpec {
         recording_path,
         bench_exe: bench_exe(),
+        ..Default::default()
     };
 
     match launcher.start(2, &spec) {

@@ -35,6 +35,18 @@ pub enum Scenario {
     /// escaped-process visibility measurement, where MemMux's daemon surfaces the reparented pid
     /// as a `process_escaped` event and the baselines cannot detect it at all.
     Escape,
+    /// N long-lived resident agents (each with a child subtree) held concurrently live under a
+    /// **constrained agent budget** for the bounded-footprint-under-overcommit measurement
+    /// (SUM-167 / H4a) and the no-lost-work measurement (SUM-168 / H4b).
+    ///
+    /// Explicitly-selectable and **not** part of [`Scenario::ALL`]: it is the driver for H4, where
+    /// the daemon is started with an agent budget below the aggregate predicted peak of N agents so
+    /// the admission planner must defer and/or the pressure ladder must reclaim. Like [`Hold`], the
+    /// agents stay resident (Allocate + long-hold SpawnChild + Sleep) so all N are concurrently live
+    /// long enough to be sampled; the baselines run all N ungoverned.
+    ///
+    /// [`Hold`]: Scenario::Hold
+    Overcommit,
 }
 
 impl Scenario {
@@ -58,6 +70,7 @@ impl Scenario {
             Scenario::Leak => "leak",
             Scenario::Hold => "hold",
             Scenario::Escape => "escape",
+            Scenario::Overcommit => "overcommit",
         }
     }
 
@@ -76,6 +89,9 @@ impl Scenario {
             Scenario::Escape => {
                 "Agent that injects an escaped process (double-fork → reparent to init) for the escape-detection measurement."
             }
+            Scenario::Overcommit => {
+                "N resident agents held concurrently under a constrained agent budget (bounded-footprint + no-lost-work measurement)."
+            }
         }
     }
 
@@ -85,6 +101,12 @@ impl Scenario {
     /// is about *process visibility*, not memory growth — the agent's own footprint stays flat.
     pub fn expects_bounded_memory(self) -> bool {
         !matches!(self, Scenario::Leak)
+    }
+
+    /// Whether this scenario is the overcommit driver (SUM-167 / H4): the harness constrains the
+    /// MemMux agent budget below the aggregate predicted peak of N agents for this scenario only.
+    pub fn is_overcommit(self) -> bool {
+        matches!(self, Scenario::Overcommit)
     }
 
     /// How many escaped processes each agent injects in this scenario (SUM-166 / H3).
@@ -188,6 +210,20 @@ impl Scenario {
                 // Freed only at the very end so the modeled trajectory is a plateau that returns to
                 // baseline — bounded, and (like Hold) NOT the monotonic growth that flags a leak.
                 .with(Step::Free { mib: 20 }),
+            // Fixed timing, independent of `intensity` (like Hold): a resident agent WITH a child
+            // subtree, held ~60s so all N stay concurrently live under the constrained budget long
+            // enough to be sampled and, if the budget is tight enough, reclaimed (SUM-167/168 / H4).
+            // The 120 MiB is held for the whole sleep then freed, so a single agent's own footprint
+            // is a bounded plateau (peak base+120) that returns to baseline — NOT a leak — while N
+            // such agents aggregate well past a few-hundred-MiB budget, forcing MemMux to govern.
+            Scenario::Overcommit => SessionRecording::new("overcommit", provider, base)
+                .with(Step::Allocate { mib: 120 })
+                .with(Step::SpawnChild {
+                    mib: 30,
+                    hold_ms: 60_000,
+                })
+                .with(Step::Sleep { ms: 60_000 })
+                .with(Step::Free { mib: 120 }),
         }
     }
 }
@@ -256,11 +292,13 @@ mod tests {
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(slugs.len(), Scenario::ALL.len());
-        // Hold and Escape are deliberately NOT in ALL, but their slugs must be distinct.
+        // Hold, Escape, and Overcommit are deliberately NOT in ALL, but their slugs must be distinct.
         assert_eq!(Scenario::Hold.slug(), "hold");
         assert_eq!(Scenario::Escape.slug(), "escape");
+        assert_eq!(Scenario::Overcommit.slug(), "overcommit");
         assert!(!slugs.contains(&Scenario::Hold.slug()));
         assert!(!slugs.contains(&Scenario::Escape.slug()));
+        assert!(!slugs.contains(&Scenario::Overcommit.slug()));
     }
 
     #[test]
@@ -303,7 +341,11 @@ mod tests {
     #[test]
     fn only_escape_injects_escapes() {
         assert_eq!(Scenario::Escape.escapes_per_agent(Provider::Generic), 1);
-        for s in Scenario::ALL.iter().copied().chain([Scenario::Hold]) {
+        for s in Scenario::ALL
+            .iter()
+            .copied()
+            .chain([Scenario::Hold, Scenario::Overcommit])
+        {
             assert_eq!(
                 s.escapes_per_agent(Provider::Generic),
                 0,
@@ -311,6 +353,32 @@ mod tests {
                 s.slug()
             );
         }
+    }
+
+    #[test]
+    fn overcommit_is_bounded_and_not_a_leak() {
+        // Only ever `.simulate()` Overcommit in a unit test — `.execute()` spawns real processes
+        // and sleeps ~60s. The agent's own footprint is a bounded plateau (it allocates 120 MiB,
+        // holds it during the sleep, then frees it), NOT monotonic growth.
+        let traj = Scenario::Overcommit
+            .recording(Provider::Generic, 1)
+            .simulate();
+        assert!(Scenario::Overcommit.expects_bounded_memory());
+        assert!(Scenario::Overcommit.is_overcommit());
+        assert!(
+            !traj.is_monotonic_growth(),
+            "overcommit must not look like a leak"
+        );
+        assert_eq!(traj.peak_resident_mib(), 64 + 120);
+        assert_eq!(traj.final_resident_mib(), 64);
+    }
+
+    #[test]
+    fn overcommit_ignores_intensity() {
+        // The hold timing is fixed; the step list must not scale with intensity.
+        let a = Scenario::Overcommit.recording(Provider::Generic, 1);
+        let b = Scenario::Overcommit.recording(Provider::Generic, 8);
+        assert_eq!(a.steps, b.steps);
     }
 
     #[test]
