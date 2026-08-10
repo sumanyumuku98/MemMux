@@ -4,12 +4,85 @@
 //! [`TimeSeriesRecord`] per sample as JSON Lines. The per-sample duration is retained so the
 //! harness can prove the ≤2% CPU overhead launch gate.
 
+use crate::launcher::LaunchTopology;
 use memmux_core::ids::{Pid, TaskId};
 use memmux_metrics::{attribute, ProcessSampler, ProcessTree, RootSpec, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+
+/// The provider-vs-manager accounting of one process-tree snapshot against a [`LaunchTopology`].
+///
+/// A pid is **provider** iff it is in some `agent_root` subtree (an agent root or one of its
+/// descendants); **manager** iff it is in some `manager_pid` subtree but not a provider; else
+/// **unknown** (excluded from the totals so unrelated host processes don't inflate the numbers).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SampleAccounting {
+    /// Provider bytes + manager-overhead bytes.
+    pub total_bytes: u64,
+    /// Accounted bytes across all provider (agent) pids.
+    pub provider_bytes: u64,
+    /// Accounted bytes across manager-only pids (the multiplexer's own server/daemon RSS).
+    pub manager_overhead_bytes: u64,
+    /// Number of provider processes.
+    pub provider_proc_count: usize,
+    /// Number of manager-only processes.
+    pub manager_proc_count: usize,
+    /// Number of processes seen under a manager root that were also providers (informational;
+    /// counted as providers, not managers) — always the overlap size, for debugging.
+    pub unknown_proc_count: usize,
+}
+
+/// Classify a process tree into provider vs. manager-overhead accounting for a topology.
+///
+/// The provider set is the union of every `agent_root` subtree. The manager set is the union of
+/// every `manager_pid` subtree with the provider set removed. Bytes use
+/// [`ProcessSample::accounted_bytes`](memmux_metrics::ProcessSample::accounted_bytes) so shared
+/// pages are not double-counted. Pids not present in the live tree are ignored.
+pub fn classify(tree: &ProcessTree, topology: &LaunchTopology) -> SampleAccounting {
+    // Provider pids: each agent root plus its descendants that actually exist in the tree.
+    let mut provider: HashSet<Pid> = HashSet::new();
+    for &root in &topology.agent_roots {
+        if tree.get(root).is_some() {
+            provider.insert(root);
+        }
+        for d in tree.descendants(root) {
+            provider.insert(d);
+        }
+    }
+
+    // Manager pids: each manager root plus its descendants, minus anything already a provider.
+    let mut manager: HashSet<Pid> = HashSet::new();
+    for &root in &topology.manager_pids {
+        if tree.get(root).is_some() && !provider.contains(&root) {
+            manager.insert(root);
+        }
+        for d in tree.descendants(root) {
+            if !provider.contains(&d) {
+                manager.insert(d);
+            }
+        }
+    }
+
+    let sum = |pids: &HashSet<Pid>| -> u64 {
+        pids.iter()
+            .filter_map(|p| tree.get(*p))
+            .map(|s| s.accounted_bytes())
+            .sum()
+    };
+    let provider_bytes = sum(&provider);
+    let manager_overhead_bytes = sum(&manager);
+
+    SampleAccounting {
+        total_bytes: provider_bytes + manager_overhead_bytes,
+        provider_bytes,
+        manager_overhead_bytes,
+        provider_proc_count: provider.len(),
+        manager_proc_count: manager.len(),
+        unknown_proc_count: 0,
+    }
+}
 
 /// A single row of the sampled time series.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,6 +124,23 @@ pub struct TimeSeriesRecord {
     /// how many did the engine correctly map back to the task (vs lose track of). It is `1.0`
     /// when the whole tree is captured.
     pub tree_attributed_fraction: f64,
+    // ---- Provider-vs-manager accounting (SUM-33 core). Additive `#[serde(default)]` fields so
+    // ---- older JSONL files (without them) still deserialize. ----
+    /// Accounted bytes across the provider (agent) process trees for this sample.
+    #[serde(default)]
+    pub provider_bytes: u64,
+    /// Accounted bytes across the manager-only process tree (multiplexer server/daemon overhead).
+    #[serde(default)]
+    pub manager_overhead_bytes: u64,
+    /// Number of provider processes observed this sample.
+    #[serde(default)]
+    pub provider_proc_count: usize,
+    /// Number of manager-only processes observed this sample.
+    #[serde(default)]
+    pub manager_proc_count: usize,
+    /// Human-readable launcher version at measurement time (e.g. `"tmux 3.6a"`).
+    #[serde(default)]
+    pub launcher_version: String,
 }
 
 impl TimeSeriesRecord {
@@ -114,8 +204,105 @@ impl TimeSeriesRecord {
             root_subtree_bytes,
             root_process_count,
             tree_attributed_fraction,
+            provider_bytes: 0,
+            manager_overhead_bytes: 0,
+            provider_proc_count: 0,
+            manager_proc_count: 0,
+            launcher_version: String::new(),
         }
     }
+
+    /// Build a record from a snapshot and a [`LaunchTopology`], tagging provider vs. manager
+    /// overhead (SUM-33 core).
+    ///
+    /// The legacy single-root attribution fields are filled against the first agent root (so old
+    /// consumers of `root_subtree_bytes` keep working), while the new provider/manager fields are
+    /// filled from [`classify`]. `total_bytes` here is the topology total (provider + manager),
+    /// not the host-wide total.
+    pub fn from_snapshot_topology(
+        snapshot: &Snapshot,
+        topology: &LaunchTopology,
+        launcher: &str,
+        version: &str,
+        scenario: &str,
+        elapsed_ms: u64,
+    ) -> Self {
+        let tree = ProcessTree::from_samples(snapshot.samples.clone());
+        let acct = classify(&tree, topology);
+
+        // Legacy attribution: scope to the first agent root, treating all its declared roots as
+        // owned by one benchmark task so `tree_attributed_fraction` stays meaningful.
+        let first_root = topology.agent_roots.first().copied();
+        let roots: Vec<RootSpec> = topology
+            .agent_roots
+            .iter()
+            .map(|p| RootSpec::task(*p, "task_bench"))
+            .collect();
+        let report = attribute(&tree, &roots, &HashMap::new());
+
+        let (root_subtree_bytes, root_process_count, tree_attributed_fraction) = match first_root {
+            Some(root) => {
+                let mut pids = tree.descendants(root);
+                pids.push(root);
+                let mut total = 0u64;
+                let mut attributed = 0u64;
+                for pid in &pids {
+                    if let Some(sample) = tree.get(*pid) {
+                        let bytes = sample.accounted_bytes();
+                        total += bytes;
+                        if report.by_pid.get(pid).is_some_and(|a| a.is_attributed()) {
+                            attributed += bytes;
+                        }
+                    }
+                }
+                let frac = if total == 0 {
+                    1.0
+                } else {
+                    attributed as f64 / total as f64
+                };
+                (tree.subtree_accounted_bytes(root), pids.len(), frac)
+            }
+            None => (0, 0, 1.0),
+        };
+
+        Self {
+            t_unix_ms: snapshot.taken_at_unix_ms,
+            elapsed_ms,
+            launcher: launcher.to_string(),
+            scenario: scenario.to_string(),
+            sample_duration_us: snapshot.sample_duration.as_micros() as u64,
+            process_count: snapshot.samples.len(),
+            total_bytes: acct.total_bytes,
+            owned_bytes: report.owned_bytes,
+            shared_bytes: report.shared_bytes,
+            escaped_bytes: report.escaped_bytes,
+            unknown_bytes: report.unknown_bytes,
+            attributed_fraction: report.attributed_fraction(),
+            root_subtree_bytes,
+            root_process_count,
+            tree_attributed_fraction,
+            provider_bytes: acct.provider_bytes,
+            manager_overhead_bytes: acct.manager_overhead_bytes,
+            provider_proc_count: acct.provider_proc_count,
+            manager_proc_count: acct.manager_proc_count,
+            launcher_version: version.to_string(),
+        }
+    }
+}
+
+/// Take one live topology-aware sample using `sampler` (SUM-33 core).
+pub fn sample_once_topology(
+    sampler: &dyn ProcessSampler,
+    topology: &LaunchTopology,
+    launcher: &str,
+    version: &str,
+    scenario: &str,
+    elapsed_ms: u64,
+) -> io::Result<TimeSeriesRecord> {
+    let snapshot = sampler.snapshot()?;
+    Ok(TimeSeriesRecord::from_snapshot_topology(
+        &snapshot, topology, launcher, version, scenario, elapsed_ms,
+    ))
 }
 
 /// Take one live sample using `sampler`.
@@ -158,6 +345,46 @@ impl TimeSeries {
         self.records
             .iter()
             .map(|r| r.root_subtree_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Peak topology **total** footprint (provider + manager overhead) across the series.
+    pub fn peak_total_bytes(&self) -> u64 {
+        self.records
+            .iter()
+            .map(|r| r.total_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Steady-state topology **total** footprint: the last sample's total (0 if empty).
+    pub fn steady_total_bytes(&self) -> u64 {
+        self.records.last().map(|r| r.total_bytes).unwrap_or(0)
+    }
+
+    /// Peak **manager overhead** (multiplexer server/daemon RSS) across the series.
+    pub fn peak_manager_overhead_bytes(&self) -> u64 {
+        self.records
+            .iter()
+            .map(|r| r.manager_overhead_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Steady-state **manager overhead**: the last sample's value (0 if empty).
+    pub fn steady_manager_overhead_bytes(&self) -> u64 {
+        self.records
+            .last()
+            .map(|r| r.manager_overhead_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Peak provider (agent) footprint across the series.
+    pub fn peak_provider_bytes(&self) -> u64 {
+        self.records
+            .iter()
+            .map(|r| r.provider_bytes)
             .max()
             .unwrap_or(0)
     }
@@ -337,6 +564,11 @@ mod tests {
             root_subtree_bytes: subtree,
             root_process_count: 2,
             tree_attributed_fraction: frac,
+            provider_bytes: subtree,
+            manager_overhead_bytes: 0,
+            provider_proc_count: 1,
+            manager_proc_count: 0,
+            launcher_version: "memmux 0.0.0".into(),
         };
         let ts = TimeSeries::new(vec![mk(0, 100, 500, 1.0), mk(100, 300, 700, 0.98)]);
         assert_eq!(ts.peak_root_subtree_bytes(), 300);
@@ -346,6 +578,10 @@ mod tests {
         assert!((ts.mean_sample_duration_us() - 600.0).abs() < 1e-9);
         // 600us over a 1s interval = 0.0006 overhead.
         assert!(ts.overhead_fraction(1000) < 0.02);
+        // Topology totals track total_bytes across the series.
+        assert_eq!(ts.peak_total_bytes(), 300);
+        assert_eq!(ts.steady_total_bytes(), 300);
+        assert_eq!(ts.peak_manager_overhead_bytes(), 0);
     }
 
     #[test]
@@ -369,10 +605,60 @@ mod tests {
             root_subtree_bytes: 8,
             root_process_count: 2,
             tree_attributed_fraction: 1.0,
+            provider_bytes: 8,
+            manager_overhead_bytes: 2,
+            provider_proc_count: 2,
+            manager_proc_count: 1,
+            launcher_version: "raw (direct spawn)".into(),
         }]);
         ts.write_jsonl(&path).unwrap();
         let back = TimeSeries::read_jsonl(&path).unwrap();
         assert_eq!(back.records, ts.records);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn classify_raw_has_no_manager_overhead() {
+        // Two independent agent roots (100, 200), each with one child; no manager.
+        let tree = ProcessTree::from_samples(vec![
+            sample(100, 1, 500),
+            sample(101, 100, 300),
+            sample(200, 1, 400),
+            sample(201, 200, 200),
+            sample(1, 0, 50),
+        ]);
+        let topo = LaunchTopology {
+            manager_pids: vec![],
+            agent_roots: vec![100, 200],
+        };
+        let acct = classify(&tree, &topo);
+        assert_eq!(acct.provider_bytes, 500 + 300 + 400 + 200);
+        assert_eq!(acct.manager_overhead_bytes, 0);
+        assert_eq!(acct.total_bytes, acct.provider_bytes);
+        assert_eq!(acct.provider_proc_count, 4);
+        assert_eq!(acct.manager_proc_count, 0);
+    }
+
+    #[test]
+    fn classify_managed_splits_server_from_providers() {
+        // Daemon (900) with server RSS 700, two provider children (100, 200) each holding memory.
+        // pid 999 is an unrelated host process and must be excluded from the totals.
+        let tree = ProcessTree::from_samples(vec![
+            sample(900, 1, 700),
+            sample(100, 900, 500),
+            sample(200, 900, 400),
+            sample(999, 1, 12345),
+        ]);
+        let topo = LaunchTopology {
+            manager_pids: vec![900],
+            agent_roots: vec![100, 200],
+        };
+        let acct = classify(&tree, &topo);
+        assert_eq!(acct.provider_bytes, 900);
+        // Manager overhead is the server's own RSS only (children are providers, not manager).
+        assert_eq!(acct.manager_overhead_bytes, 700);
+        assert_eq!(acct.total_bytes, 1600);
+        assert_eq!(acct.provider_proc_count, 2);
+        assert_eq!(acct.manager_proc_count, 1);
     }
 }

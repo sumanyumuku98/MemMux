@@ -6,13 +6,11 @@
 
 use crate::gates::{evaluate_gates, GateInputs, GateResult};
 use crate::launcher::{LaunchSpec, Launcher, LauncherKind};
-use crate::report::{render_markdown, RunSummary};
-use crate::sampler::{sample_once, TimeSeries};
+use crate::report::{render_markdown, ReportMeta, RunSummary};
+use crate::sampler::{sample_once_topology, TimeSeries};
 use crate::scenario::Scenario;
-use memmux_core::ids::TaskId;
 use memmux_core::Provider;
-use memmux_metrics::{default_sampler, RootSpec};
-use std::collections::HashMap;
+use memmux_metrics::default_sampler;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -32,10 +30,26 @@ pub struct RunConfig {
     pub interval_ms: u64,
     /// Maximum number of samples per run.
     pub max_samples: usize,
+    /// Number of identical stub agents to launch per launcher (default 3).
+    pub agents: usize,
     /// Path to the `memmux-bench` binary (used to execute the stub).
     pub bench_exe: PathBuf,
     /// Directory for recordings and JSONL output.
     pub workdir: PathBuf,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            provider: Provider::Generic,
+            intensity: 1,
+            interval_ms: 100,
+            max_samples: 20,
+            agents: 3,
+            bench_exe: PathBuf::new(),
+            workdir: PathBuf::from("bench-out"),
+        }
+    }
 }
 
 /// The result of running one launcher against one scenario.
@@ -43,6 +57,8 @@ pub struct RunConfig {
 pub struct LauncherRun {
     /// Launcher name.
     pub launcher: String,
+    /// Resolved launcher version at measurement time.
+    pub version: String,
     /// Scenario.
     pub scenario: Scenario,
     /// Sampled time series.
@@ -58,16 +74,27 @@ pub struct BenchOutcome {
     pub summaries: Vec<RunSummary>,
     /// Evaluated launch gates.
     pub gates: Vec<GateResult>,
+    /// Launchers skipped this run, each paired with the reason (§19.5 claims discipline).
+    pub skipped: Vec<(String, String)>,
+    /// Report metadata (measurement time, host OS, per-launcher versions).
+    pub meta: ReportMeta,
 }
 
 impl BenchOutcome {
     /// Render the outcome as a Markdown report.
     pub fn to_markdown(&self, title: &str) -> String {
-        render_markdown(title, &self.summaries, &self.gates)
+        render_markdown(
+            title,
+            &self.summaries,
+            &self.gates,
+            &self.meta,
+            &self.skipped,
+        )
     }
 }
 
-/// Run one launcher against one scenario, sampling the launched stub over its lifetime.
+/// Run one launcher against one scenario, launching `cfg.agents` identical stubs and sampling the
+/// whole topology (providers vs. manager overhead) over its lifetime.
 pub fn run_launcher_scenario(
     launcher: &dyn Launcher,
     scenario: Scenario,
@@ -88,25 +115,21 @@ pub fn run_launcher_scenario(
         recording_path,
         bench_exe: cfg.bench_exe.clone(),
     };
-    let mut launched = launcher.launch(&spec)?;
-    let pid = launched.pid;
-
-    let roots = vec![RootSpec::task(pid, "task_bench")];
-    let expected: HashMap<_, TaskId> = HashMap::new();
+    let session = launcher.start(cfg.agents.max(1), &spec)?;
+    let version = launcher.version();
     let sampler = default_sampler();
 
     let started = Instant::now();
     let mut records = Vec::new();
     loop {
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        if let Ok(record) = sample_once(
+        if let Ok(record) = sample_once_topology(
             sampler.as_ref(),
-            &roots,
-            &expected,
+            session.topology(),
             launcher.name(),
+            &version,
             scenario.slug(),
             elapsed_ms,
-            Some(pid),
         ) {
             records.push(record);
         }
@@ -114,19 +137,38 @@ pub fn run_launcher_scenario(
         if records.len() >= cfg.max_samples {
             break;
         }
-        // Stop once the child has exited.
-        if matches!(launched.child.try_wait(), Ok(Some(_))) {
+        // Stop early once every agent process has exited (provider footprint went to zero).
+        if all_agents_gone(session.topology()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(cfg.interval_ms));
     }
 
-    // Reap the child so we never leak the process we launched (§2.4 "own what you launch").
-    let _ = launched.child.wait();
+    // Tear the whole session down so we never leak processes (§2.4 "own what you launch").
+    session.stop();
     Ok(TimeSeries::new(records))
 }
 
-/// Run every *available* launcher against the given scenarios and evaluate the launch gates.
+/// Whether none of the topology's agent roots are still alive in the live process tree.
+fn all_agents_gone(topology: &crate::launcher::LaunchTopology) -> bool {
+    if topology.agent_roots.is_empty() {
+        return true;
+    }
+    match default_sampler().snapshot() {
+        Ok(snapshot) => {
+            let tree = memmux_metrics::ProcessTree::from_samples(snapshot.samples);
+            topology.agent_roots.iter().all(|p| tree.get(*p).is_none())
+        }
+        // If we cannot sample, keep going rather than stopping prematurely.
+        Err(_) => false,
+    }
+}
+
+/// Run every launcher against the given scenarios and evaluate the launch gates.
+///
+/// Unavailable launchers, and launchers whose `start()` errors, are recorded in
+/// [`BenchOutcome::skipped`] with a reason and never abort the whole benchmark — a fabricated or
+/// zero measurement is never emitted for a launcher that could not be driven (§19.5).
 pub fn run_benchmark(
     launchers: &[Box<dyn Launcher>],
     scenarios: &[Scenario],
@@ -134,13 +176,30 @@ pub fn run_benchmark(
 ) -> anyhow::Result<BenchOutcome> {
     let mut runs = Vec::new();
     let mut summaries = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
 
+    let mut versions: Vec<(String, String)> = Vec::new();
     for launcher in launchers {
         if !launcher.is_available() {
+            skipped.push((
+                launcher.name().to_string(),
+                "binary not available on this host".to_string(),
+            ));
             continue;
         }
+        let version = launcher.version();
+        versions.push((launcher.name().to_string(), version.clone()));
         for &scenario in scenarios {
-            let series = run_launcher_scenario(launcher.as_ref(), scenario, cfg)?;
+            let series = match run_launcher_scenario(launcher.as_ref(), scenario, cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    skipped.push((
+                        format!("{} ({})", launcher.name(), scenario.slug()),
+                        e.to_string(),
+                    ));
+                    continue;
+                }
+            };
             // Persist the raw series next to the report for auditability.
             let jsonl = cfg
                 .workdir
@@ -148,12 +207,14 @@ pub fn run_benchmark(
             series.write_jsonl(&jsonl)?;
             summaries.push(RunSummary::from_series(
                 launcher.name(),
+                &version,
                 scenario.slug(),
                 &series,
                 cfg.interval_ms,
             ));
             runs.push(LauncherRun {
                 launcher: launcher.name().to_string(),
+                version: version.clone(),
                 scenario,
                 series,
             });
@@ -161,10 +222,13 @@ pub fn run_benchmark(
     }
 
     let gates = evaluate_gates(&derive_gate_inputs(launchers, &runs));
+    let meta = ReportMeta::now(versions);
     Ok(BenchOutcome {
         runs,
         summaries,
         gates,
+        skipped,
+        meta,
     })
 }
 
@@ -221,6 +285,7 @@ mod tests {
         let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
         let runs = vec![LauncherRun {
             launcher: "memmux".into(),
+            version: "memmux 0.0.0".into(),
             scenario: Scenario::Burst,
             series: TimeSeries::new(vec![crate::sampler::TimeSeriesRecord {
                 t_unix_ms: 0,
@@ -238,6 +303,11 @@ mod tests {
                 root_subtree_bytes: 90,
                 root_process_count: 2,
                 tree_attributed_fraction: 0.95,
+                provider_bytes: 90,
+                manager_overhead_bytes: 10,
+                provider_proc_count: 2,
+                manager_proc_count: 1,
+                launcher_version: "memmux 0.0.0".into(),
             }]),
         }];
         let inputs = derive_gate_inputs(&launchers, &runs);

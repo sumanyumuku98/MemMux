@@ -555,6 +555,8 @@ dependencies = [
  "clap",
  "memmux-core",
  "memmux-metrics",
+ "memmux-proto",
+ "memmuxd",
  "serde",
  "serde_json",
 ]

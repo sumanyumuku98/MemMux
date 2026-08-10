@@ -57,7 +57,10 @@ enum Command {
         /// Maximum samples per run.
         #[arg(long, default_value_t = 20)]
         max_samples: usize,
-        /// Also run installed competitor launchers (best-effort CLI templates; see docs).
+        /// Number of identical stub agents to launch per launcher.
+        #[arg(long, default_value_t = 3)]
+        agents: usize,
+        /// Also list competitor launchers (dmux/cmux/agentmux) — currently always skipped.
         #[arg(long, default_value_t = false)]
         include_competitors: bool,
         /// Output directory for JSONL + report.
@@ -95,6 +98,7 @@ fn main() -> anyhow::Result<()> {
             intensity,
             interval_ms,
             max_samples,
+            agents,
             include_competitors,
             out,
         } => {
@@ -105,15 +109,12 @@ fn main() -> anyhow::Result<()> {
                 intensity,
                 interval_ms,
                 max_samples,
+                agents,
                 bench_exe: std::env::current_exe()?,
                 workdir: out.clone(),
             };
             let mut launchers: Vec<Box<dyn Launcher>> = builtin_launchers();
             if include_competitors {
-                eprintln!(
-                    "warning: competitor launchers use best-effort CLI templates; treat their \
-numbers as indicative only (§19.5)."
-                );
                 launchers.extend(competitor_launchers());
             }
             let available: Vec<&str> = launchers
@@ -124,6 +125,9 @@ numbers as indicative only (§19.5)."
             eprintln!("available launchers: {}", available.join(", "));
 
             let outcome = run_benchmark(&launchers, &scenarios, &cfg)?;
+            for (name, reason) in &outcome.skipped {
+                eprintln!("skipped {name}: {reason}");
+            }
             let report = outcome.to_markdown("MemMux Phase 0 benchmark");
             let report_path = out.join("report.md");
             std::fs::write(&report_path, &report)?;
