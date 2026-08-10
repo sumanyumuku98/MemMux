@@ -82,6 +82,17 @@ pub trait Launcher {
 pub trait LaunchedSession {
     /// The provider/manager process topology of this session.
     fn topology(&self) -> &LaunchTopology;
+    /// The pids the launcher's own machinery has surfaced as *escaped* (reparented out of every
+    /// task subtree while still alive), deduped (SUM-166 / H3).
+    ///
+    /// Only MemMux has an escape-detection mechanism (its daemon emits `process_escaped` events),
+    /// so only its `MemMuxSession` overrides this. The default is `None`, meaning "this launcher
+    /// has no such capability" — which the report renders as *unsupported*, distinct from a
+    /// measured zero. Called once, just before [`stop`](LaunchedSession::stop), while the daemon
+    /// still lives.
+    fn escaped_pids(&self) -> Option<Vec<Pid>> {
+        None
+    }
     /// Tear the whole session down. Best-effort: never panics, never leaves strays behind.
     fn stop(self: Box<Self>);
 }
@@ -610,9 +621,57 @@ impl Launcher for MemMuxLauncher {
     }
 }
 
+impl MemMuxSession {
+    /// Read the daemon's `process_escaped` events and return the deduped set of escaped pids
+    /// (SUM-166 / H3).
+    ///
+    /// Pages every event (`after_seq: 0`) and parses the `pid` out of each `process_escaped`
+    /// event's `payload_json`. Never fabricates: a client/transport error, or a daemon with no
+    /// such events, yields an empty vec. This is the only launcher with an escape-detection
+    /// mechanism, so it is the only one that returns `Some(..)` from
+    /// [`escaped_pids`](LaunchedSession::escaped_pids).
+    pub fn read_escaped_pids(&self) -> Vec<Pid> {
+        let resp = match self.client.call(&memmux_proto::Request::ReadEvents {
+            after_seq: 0,
+            // A run injects one escape per agent and the daemon dedupes per pid, so a few thousand
+            // events is far more than enough headroom for a benchmark run.
+            limit: 10_000,
+        }) {
+            Ok(memmux_proto::Response::Events(events)) => events,
+            _ => return Vec::new(),
+        };
+        let mut pids: Vec<Pid> = Vec::new();
+        for ev in &resp {
+            if ev.event_type != "process_escaped" {
+                continue;
+            }
+            if let Some(pid) = ev
+                .payload_json
+                .as_deref()
+                .and_then(escaped_pid_from_payload)
+            {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+        pids
+    }
+}
+
+/// Parse the `pid` field out of a `process_escaped` event payload (a JSON object like
+/// `{"pid":123,"name":"…","bytes":…}`). Dependency-free integer extraction, mirroring the herdr
+/// helpers above.
+fn escaped_pid_from_payload(payload: &str) -> Option<Pid> {
+    extract_json_int(payload, "\"pid\":").map(|v| v as Pid)
+}
+
 impl LaunchedSession for MemMuxSession {
     fn topology(&self) -> &LaunchTopology {
         &self.topology
+    }
+    fn escaped_pids(&self) -> Option<Vec<Pid>> {
+        Some(self.read_escaped_pids())
     }
     fn stop(self: Box<Self>) {
         // Best-effort: terminate each task, then kill+reap the daemon and clean the root.

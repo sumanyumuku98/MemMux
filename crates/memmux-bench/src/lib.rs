@@ -11,6 +11,7 @@
 //! * [`launcher`] — baseline / MemMux / competitor launchers (SUM-34, SUM-35).
 //! * [`sampler`] — time-series sampling to JSONL + overhead accounting (SUM-33, SUM-31).
 //! * [`cleanup`] — cleanup / leak-on-teardown measurement (SUM-165 / H2).
+//! * [`escape`] — escaped-process visibility measurement (SUM-166 / H3).
 //! * [`report`] — Markdown + sparkline report generator (SUM-37).
 //! * [`matrix`] — §18.2 test-matrix enumeration (SUM-39).
 //! * [`gates`] — §18.5 launch-gate checks (SUM-40).
@@ -22,6 +23,7 @@
 #![warn(missing_docs)]
 
 pub mod cleanup;
+pub mod escape;
 pub mod gates;
 pub mod launcher;
 pub mod matrix;

@@ -5,7 +5,9 @@ use memmux_bench::launcher::{builtin_launchers, competitor_launchers, Launcher};
 use memmux_bench::matrix::TestMatrix;
 use memmux_bench::run::{run_benchmark, RunConfig};
 use memmux_bench::scenario::Scenario;
-use memmux_bench::stub::{run_child_worker, SessionRecording};
+use memmux_bench::stub::{
+    run_child_worker, run_orphan_child, run_orphan_intermediate, SessionRecording,
+};
 use memmux_core::Provider;
 use std::path::PathBuf;
 
@@ -40,9 +42,32 @@ enum Command {
         #[arg(long)]
         hold_ms: u64,
     },
+    /// Intermediate half of the escape double-fork spawned by a stub (used internally): forks a
+    /// detached grandchild, stays alive `settle_ms`, then exits so the grandchild reparents to
+    /// init (SUM-166 / H3).
+    #[command(hide = true)]
+    StubOrphan {
+        /// How long the intermediate stays alive before exiting, in milliseconds.
+        #[arg(long)]
+        settle_ms: u64,
+        /// How long the escaped grandchild holds memory after reparenting, in milliseconds.
+        #[arg(long)]
+        hold_ms: u64,
+    },
+    /// Escaped grandchild spawned by `stub-orphan` (used internally): hold a little memory then
+    /// exit (SUM-166 / H3).
+    #[command(hide = true)]
+    StubOrphanChild {
+        /// Mebibytes to hold resident.
+        #[arg(long)]
+        mib: u64,
+        /// How long to stay alive, in milliseconds.
+        #[arg(long)]
+        hold_ms: u64,
+    },
     /// Run the benchmark across all available launchers and emit a report.
     Run {
-        /// Scenario to run (`all`, `burst`, `soak`, `idle`, `leak`, `hold`).
+        /// Scenario to run (`all`, `burst`, `soak`, `idle`, `leak`, `hold`, `escape`).
         #[arg(long, default_value = "all")]
         scenario: String,
         /// Provider profile to emulate.
@@ -95,6 +120,12 @@ fn main() -> anyhow::Result<()> {
         Command::StubChild { mib, hold_ms } => {
             run_child_worker(mib, hold_ms);
         }
+        Command::StubOrphan { settle_ms, hold_ms } => {
+            run_orphan_intermediate(settle_ms, hold_ms);
+        }
+        Command::StubOrphanChild { mib, hold_ms } => {
+            run_orphan_child(mib, hold_ms);
+        }
         Command::Run {
             scenario,
             provider,
@@ -145,8 +176,13 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Scenarios => {
-            // The four canonical scenarios plus the explicitly-selectable `hold` (not in `ALL`).
-            for s in Scenario::ALL.iter().copied().chain([Scenario::Hold]) {
+            // The four canonical scenarios plus the explicitly-selectable `hold`/`escape` extras
+            // (not in `ALL`).
+            for s in Scenario::ALL
+                .iter()
+                .copied()
+                .chain([Scenario::Hold, Scenario::Escape])
+            {
                 println!("{:6}  {}", s.slug(), s.description());
             }
         }
@@ -194,6 +230,7 @@ fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
         "idle" => Scenario::Idle,
         "leak" => Scenario::Leak,
         "hold" => Scenario::Hold,
+        "escape" => Scenario::Escape,
         other => anyhow::bail!("unknown scenario '{other}'"),
     };
     Ok(vec![scenario])

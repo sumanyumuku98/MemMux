@@ -5,6 +5,7 @@
 //! `memmux-metrics` against real processes.
 
 use crate::cleanup::{survivors_of, CleanupResult, OwnedProc};
+use crate::escape::{confirm_reparented, EscapeResult};
 use crate::gates::{evaluate_gates, GateInputs, GateResult};
 use crate::launcher::{LaunchSpec, LaunchTopology, Launcher, LauncherKind};
 use crate::plot::{line_chart_svg, Series, PALETTE};
@@ -85,6 +86,9 @@ pub struct LauncherRun {
     /// Per-trial cleanup / leak-on-teardown measurements (SUM-165 / H2); `None` for a trial where
     /// nothing was owned. Aggregated into the report's "Cleanup on teardown" table.
     pub trial_cleanup: Vec<Option<CleanupResult>>,
+    /// Per-trial escaped-process visibility measurements (SUM-166 / H3); `None` for a trial whose
+    /// scenario injected no escapes. Aggregated into the report's "Escaped-process detection" table.
+    pub trial_escape: Vec<Option<EscapeResult>>,
 }
 
 /// Aggregate result of a benchmark across launchers and scenarios.
@@ -133,6 +137,9 @@ pub struct TrialResult {
     /// Cleanup / leak-on-teardown measurement for this trial (SUM-165 / H2), or `None` when the
     /// launcher owned no live agent processes at teardown (measurement is n/a, never a fake 100%).
     pub cleanup: Option<CleanupResult>,
+    /// Escaped-process visibility measurement for this trial (SUM-166 / H3), or `None` when the
+    /// scenario injected no escapes (measurement is n/a for it).
+    pub escape: Option<EscapeResult>,
 }
 
 /// Run one launcher against one scenario, launching `cfg.agents` identical stubs and sampling the
@@ -179,6 +186,12 @@ pub fn run_launcher_scenario_measured(
     let manager_pids = session.topology().manager_pids.clone();
     let cpu_start = sum_cpu_seconds(&manager_pids);
 
+    // How many escapes this scenario injects per agent (SUM-166 / H3); 0 for every scenario but
+    // Escape. When > 0 we track which pids we ever saw under an agent-root subtree, so we can
+    // later independently confirm the ones that reparented away.
+    let escapes_per_agent = scenario.escapes_per_agent(cfg.provider);
+    let mut ever_seen_under_root: std::collections::HashSet<Pid> = std::collections::HashSet::new();
+
     let started = Instant::now();
     let mut records = Vec::new();
     let mut proc_rows: Vec<TaggedProc> = Vec::new();
@@ -187,6 +200,16 @@ pub fn run_launcher_scenario_measured(
         // One snapshot per tick feeds both the aggregate record and the per-process rows (SUM-33).
         if let Ok(snapshot) = sampler.snapshot() {
             let tree = ProcessTree::from_samples(snapshot.samples.clone());
+            // Record every pid currently in an agent-root subtree so we can later tell which ones
+            // reparented out (an escape) vs. which simply exited (SUM-166 / H3).
+            if escapes_per_agent > 0 {
+                for &root in &session.topology().agent_roots {
+                    if tree.get(root).is_some() {
+                        ever_seen_under_root.insert(root);
+                        ever_seen_under_root.extend(tree.descendants(root));
+                    }
+                }
+            }
             records.push(TimeSeriesRecord::from_snapshot_topology(
                 &snapshot,
                 session.topology(),
@@ -224,6 +247,21 @@ pub fn run_launcher_scenario_measured(
     // alive, then measure how much of it survives the launcher's own normal teardown.
     let owned = capture_owned_set(session.topology());
 
+    // Escaped-process visibility (SUM-166 / H3): while the daemon is still alive, (1) read the
+    // launcher's own detected escapes (only MemMux surfaces any — the trait default is `None`),
+    // and (2) independently confirm which of the pids we ever saw under an agent root have now
+    // reparented out of every root subtree while still alive. Only meaningful for scenarios that
+    // inject escapes; `None` otherwise (n/a, never a fabricated row).
+    let escape = if escapes_per_agent > 0 {
+        Some(measure_escape(
+            session.as_ref(),
+            escapes_per_agent.saturating_mul(cfg.agents.max(1)),
+            &ever_seen_under_root,
+        ))
+    } else {
+        None
+    };
+
     // Tear the whole session down so we never leak processes (§2.4 "own what you launch"). Each
     // launcher runs its OWN normal teardown here — no MemMux special-casing (fairness is the whole
     // point of H2).
@@ -247,7 +285,47 @@ pub fn run_launcher_scenario_measured(
         manager_cpu_pct,
         proc_rows,
         cleanup,
+        escape,
     })
+}
+
+/// Measure escaped-process visibility for one trial (SUM-166 / H3).
+///
+/// `injected` is the known count of escapes the harness created (agents × escapes-per-agent).
+/// `candidates` is every pid we ever saw under an agent-root subtree during the run. This takes a
+/// fresh snapshot, independently confirms which candidates reparented out of every live agent-root
+/// subtree (`injected_confirmed`), reads the launcher's own detected escapes (`detected`, `None`
+/// for launchers with no such mechanism), and then reaps the confirmed-escaped pids so the harness
+/// never leaks the orphans it caused to exist.
+fn measure_escape(
+    session: &dyn crate::launcher::LaunchedSession,
+    injected: usize,
+    candidates: &std::collections::HashSet<Pid>,
+) -> EscapeResult {
+    // The launcher's own detection (dedup already done by the daemon / reader).
+    let detected = session.escaped_pids().map(|pids| pids.len());
+
+    // Independent confirmation against a fresh live tree, scoped to the still-alive agent roots.
+    let candidate_vec: Vec<Pid> = candidates.iter().copied().collect();
+    let agent_roots = &session.topology().agent_roots;
+    let confirmed = match default_sampler().snapshot() {
+        Ok(snapshot) => {
+            let tree = ProcessTree::from_samples(snapshot.samples);
+            confirm_reparented(&tree, &candidate_vec, agent_roots)
+        }
+        // If we cannot sample we simply confirm none (never fabricate a reparent).
+        Err(_) => Vec::new(),
+    };
+
+    // Reap the orphans the harness caused to exist so nothing is left running (they hold memory and
+    // sleep for tens of seconds otherwise). Best-effort SIGKILL, same as the cleanup path.
+    kill_survivors(&confirmed);
+
+    EscapeResult {
+        injected,
+        injected_confirmed: confirmed.len(),
+        detected,
+    }
 }
 
 /// Capture the *owned set* for the cleanup measurement: every live pid in each agent-root subtree,
@@ -424,6 +502,7 @@ pub fn run_benchmark(
             let mut trial_series: Vec<TimeSeries> = Vec::with_capacity(n_trials);
             let mut trial_proc_rows: Vec<Vec<TaggedProc>> = Vec::with_capacity(n_trials);
             let mut trial_cleanup: Vec<Option<CleanupResult>> = Vec::with_capacity(n_trials);
+            let mut trial_escape: Vec<Option<EscapeResult>> = Vec::with_capacity(n_trials);
             let mut cpu_samples: Vec<f64> = Vec::new();
             let mut trial_error: Option<String> = None;
             for trial in 0..n_trials {
@@ -443,6 +522,7 @@ pub fn run_benchmark(
                         trial_series.push(result.series);
                         trial_proc_rows.push(result.proc_rows);
                         trial_cleanup.push(result.cleanup);
+                        trial_escape.push(result.escape);
                     }
                     Err(e) => {
                         trial_error = Some(e.to_string());
@@ -474,6 +554,7 @@ pub fn run_benchmark(
                 cfg.interval_ms,
                 manager_cpu_pct,
                 &trial_cleanup,
+                &trial_escape,
             ));
             runs.push(LauncherRun {
                 launcher: launcher.name().to_string(),
@@ -484,6 +565,7 @@ pub fn run_benchmark(
                 trial_proc_rows,
                 manager_cpu_pct,
                 trial_cleanup,
+                trial_escape,
             });
         }
     }
@@ -741,6 +823,7 @@ mod tests {
             trial_proc_rows: vec![Vec::new()],
             manager_cpu_pct,
             trial_cleanup,
+            trial_escape: vec![None],
         }
     }
 

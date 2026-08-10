@@ -27,6 +27,14 @@ pub enum Scenario {
     /// must stay concurrently resident long enough to outlive sampling **and** the 10s teardown
     /// grace. The other scenarios finish in ~1s, so they cannot host that measurement.
     Hold,
+    /// An agent that injects an **escaped** process (double-fork → reparent to init) and stays
+    /// alive long enough for the daemon to sample it under the task and then flag the reparent
+    /// (SUM-166 / H3).
+    ///
+    /// Explicitly-selectable and **not** part of [`Scenario::ALL`]: it is the driver for the
+    /// escaped-process visibility measurement, where MemMux's daemon surfaces the reparented pid
+    /// as a `process_escaped` event and the baselines cannot detect it at all.
+    Escape,
 }
 
 impl Scenario {
@@ -49,6 +57,7 @@ impl Scenario {
             Scenario::Idle => "idle",
             Scenario::Leak => "leak",
             Scenario::Hold => "hold",
+            Scenario::Escape => "escape",
         }
     }
 
@@ -64,14 +73,30 @@ impl Scenario {
             Scenario::Hold => {
                 "Long-lived resident agent + child subtree (~60s) for the teardown-cleanup measurement."
             }
+            Scenario::Escape => {
+                "Agent that injects an escaped process (double-fork → reparent to init) for the escape-detection measurement."
+            }
         }
     }
 
     /// Whether this scenario is expected to keep resident memory bounded.
     ///
-    /// Burst/Soak/Idle/Hold should stay flat; Leak should grow (that is the point).
+    /// Burst/Soak/Idle/Hold/Escape should stay flat; Leak should grow (that is the point). Escape
+    /// is about *process visibility*, not memory growth — the agent's own footprint stays flat.
     pub fn expects_bounded_memory(self) -> bool {
         !matches!(self, Scenario::Leak)
+    }
+
+    /// How many escaped processes each agent injects in this scenario (SUM-166 / H3).
+    ///
+    /// Counts the [`Step::Orphan`] steps in the recording; only [`Scenario::Escape`] injects any,
+    /// so every other scenario returns `0` (and the escape measurement is n/a for them).
+    pub fn escapes_per_agent(self, provider: Provider) -> usize {
+        self.recording(provider, 1)
+            .steps
+            .iter()
+            .filter(|s| matches!(s, Step::Orphan { .. }))
+            .count()
     }
 
     /// Build the stub recording for this scenario at the given intensity.
@@ -145,6 +170,24 @@ impl Scenario {
                 })
                 .with(Step::Sleep { ms: 60_000 })
                 .with(Step::Free { mib: 40 }),
+            // Fixed timing, independent of `intensity` (the escape mechanism is timing-critical):
+            //  * Allocate a small transient so the agent has a real footprint;
+            //  * Orphan{settle_ms: 2500}: the intermediate lives ~2.5s so ≥2 daemon sample ticks
+            //    (SAMPLE_INTERVAL_MS≈1000ms) record the grandchild as a descendant of this task's
+            //    root BEFORE it reparents, then the intermediate exits → the grandchild reparents
+            //    to init (escaped, still alive because hold_ms is long);
+            //  * Sleep so the AGENT itself stays alive for the whole run (≥3–4 more sample ticks),
+            //    giving the daemon time to reconcile the reparent and emit `process_escaped`.
+            Scenario::Escape => SessionRecording::new("escape", provider, base)
+                .with(Step::Allocate { mib: 20 })
+                .with(Step::Orphan {
+                    settle_ms: 2_500,
+                    hold_ms: 30_000,
+                })
+                .with(Step::Sleep { ms: 30_000 })
+                // Freed only at the very end so the modeled trajectory is a plateau that returns to
+                // baseline — bounded, and (like Hold) NOT the monotonic growth that flags a leak.
+                .with(Step::Free { mib: 20 }),
         }
     }
 }
@@ -213,9 +256,11 @@ mod tests {
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(slugs.len(), Scenario::ALL.len());
-        // Hold is deliberately NOT in ALL, but its slug must still be distinct from the four.
+        // Hold and Escape are deliberately NOT in ALL, but their slugs must be distinct.
         assert_eq!(Scenario::Hold.slug(), "hold");
+        assert_eq!(Scenario::Escape.slug(), "escape");
         assert!(!slugs.contains(&Scenario::Hold.slug()));
+        assert!(!slugs.contains(&Scenario::Escape.slug()));
     }
 
     #[test]
@@ -228,6 +273,44 @@ mod tests {
         assert!(!traj.is_monotonic_growth(), "hold looks like a leak");
         assert_eq!(traj.peak_resident_mib(), 64 + 40);
         assert_eq!(traj.final_resident_mib(), 64);
+    }
+
+    #[test]
+    fn escape_is_bounded_and_not_a_leak() {
+        // Only ever `.simulate()` Escape in a unit test — `.execute()` spawns real processes and
+        // sleeps for tens of seconds. The agent's own footprint is a flat plateau (it allocates a
+        // small transient and never frees it during the run), NOT monotonic growth.
+        let traj = Scenario::Escape.recording(Provider::Generic, 1).simulate();
+        assert!(Scenario::Escape.expects_bounded_memory());
+        assert!(
+            !traj.is_monotonic_growth(),
+            "escape must not look like a leak"
+        );
+        // A 20 MiB transient is held during the run then freed at the very end: the trajectory
+        // rises to a plateau (peak) and returns to baseline — bounded, not a leak.
+        assert_eq!(traj.peak_resident_mib(), 64 + 20);
+        assert_eq!(traj.final_resident_mib(), 64);
+    }
+
+    #[test]
+    fn escape_ignores_intensity() {
+        // The escape timing is fixed; the step list must not scale with intensity.
+        let a = Scenario::Escape.recording(Provider::Generic, 1);
+        let b = Scenario::Escape.recording(Provider::Generic, 8);
+        assert_eq!(a.steps, b.steps);
+    }
+
+    #[test]
+    fn only_escape_injects_escapes() {
+        assert_eq!(Scenario::Escape.escapes_per_agent(Provider::Generic), 1);
+        for s in Scenario::ALL.iter().copied().chain([Scenario::Hold]) {
+            assert_eq!(
+                s.escapes_per_agent(Provider::Generic),
+                0,
+                "{} must not inject escapes",
+                s.slug()
+            );
+        }
     }
 
     #[test]
