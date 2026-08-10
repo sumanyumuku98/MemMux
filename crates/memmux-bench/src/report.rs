@@ -4,6 +4,7 @@
 //! tables and inline Unicode sparklines — no plotting dependencies, so a report can be produced
 //! anywhere the harness runs and committed as text.
 
+use crate::cleanup::CleanupResult;
 use crate::gates::{GateResult, GateStatus};
 use crate::sampler::TimeSeries;
 use crate::stats::{summarize, TrialStats};
@@ -12,6 +13,52 @@ use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MIB: f64 = 1024.0 * 1024.0;
+
+/// Grace window (seconds) cited in the cleanup table caption; matches `run::CLEANUP_GRACE_MS`.
+const CLEANUP_GRACE_SECONDS: u64 = 10;
+
+/// Aggregated cleanup / leak-on-teardown statistics for one launcher × scenario (SUM-165 / H2).
+///
+/// Each field is a [`TrialStats`] over the trials that produced a cleanup measurement (trials with
+/// nothing owned are excluded). `reclaimed_fraction` is the mean reclaimed fraction; it and the CI
+/// are meaningful across `n >= 2` trials. This whole struct is `None` on a [`RunSummary`] when no
+/// trial produced cleanup data (the launcher owned no live agents at teardown).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CleanupSummary {
+    /// Owned agent-subtree process count (captured pre-teardown), across trials.
+    pub owned_procs: TrialStats,
+    /// Leaked (surviving) process count after the grace window, across trials.
+    pub leaked_procs: TrialStats,
+    /// Leaked bytes (sum of capture-time accounted bytes of survivors), across trials.
+    pub leaked_bytes: TrialStats,
+    /// Reclaimed fraction `(owned - leaked) / owned`, across trials.
+    pub reclaimed_fraction: TrialStats,
+}
+
+impl CleanupSummary {
+    /// Aggregate the per-trial cleanup results, ignoring trials that produced no measurement.
+    ///
+    /// Returns `None` when no trial had cleanup data, so the report shows nothing for launchers
+    /// that owned no live agents at teardown (n/a, never a fabricated row).
+    pub fn from_trials(trials: &[Option<CleanupResult>]) -> Option<Self> {
+        let present: Vec<&CleanupResult> = trials.iter().filter_map(|c| c.as_ref()).collect();
+        if present.is_empty() {
+            return None;
+        }
+        let owned: Vec<f64> = present.iter().map(|c| c.owned_procs as f64).collect();
+        let leaked: Vec<f64> = present.iter().map(|c| c.leaked_procs as f64).collect();
+        let bytes: Vec<f64> = present.iter().map(|c| c.leaked_bytes as f64).collect();
+        // Only trials whose owned>0 have a defined fraction (that is exactly `present`, since a
+        // `Some` cleanup result implies owned>0).
+        let frac: Vec<f64> = present.iter().filter_map(|c| c.cleanup_fraction).collect();
+        Some(Self {
+            owned_procs: summarize(&owned),
+            leaked_procs: summarize(&leaked),
+            leaked_bytes: summarize(&bytes),
+            reclaimed_fraction: summarize(&frac),
+        })
+    }
+}
 
 /// Report-level metadata cited at the top of the Markdown report (SUM-37 core).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,6 +125,9 @@ pub struct RunSummary {
     pub footprint_spark: String,
     /// Number of trials aggregated (K).
     pub trials: usize,
+    /// Aggregated cleanup / leak-on-teardown stats (SUM-165 / H2); `None` when no trial owned any
+    /// live agents at teardown (the "Cleanup on teardown" table then omits this launcher×scenario).
+    pub cleanup: Option<CleanupSummary>,
 }
 
 impl RunSummary {
@@ -96,6 +146,7 @@ impl RunSummary {
             std::slice::from_ref(ts),
             interval_ms,
             None,
+            &[],
         )
     }
 
@@ -104,7 +155,9 @@ impl RunSummary {
     ///
     /// `manager_cpu_pct` is the real measured manager-process CPU% for the run (SUM-164 / H5) when
     /// a manager pid could be sampled, else `None` (the report then falls back to the per-sample
-    /// overhead proxy). The representative scalar fields come from the first trial.
+    /// overhead proxy). `trial_cleanup` carries each trial's leak-on-teardown result (SUM-165 / H2),
+    /// aggregated into [`CleanupSummary`]. The representative scalar fields come from the first
+    /// trial.
     pub fn from_trials(
         launcher: &str,
         version: &str,
@@ -112,6 +165,7 @@ impl RunSummary {
         trials: &[TimeSeries],
         interval_ms: u64,
         manager_cpu_pct: Option<f64>,
+        trial_cleanup: &[Option<CleanupResult>],
     ) -> Self {
         let peak_total: Vec<f64> = trials
             .iter()
@@ -179,6 +233,7 @@ impl RunSummary {
             peak_procs: rep.map(|ts| ts.peak_root_process_count()).unwrap_or(0),
             footprint_spark: sparkline(&footprint),
             trials: trials.len(),
+            cleanup: CleanupSummary::from_trials(trial_cleanup),
         }
     }
 }
@@ -267,6 +322,37 @@ this host._\n"
         );
     }
 
+    // Cleanup on teardown (H2, SUM-165): one row per launcher×scenario that produced cleanup data.
+    let cleanup_rows: Vec<&RunSummary> = summaries.iter().filter(|s| s.cleanup.is_some()).collect();
+    if !cleanup_rows.is_empty() {
+        let _ = writeln!(out, "\n## Cleanup on teardown (H2)\n");
+        let _ = writeln!(
+            out,
+            "_Reclaimed % = fraction of the owned agent subtree gone within {}s of the launcher's \
+normal teardown. `mean ±halfwidth` is over trials with cleanup data (± is the 95% CI half-width, \
+`0.0` for a single trial)._\n",
+            CLEANUP_GRACE_SECONDS
+        );
+        let _ = writeln!(
+            out,
+            "| Launcher | Scenario | Owned procs | Leaked procs | Leaked MiB | Reclaimed % |"
+        );
+        let _ = writeln!(out, "| --- | --- | ---: | ---: | ---: | ---: |");
+        for s in cleanup_rows {
+            let c = s.cleanup.expect("filtered to Some above");
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} |",
+                s.launcher,
+                s.scenario,
+                fmt_stat(&c.owned_procs, 1),
+                fmt_stat(&c.leaked_procs, 1),
+                fmt_stat(&mib_stat(&c.leaked_bytes), 1),
+                fmt_stat_pct(&c.reclaimed_fraction),
+            );
+        }
+    }
+
     // Figures (embedded dependency-free SVG next to the report; SUM-163).
     if !figures.is_empty() {
         let _ = writeln!(out, "\n## Figures\n");
@@ -310,6 +396,18 @@ fn fmt_stat(s: &TrialStats, prec: usize) -> String {
 /// Format a fractional metric [`TrialStats`] as a percentage `mean% ±halfwidth%`.
 fn fmt_stat_pct(s: &TrialStats) -> String {
     format!("{:.1}% ±{:.1}", s.mean * 100.0, s.ci95_halfwidth * 100.0)
+}
+
+/// Rescale a bytes-valued [`TrialStats`] into mebibytes for display (mean, median, stddev, CI all
+/// divide by [`MIB`]; `n` is unchanged).
+fn mib_stat(s: &TrialStats) -> TrialStats {
+    TrialStats {
+        mean: s.mean / MIB,
+        median: s.median / MIB,
+        stddev: s.stddev / MIB,
+        ci95_halfwidth: s.ci95_halfwidth / MIB,
+        n: s.n,
+    }
 }
 
 /// Format the optional measured manager CPU% (H5); `n/a` when unmeasured.
@@ -450,6 +548,7 @@ mod tests {
             &[t1, t2],
             1000,
             Some(1.23),
+            &[],
         );
         assert_eq!(s.trials, 2);
         assert_eq!(s.peak_total_mib.n, 2);
@@ -522,6 +621,100 @@ mod tests {
         assert!(md.contains("![Footprint over time](footprint-over-time.svg)"));
         assert!(md.contains("✅ pass"));
         assert!(md.contains("⚪ skipped"));
+    }
+
+    #[test]
+    fn cleanup_summary_aggregates_present_trials_only() {
+        let full = CleanupResult {
+            owned_procs: 6,
+            leaked_procs: 0,
+            leaked_bytes: 0,
+            cleanup_fraction: Some(1.0),
+        };
+        let leaky = CleanupResult {
+            owned_procs: 6,
+            leaked_procs: 3,
+            leaked_bytes: 3 * MIB as u64,
+            cleanup_fraction: Some(0.5),
+        };
+        // A `None` trial (nothing owned) is ignored, not averaged in as a zero.
+        let summary = CleanupSummary::from_trials(&[Some(full), None, Some(leaky)]).unwrap();
+        assert_eq!(summary.owned_procs.n, 2);
+        assert!((summary.owned_procs.mean - 6.0).abs() < 1e-9);
+        assert!((summary.leaked_procs.mean - 1.5).abs() < 1e-9);
+        assert!((summary.reclaimed_fraction.mean - 0.75).abs() < 1e-9);
+        // Leaked bytes mean is (0 + 3 MiB) / 2 = 1.5 MiB.
+        assert!((summary.leaked_bytes.mean - 1.5 * MIB).abs() < 1.0);
+
+        // No cleanup data at all → None (n/a, never a fabricated row).
+        assert!(CleanupSummary::from_trials(&[None, None]).is_none());
+        assert!(CleanupSummary::from_trials(&[]).is_none());
+    }
+
+    #[test]
+    fn markdown_renders_cleanup_table_when_present() {
+        let ts = TimeSeries::new(vec![rec(0, (50.0 * MIB) as u64, (5.0 * MIB) as u64)]);
+        // raw-baseline leaks 1 of 2 owned; memmux reclaims all 2.
+        let raw_cleanup = vec![Some(CleanupResult {
+            owned_procs: 2,
+            leaked_procs: 1,
+            leaked_bytes: 30 * MIB as u64,
+            cleanup_fraction: Some(0.5),
+        })];
+        let mmx_cleanup = vec![Some(CleanupResult {
+            owned_procs: 2,
+            leaked_procs: 0,
+            leaked_bytes: 0,
+            cleanup_fraction: Some(1.0),
+        })];
+        let summaries = vec![
+            RunSummary::from_trials(
+                "raw-baseline",
+                "raw (direct spawn)",
+                "hold",
+                std::slice::from_ref(&ts),
+                1000,
+                None,
+                &raw_cleanup,
+            ),
+            RunSummary::from_trials(
+                "memmux",
+                "memmux 0.0.0",
+                "hold",
+                std::slice::from_ref(&ts),
+                1000,
+                None,
+                &mmx_cleanup,
+            ),
+        ];
+        let meta = ReportMeta {
+            measured_at_utc: "2026-08-10 00:00:00Z".into(),
+            host_os: "macos".into(),
+            launcher_versions: vec![],
+        };
+        let md = render_markdown("t", &summaries, &[], &meta, &[], &[]);
+        assert!(md.contains("## Cleanup on teardown (H2)"));
+        assert!(md.contains("Reclaimed %"));
+        // The honest differentiator: raw reclaims 50%, memmux reclaims 100%.
+        assert!(md.contains("50.0%"));
+        assert!(md.contains("100.0%"));
+        // Caption cites the 10s grace window.
+        assert!(md.contains("10s"));
+    }
+
+    #[test]
+    fn markdown_omits_cleanup_table_when_no_data() {
+        let ts = TimeSeries::new(vec![rec(0, (50.0 * MIB) as u64, 0)]);
+        let summaries = vec![RunSummary::from_series(
+            "raw-baseline",
+            "raw",
+            "burst",
+            &ts,
+            1000,
+        )];
+        let meta = ReportMeta::default();
+        let md = render_markdown("t", &summaries, &[], &meta, &[], &[]);
+        assert!(!md.contains("## Cleanup on teardown"));
     }
 
     #[test]

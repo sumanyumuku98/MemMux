@@ -42,7 +42,7 @@ enum Command {
     },
     /// Run the benchmark across all available launchers and emit a report.
     Run {
-        /// Scenario to run (`all`, `burst`, `soak`, `idle`, `leak`).
+        /// Scenario to run (`all`, `burst`, `soak`, `idle`, `leak`, `hold`).
         #[arg(long, default_value = "all")]
         scenario: String,
         /// Provider profile to emulate.
@@ -145,7 +145,8 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Scenarios => {
-            for s in Scenario::ALL {
+            // The four canonical scenarios plus the explicitly-selectable `hold` (not in `ALL`).
+            for s in Scenario::ALL.iter().copied().chain([Scenario::Hold]) {
                 println!("{:6}  {}", s.slug(), s.description());
             }
         }
@@ -192,6 +193,7 @@ fn parse_scenarios(s: &str) -> anyhow::Result<Vec<Scenario>> {
         "soak" => Scenario::Soak,
         "idle" => Scenario::Idle,
         "leak" => Scenario::Leak,
+        "hold" => Scenario::Hold,
         other => anyhow::bail!("unknown scenario '{other}'"),
     };
     Ok(vec![scenario])

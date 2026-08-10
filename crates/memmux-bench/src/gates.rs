@@ -44,6 +44,9 @@ pub struct GateInputs {
     pub min_attributed_fraction: Option<f64>,
     /// Sampling overhead as a fraction of the sampling interval.
     pub sampling_overhead_fraction: Option<f64>,
+    /// Worst-case (minimum) teardown cleanup fraction across MemMux runs (SUM-165 / H2). `None`
+    /// when no cleanup data exists this run — the Cleanup gate then stays skipped.
+    pub min_cleanup_fraction: Option<f64>,
 }
 
 impl GateInputs {
@@ -58,6 +61,8 @@ impl GateInputs {
 
 const ATTRIBUTION_MIN: f64 = 0.95;
 const OVERHEAD_MAX: f64 = 0.02;
+/// Minimum teardown cleanup fraction for the Cleanup gate to pass (SUM-165 / H2).
+const CLEANUP_MIN: f64 = 0.995;
 
 /// Evaluate all launch gates against the measured inputs.
 pub fn evaluate_gates(inputs: &GateInputs) -> Vec<GateResult> {
@@ -126,14 +131,30 @@ pub fn evaluate_gates(inputs: &GateInputs) -> Vec<GateResult> {
         None => skipped("Sampling overhead", "no overhead measured this run"),
     });
 
-    // 4-7. Gates whose evidence arrives in later phases.
+    // 4. Cleanup (SUM-165 / H2): the whole owned agent subtree must be reclaimed within the grace
+    // window of MemMux's own normal teardown. MEASURED: pass iff the worst-case cleanup fraction
+    // across MemMux runs >= 99.5%. Skipped only when no cleanup data exists this run.
+    results.push(match inputs.min_cleanup_fraction {
+        Some(frac) => GateResult {
+            name: "Cleanup".into(),
+            status: if frac >= CLEANUP_MIN {
+                GateStatus::Pass
+            } else {
+                GateStatus::Fail
+            },
+            detail: format!(
+                "min reclaimed {:.2}% vs >= {:.1}%",
+                frac * 100.0,
+                CLEANUP_MIN * 100.0
+            ),
+        },
+        None => skipped("Cleanup", "no teardown cleanup measured this run"),
+    });
+
+    // 5-7. Gates whose evidence arrives in later phases.
     results.push(skipped(
         "No lost work",
         "fault-injection lifecycle trials arrive in Phase 2",
-    ));
-    results.push(skipped(
-        "Cleanup",
-        "recursive termination + reconciliation arrive in Phase 1",
     ));
     results.push(skipped(
         "Pressure avoidance",
@@ -203,6 +224,35 @@ mod tests {
             .find(|r| r.name == "Sampling overhead")
             .unwrap();
         assert_eq!(g.status, GateStatus::Fail);
+    }
+
+    #[test]
+    fn cleanup_gate_passes_at_or_above_threshold() {
+        let mut inputs = GateInputs::new();
+        inputs.min_cleanup_fraction = Some(1.0);
+        let results = evaluate_gates(&inputs);
+        let g = results.iter().find(|r| r.name == "Cleanup").unwrap();
+        assert_eq!(g.status, GateStatus::Pass);
+        assert!(g.detail.contains("100.00%"));
+    }
+
+    #[test]
+    fn cleanup_gate_fails_below_threshold() {
+        let mut inputs = GateInputs::new();
+        // A leak: some of the owned subtree survived teardown.
+        inputs.min_cleanup_fraction = Some(0.75);
+        let results = evaluate_gates(&inputs);
+        let g = results.iter().find(|r| r.name == "Cleanup").unwrap();
+        assert_eq!(g.status, GateStatus::Fail);
+        assert!(!all_measured_gates_pass(&results));
+    }
+
+    #[test]
+    fn cleanup_gate_skipped_without_data() {
+        let inputs = GateInputs::new();
+        let results = evaluate_gates(&inputs);
+        let g = results.iter().find(|r| r.name == "Cleanup").unwrap();
+        assert_eq!(g.status, GateStatus::Skipped);
     }
 
     #[test]
