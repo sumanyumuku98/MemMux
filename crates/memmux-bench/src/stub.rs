@@ -58,6 +58,27 @@ pub enum Step {
         /// How long the child lives, in milliseconds.
         hold_ms: u64,
     },
+    /// Inject an **escaped** process via a classic double-fork (SUM-166 / H3).
+    ///
+    /// Models an agent spawning a helper that then reparents away: this process forks an
+    /// *intermediate* child; the intermediate forks a *grandchild* that allocates a little memory
+    /// and sleeps for `hold_ms`; the intermediate stays alive for `settle_ms` (long enough for at
+    /// least one daemon sample tick to record the grandchild as a descendant of this task's root)
+    /// and then exits, so the grandchild **reparents to init** — alive but outside every task
+    /// subtree. MemMux surfaces that as a `process_escaped` event; tmux/herdr/raw have no such
+    /// concept and cannot detect it.
+    ///
+    /// This process does not wait on the grandchild (that is the whole point — the grandchild
+    /// outlives the agent's own view of it), but it *does* record the grandchild's pid so the
+    /// harness can independently confirm the reparent and reap the pid afterwards.
+    Orphan {
+        /// How long the intermediate stays alive before exiting (so ≥1 sample tick sees the
+        /// grandchild under the task), in milliseconds.
+        settle_ms: u64,
+        /// How long the escaped grandchild holds ~2 MiB resident after reparenting, in
+        /// milliseconds.
+        hold_ms: u64,
+    },
 }
 
 /// A named, provider-tagged deterministic session script.
@@ -178,6 +199,10 @@ impl SessionRecording {
                 // A child runs in its own process; it does not change *this* process's
                 // resident model. Its memory is observed live via the process tree.
                 Step::SpawnChild { .. } => {}
+                // The orphaned grandchild runs in its own (soon-to-be-reparented) process; it does
+                // not change *this* process's resident model. It is observed live via the process
+                // tree and, after it reparents, as a daemon `process_escaped` event.
+                Step::Orphan { .. } => {}
             }
             points.push(TrajectoryPoint {
                 step: i,
@@ -231,6 +256,15 @@ impl SessionRecording {
                         children.push(child);
                     }
                 }
+                Step::Orphan { settle_ms, hold_ms } => {
+                    // Spawn the intermediate and reap it in place: it lives for `settle_ms` then
+                    // exits, which reparents the grandchild it forked to init (the escape). We must
+                    // NOT wait on the grandchild — it is meant to outlive this agent's view of it.
+                    if let Some(mut intermediate) = spawn_orphan_intermediate(*settle_ms, *hold_ms)
+                    {
+                        let _ = intermediate.wait();
+                    }
+                }
             }
             peak = peak.max(ballast.resident_mib());
         }
@@ -265,6 +299,55 @@ pub fn run_child_worker(mib: u64, hold_ms: u64) {
     ballast.grow_mib(mib);
     std::thread::sleep(std::time::Duration::from_millis(hold_ms));
     drop(ballast);
+}
+
+/// Mebibytes the escaped grandchild holds resident so its RSS is non-trivial but small.
+pub const ORPHAN_GRANDCHILD_MIB: u64 = 2;
+
+/// Spawn the *intermediate* half of the double-fork (`stub-orphan` subcommand). Returns `None` if
+/// the executable path is unavailable, in which case the escape is simply not injected.
+fn spawn_orphan_intermediate(settle_ms: u64, hold_ms: u64) -> Option<std::process::Child> {
+    let exe = std::env::current_exe().ok()?;
+    std::process::Command::new(exe)
+        .arg("stub-orphan")
+        .arg("--settle-ms")
+        .arg(settle_ms.to_string())
+        .arg("--hold-ms")
+        .arg(hold_ms.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Run the *intermediate* half of the double-fork (`stub-orphan` subcommand).
+///
+/// Forks a detached grandchild (`stub-orphan-child`) that allocates [`ORPHAN_GRANDCHILD_MIB`] and
+/// sleeps for `hold_ms`, then stays alive for `settle_ms` and exits. The intermediate deliberately
+/// does **not** wait on the grandchild: when the intermediate exits, the still-alive grandchild
+/// reparents to init (pid 1) — that is the escape MemMux surfaces. Best-effort: a failed spawn
+/// just means no escape was injected for this agent.
+pub fn run_orphan_intermediate(settle_ms: u64, hold_ms: u64) {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .arg("stub-orphan-child")
+            .arg("--mib")
+            .arg(ORPHAN_GRANDCHILD_MIB.to_string())
+            .arg("--hold-ms")
+            .arg(hold_ms.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        // Intentionally NOT reaping the grandchild: it must outlive us and reparent to init.
+    }
+    std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+}
+
+/// Run the escaped-grandchild behaviour (`stub-orphan-child` subcommand): hold `mib` mebibytes for
+/// `hold_ms` then exit. Identical to [`run_child_worker`], but named distinctly so the harness can
+/// recognise an escaped process by its argv/name when confirming the reparent (SUM-166 / H3).
+pub fn run_orphan_child(mib: u64, hold_ms: u64) {
+    run_child_worker(mib, hold_ms);
 }
 
 /// A block of touched heap memory that is guaranteed to be resident.
@@ -360,6 +443,30 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         let back: SessionRecording = serde_json::from_str(&json).unwrap();
         assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn orphan_does_not_change_this_process_resident_model() {
+        // Only ever `.simulate()` Orphan in a unit test — `.execute()` spawns real processes and
+        // sleeps for `settle_ms`. The orphaned grandchild lives in its own process, so this
+        // process's modeled resident memory is unchanged and it is not a monotonic-growth leak.
+        let rec = SessionRecording::new("escape", Provider::Generic, 100)
+            .with(Step::Allocate { mib: 20 })
+            .with(Step::Orphan {
+                settle_ms: 2500,
+                hold_ms: 30_000,
+            })
+            .with(Step::Sleep { ms: 30_000 })
+            .with(Step::Free { mib: 20 });
+        let traj = rec.simulate();
+        // Allocate moved resident to 120 (peak); Orphan and Sleep leave it there; Free returns it
+        // to baseline. The orphaned grandchild's memory lives in its own process, not this model.
+        assert_eq!(traj.peak_resident_mib(), 120);
+        assert_eq!(traj.final_resident_mib(), 100);
+        assert!(
+            !traj.is_monotonic_growth(),
+            "escape must not look like a leak"
+        );
     }
 
     #[test]

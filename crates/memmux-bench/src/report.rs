@@ -5,6 +5,7 @@
 //! anywhere the harness runs and committed as text.
 
 use crate::cleanup::CleanupResult;
+use crate::escape::EscapeResult;
 use crate::gates::{GateResult, GateStatus};
 use crate::sampler::TimeSeries;
 use crate::stats::{summarize, TrialStats};
@@ -56,6 +57,56 @@ impl CleanupSummary {
             leaked_procs: summarize(&leaked),
             leaked_bytes: summarize(&bytes),
             reclaimed_fraction: summarize(&frac),
+        })
+    }
+}
+
+/// Aggregated escaped-process visibility statistics for one launcher × scenario (SUM-166 / H3).
+///
+/// Escape counts are fixed by construction (one injection per agent) and detection is
+/// deterministic, so this is not a distribution: the fields are the worst-case (min) confirmed /
+/// detected across trials, so a single flaky trial can only make the numbers *look worse*, never
+/// better. `detected` is `None` for launchers with no escape-detection mechanism (rendered
+/// *unsupported*, never a measured-looking `0`). This whole struct is `None` on a [`RunSummary`]
+/// when the scenario injected no escapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscapeSummary {
+    /// Escapes injected per trial (agents × escapes-per-agent).
+    pub injected: usize,
+    /// Worst-case (min across trials) independently-confirmed reparented escapes.
+    pub injected_confirmed: usize,
+    /// Worst-case (min across trials) launcher-detected escapes, or `None` when the launcher has no
+    /// escape-detection mechanism.
+    pub detected: Option<usize>,
+}
+
+impl EscapeSummary {
+    /// Aggregate the per-trial escape results, ignoring trials that produced no measurement.
+    ///
+    /// Returns `None` when no trial had escape data, so the report shows nothing for scenarios that
+    /// injected no escapes. Takes the min confirmed/detected across trials (worst case). `detected`
+    /// stays `None` iff every present trial reported `None` (the launcher is unsupported).
+    pub fn from_trials(trials: &[Option<EscapeResult>]) -> Option<Self> {
+        let present: Vec<&EscapeResult> = trials.iter().filter_map(|c| c.as_ref()).collect();
+        if present.is_empty() {
+            return None;
+        }
+        let injected = present.iter().map(|e| e.injected).max().unwrap_or(0);
+        let injected_confirmed = present
+            .iter()
+            .map(|e| e.injected_confirmed)
+            .min()
+            .unwrap_or(0);
+        // Detected is `Some` iff any present trial had a mechanism; then take the worst (min).
+        let detected = if present.iter().all(|e| e.detected.is_none()) {
+            None
+        } else {
+            present.iter().filter_map(|e| e.detected).min()
+        };
+        Some(Self {
+            injected,
+            injected_confirmed,
+            detected,
         })
     }
 }
@@ -128,6 +179,9 @@ pub struct RunSummary {
     /// Aggregated cleanup / leak-on-teardown stats (SUM-165 / H2); `None` when no trial owned any
     /// live agents at teardown (the "Cleanup on teardown" table then omits this launcher×scenario).
     pub cleanup: Option<CleanupSummary>,
+    /// Aggregated escaped-process visibility stats (SUM-166 / H3); `None` when the scenario injected
+    /// no escapes (the "Escaped-process detection" table then omits this launcher×scenario).
+    pub escape: Option<EscapeSummary>,
 }
 
 impl RunSummary {
@@ -147,6 +201,7 @@ impl RunSummary {
             interval_ms,
             None,
             &[],
+            &[],
         )
     }
 
@@ -156,8 +211,13 @@ impl RunSummary {
     /// `manager_cpu_pct` is the real measured manager-process CPU% for the run (SUM-164 / H5) when
     /// a manager pid could be sampled, else `None` (the report then falls back to the per-sample
     /// overhead proxy). `trial_cleanup` carries each trial's leak-on-teardown result (SUM-165 / H2),
-    /// aggregated into [`CleanupSummary`]. The representative scalar fields come from the first
-    /// trial.
+    /// aggregated into [`CleanupSummary`]. `trial_escape` carries each trial's escaped-process
+    /// visibility result (SUM-166 / H3), aggregated into [`EscapeSummary`]. The representative
+    /// scalar fields come from the first trial.
+    // Each argument is a distinct measurement axis for one launcher × scenario (identity, the K
+    // per-trial series, the sampling cadence, and the three per-trial measurement vectors); a
+    // parameter struct would only rename the same fields, so allow the arity here.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_trials(
         launcher: &str,
         version: &str,
@@ -166,6 +226,7 @@ impl RunSummary {
         interval_ms: u64,
         manager_cpu_pct: Option<f64>,
         trial_cleanup: &[Option<CleanupResult>],
+        trial_escape: &[Option<EscapeResult>],
     ) -> Self {
         let peak_total: Vec<f64> = trials
             .iter()
@@ -234,6 +295,7 @@ impl RunSummary {
             footprint_spark: sparkline(&footprint),
             trials: trials.len(),
             cleanup: CleanupSummary::from_trials(trial_cleanup),
+            escape: EscapeSummary::from_trials(trial_escape),
         }
     }
 }
@@ -349,6 +411,46 @@ normal teardown. `mean ±halfwidth` is over trials with cleanup data (± is the 
                 fmt_stat(&c.leaked_procs, 1),
                 fmt_stat(&mib_stat(&c.leaked_bytes), 1),
                 fmt_stat_pct(&c.reclaimed_fraction),
+            );
+        }
+    }
+
+    // Escaped-process detection (H3, SUM-166): one row per launcher×scenario that injected escapes.
+    let escape_rows: Vec<&RunSummary> = summaries.iter().filter(|s| s.escape.is_some()).collect();
+    if !escape_rows.is_empty() {
+        let _ = writeln!(out, "\n## Escaped-process detection (H3)\n");
+        let _ = writeln!(
+            out,
+            "_A process that reparents to init escapes its agent and silently leaks. MemMux's \
+daemon surfaces it as a `process_escaped` event; tmux/herdr/raw have no such concept, so their \
+detection is **unsupported** — an honest \"n/a — no such capability\", not a measured `0`. \
+\"Reparented (confirmed)\" is the harness's independent check that the injected process actually \
+left every agent subtree while still alive._\n"
+        );
+        let _ = writeln!(
+            out,
+            "| Launcher | Injected | Reparented (confirmed) | Detected | Notes |"
+        );
+        let _ = writeln!(out, "| --- | ---: | ---: | ---: | --- |");
+        for s in escape_rows {
+            let e = s.escape.expect("filtered to Some above");
+            let (detected, notes) = match e.detected {
+                Some(d) => (
+                    d.to_string(),
+                    format!(
+                        "detected {}/{} escaped process(es)",
+                        d, e.injected_confirmed
+                    ),
+                ),
+                None => (
+                    "n/a".to_string(),
+                    "unsupported (no escape-detection mechanism)".to_string(),
+                ),
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
+                s.launcher, e.injected, e.injected_confirmed, detected, notes,
             );
         }
     }
@@ -549,6 +651,7 @@ mod tests {
             1000,
             Some(1.23),
             &[],
+            &[],
         );
         assert_eq!(s.trials, 2);
         assert_eq!(s.peak_total_mib.n, 2);
@@ -676,6 +779,7 @@ mod tests {
                 1000,
                 None,
                 &raw_cleanup,
+                &[],
             ),
             RunSummary::from_trials(
                 "memmux",
@@ -685,6 +789,7 @@ mod tests {
                 1000,
                 None,
                 &mmx_cleanup,
+                &[],
             ),
         ];
         let meta = ReportMeta {
@@ -715,6 +820,99 @@ mod tests {
         let meta = ReportMeta::default();
         let md = render_markdown("t", &summaries, &[], &meta, &[], &[]);
         assert!(!md.contains("## Cleanup on teardown"));
+    }
+
+    #[test]
+    fn escape_summary_aggregates_and_marks_unsupported() {
+        // MemMux: two trials, one detects 2, one detects 1 → worst-case min 1; confirmed min 2.
+        let mmx = EscapeSummary::from_trials(&[
+            Some(EscapeResult {
+                injected: 2,
+                injected_confirmed: 2,
+                detected: Some(2),
+            }),
+            Some(EscapeResult {
+                injected: 2,
+                injected_confirmed: 2,
+                detected: Some(1),
+            }),
+        ])
+        .unwrap();
+        assert_eq!(mmx.injected, 2);
+        assert_eq!(mmx.injected_confirmed, 2);
+        assert_eq!(mmx.detected, Some(1));
+
+        // A baseline: injected/confirmed but no detection mechanism → detected stays None.
+        let raw = EscapeSummary::from_trials(&[Some(EscapeResult {
+            injected: 2,
+            injected_confirmed: 2,
+            detected: None,
+        })])
+        .unwrap();
+        assert_eq!(raw.detected, None);
+
+        // No escape data at all → None (n/a, table omits the row).
+        assert!(EscapeSummary::from_trials(&[None, None]).is_none());
+        assert!(EscapeSummary::from_trials(&[]).is_none());
+    }
+
+    #[test]
+    fn markdown_renders_escape_table_with_memmux_and_unsupported_baseline() {
+        let ts = TimeSeries::new(vec![rec(0, (50.0 * MIB) as u64, (5.0 * MIB) as u64)]);
+        // raw-baseline: injected+confirmed but cannot detect; memmux detects all.
+        let raw_escape = vec![Some(EscapeResult {
+            injected: 2,
+            injected_confirmed: 2,
+            detected: None,
+        })];
+        let mmx_escape = vec![Some(EscapeResult {
+            injected: 2,
+            injected_confirmed: 2,
+            detected: Some(2),
+        })];
+        let summaries = vec![
+            RunSummary::from_trials(
+                "raw-baseline",
+                "raw (direct spawn)",
+                "escape",
+                std::slice::from_ref(&ts),
+                1000,
+                None,
+                &[],
+                &raw_escape,
+            ),
+            RunSummary::from_trials(
+                "memmux",
+                "memmux 0.0.0",
+                "escape",
+                std::slice::from_ref(&ts),
+                1000,
+                None,
+                &[],
+                &mmx_escape,
+            ),
+        ];
+        let meta = ReportMeta::default();
+        let md = render_markdown("t", &summaries, &[], &meta, &[], &[]);
+        assert!(md.contains("## Escaped-process detection (H3)"));
+        assert!(md.contains("Reparented (confirmed)"));
+        // MemMux reports a real detection; the baseline is explicitly unsupported (not a `0`).
+        assert!(md.contains("detected 2/2 escaped process(es)"));
+        assert!(md.contains("unsupported (no escape-detection mechanism)"));
+    }
+
+    #[test]
+    fn markdown_omits_escape_table_when_no_data() {
+        let ts = TimeSeries::new(vec![rec(0, (50.0 * MIB) as u64, 0)]);
+        let summaries = vec![RunSummary::from_series(
+            "raw-baseline",
+            "raw",
+            "burst",
+            &ts,
+            1000,
+        )];
+        let md = render_markdown("t", &summaries, &[], &ReportMeta::default(), &[], &[]);
+        assert!(!md.contains("## Escaped-process detection"));
     }
 
     #[test]
