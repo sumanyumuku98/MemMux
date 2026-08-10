@@ -3,7 +3,7 @@
 //! SUM-27. Only compiled on Linux; the parsing logic it relies on lives in
 //! [`crate::platform::linux_parse`] and is tested on all hosts.
 
-use super::linux_parse::{parse_smaps_rollup_pss, parse_stat, parse_status_kb_field};
+use super::linux_parse::{parse_smaps_rollup, parse_stat, parse_status_kb_field, SmapsRollup};
 use crate::sample::{now_unix_ms, ProcessSample, ProcessSampler, Snapshot};
 use std::fs;
 use std::time::Instant;
@@ -36,10 +36,16 @@ impl LinuxSampler {
             .and_then(|s| parse_status_kb_field(&s, "VmRSS:"))
             .unwrap_or(0);
 
-        // PSS from smaps_rollup — may be denied for other users' processes.
-        let pss_bytes = fs::read_to_string(format!("{base}/smaps_rollup"))
+        // PSS / USS / swap from smaps_rollup — may be denied for other users' processes.
+        let rollup = fs::read_to_string(format!("{base}/smaps_rollup"))
             .ok()
-            .and_then(|s| parse_smaps_rollup_pss(&s));
+            .map(|s| parse_smaps_rollup(&s))
+            .unwrap_or_default();
+        let SmapsRollup {
+            pss_bytes,
+            uss_bytes,
+            swap_bytes,
+        } = rollup;
 
         Some(ProcessSample {
             pid: info.pid,
@@ -48,6 +54,10 @@ impl LinuxSampler {
             rss_bytes,
             pss_bytes,
             phys_footprint_bytes: None,
+            uss_bytes,
+            swap_bytes,
+            minflt: info.minflt,
+            majflt: info.majflt,
         })
     }
 }

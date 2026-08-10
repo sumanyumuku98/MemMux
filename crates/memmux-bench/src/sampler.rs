@@ -34,14 +34,10 @@ pub struct SampleAccounting {
     pub unknown_proc_count: usize,
 }
 
-/// Classify a process tree into provider vs. manager-overhead accounting for a topology.
-///
-/// The provider set is the union of every `agent_root` subtree. The manager set is the union of
-/// every `manager_pid` subtree with the provider set removed. Bytes use
-/// [`ProcessSample::accounted_bytes`](memmux_metrics::ProcessSample::accounted_bytes) so shared
-/// pages are not double-counted. Pids not present in the live tree are ignored.
-pub fn classify(tree: &ProcessTree, topology: &LaunchTopology) -> SampleAccounting {
-    // Provider pids: each agent root plus its descendants that actually exist in the tree.
+/// Partition a tree into provider (agent) pids and manager-only (multiplexer overhead) pids given
+/// a launch topology. A pid is **provider** iff it lies in some agent-root subtree; **manager** iff
+/// it lies in a manager-root subtree but is not a provider.
+fn partition(tree: &ProcessTree, topology: &LaunchTopology) -> (HashSet<Pid>, HashSet<Pid>) {
     let mut provider: HashSet<Pid> = HashSet::new();
     for &root in &topology.agent_roots {
         if tree.get(root).is_some() {
@@ -51,8 +47,6 @@ pub fn classify(tree: &ProcessTree, topology: &LaunchTopology) -> SampleAccounti
             provider.insert(d);
         }
     }
-
-    // Manager pids: each manager root plus its descendants, minus anything already a provider.
     let mut manager: HashSet<Pid> = HashSet::new();
     for &root in &topology.manager_pids {
         if tree.get(root).is_some() && !provider.contains(&root) {
@@ -64,7 +58,17 @@ pub fn classify(tree: &ProcessTree, topology: &LaunchTopology) -> SampleAccounti
             }
         }
     }
+    (provider, manager)
+}
 
+/// Classify a process tree into provider vs. manager-overhead accounting for a topology.
+///
+/// The provider set is the union of every `agent_root` subtree. The manager set is the union of
+/// every `manager_pid` subtree with the provider set removed. Bytes use
+/// [`ProcessSample::accounted_bytes`](memmux_metrics::ProcessSample::accounted_bytes) so shared
+/// pages are not double-counted. Pids not present in the live tree are ignored.
+pub fn classify(tree: &ProcessTree, topology: &LaunchTopology) -> SampleAccounting {
+    let (provider, manager) = partition(tree, topology);
     let sum = |pids: &HashSet<Pid>| -> u64 {
         pids.iter()
             .filter_map(|p| tree.get(*p))
@@ -82,6 +86,92 @@ pub fn classify(tree: &ProcessTree, topology: &LaunchTopology) -> SampleAccounti
         manager_proc_count: manager.len(),
         unknown_proc_count: 0,
     }
+}
+
+/// How a sampled process is tagged relative to the launch topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcTag {
+    /// An agent process (in some agent-root subtree).
+    Provider,
+    /// Multiplexer server/daemon overhead (in a manager-root subtree, not a provider).
+    Manager,
+}
+
+/// One tagged per-process row for the detailed `.procs.jsonl` time series (SUM-33): the full
+/// per-process memory breakdown (RSS/PSS/USS/swap) + page faults, labelled provider vs manager.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaggedProc {
+    /// Wall-clock time of the sample (ms since Unix epoch).
+    pub t_unix_ms: u64,
+    /// Milliseconds since sampling started.
+    pub elapsed_ms: u64,
+    /// Launcher under test.
+    pub launcher: String,
+    /// Scenario under test.
+    pub scenario: String,
+    /// Process id.
+    pub pid: Pid,
+    /// Parent process id.
+    pub ppid: Pid,
+    /// Command name.
+    pub name: String,
+    /// Provider (agent) or manager (overhead).
+    pub tag: ProcTag,
+    /// Resident set size, bytes.
+    pub rss_bytes: u64,
+    /// Proportional set size, bytes (Linux).
+    pub pss_bytes: Option<u64>,
+    /// Unique set size, bytes (Linux).
+    pub uss_bytes: Option<u64>,
+    /// Swapped-out bytes (Linux).
+    pub swap_bytes: Option<u64>,
+    /// Minor page faults (cumulative).
+    pub minflt: Option<u64>,
+    /// Major page faults (cumulative) — the I/O-backed thrashing signal.
+    pub majflt: Option<u64>,
+}
+
+/// Build tagged per-process rows for one sample: every managed (provider or manager) process with
+/// its full memory + fault breakdown, for the detailed per-process time series (SUM-33).
+pub fn tagged_processes(
+    tree: &ProcessTree,
+    topology: &LaunchTopology,
+    launcher: &str,
+    scenario: &str,
+    t_unix_ms: u64,
+    elapsed_ms: u64,
+) -> Vec<TaggedProc> {
+    let (provider, manager) = partition(tree, topology);
+    let mut rows: Vec<TaggedProc> = Vec::with_capacity(provider.len() + manager.len());
+    let mut push = |pid: &Pid, tag: ProcTag| {
+        if let Some(s) = tree.get(*pid) {
+            rows.push(TaggedProc {
+                t_unix_ms,
+                elapsed_ms,
+                launcher: launcher.to_string(),
+                scenario: scenario.to_string(),
+                pid: s.pid,
+                ppid: s.ppid,
+                name: s.name.clone(),
+                tag,
+                rss_bytes: s.rss_bytes,
+                pss_bytes: s.pss_bytes,
+                uss_bytes: s.uss_bytes,
+                swap_bytes: s.swap_bytes,
+                minflt: s.minflt,
+                majflt: s.majflt,
+            });
+        }
+    };
+    for p in &provider {
+        push(p, ProcTag::Provider);
+    }
+    for p in &manager {
+        push(p, ProcTag::Manager);
+    }
+    rows.sort_by_key(|r| r.pid);
+    rows
 }
 
 /// A single row of the sampled time series.
@@ -473,6 +563,16 @@ impl TimeSeries {
     }
 }
 
+/// Write tagged per-process rows as JSON Lines to `path` (SUM-33 detailed per-process series).
+pub fn write_tagged_processes_jsonl(path: &Path, rows: &[TaggedProc]) -> io::Result<()> {
+    let mut file = io::BufWriter::new(std::fs::File::create(path)?);
+    for row in rows {
+        serde_json::to_writer(&mut file, row)?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +587,10 @@ mod tests {
             rss_bytes: rss,
             pss_bytes: None,
             phys_footprint_bytes: None,
+            uss_bytes: None,
+            swap_bytes: None,
+            minflt: None,
+            majflt: None,
         }
     }
 
@@ -660,5 +764,40 @@ mod tests {
         assert_eq!(acct.total_bytes, 1600);
         assert_eq!(acct.provider_proc_count, 2);
         assert_eq!(acct.manager_proc_count, 1);
+    }
+
+    #[test]
+    fn tagged_processes_tags_and_carries_per_process_fields() {
+        // Manager 900 (server) + one provider child 100 carrying USS/swap/faults; 999 unrelated.
+        let child = ProcessSample {
+            pid: 100,
+            ppid: 900,
+            name: "agent".into(),
+            rss_bytes: 500,
+            pss_bytes: Some(420),
+            phys_footprint_bytes: None,
+            uss_bytes: Some(300),
+            swap_bytes: Some(64),
+            minflt: Some(10),
+            majflt: Some(2),
+        };
+        let tree = ProcessTree::from_samples(vec![sample(900, 1, 700), child, sample(999, 1, 42)]);
+        let topo = LaunchTopology {
+            manager_pids: vec![900],
+            agent_roots: vec![100],
+        };
+        let rows = tagged_processes(&tree, &topo, "memmux", "burst", 1_000, 5);
+        // Only the two managed pids are rows (999 excluded); sorted by pid.
+        assert_eq!(
+            rows.iter().map(|r| r.pid).collect::<Vec<_>>(),
+            vec![100, 900]
+        );
+        let agent = rows.iter().find(|r| r.pid == 100).unwrap();
+        assert_eq!(agent.tag, ProcTag::Provider);
+        assert_eq!(agent.uss_bytes, Some(300));
+        assert_eq!(agent.swap_bytes, Some(64));
+        assert_eq!(agent.majflt, Some(2));
+        let server = rows.iter().find(|r| r.pid == 900).unwrap();
+        assert_eq!(server.tag, ProcTag::Manager);
     }
 }

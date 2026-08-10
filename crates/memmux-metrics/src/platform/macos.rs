@@ -82,6 +82,12 @@ impl MacosSampler {
             rss_bytes: info.ptinfo.pti_resident_size,
             pss_bytes: None,
             phys_footprint_bytes,
+            // USS / swap / faults are Linux-first (the reference bench host); macOS reports them as
+            // best-effort `None` here — `phys_footprint` already gives the proportional metric (SUM-33).
+            uss_bytes: None,
+            swap_bytes: None,
+            minflt: None,
+            majflt: None,
         })
     }
 }

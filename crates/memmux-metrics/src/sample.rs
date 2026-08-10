@@ -24,6 +24,20 @@ pub struct ProcessSample {
     pub pss_bytes: Option<u64>,
     /// Physical footprint (macOS), in bytes.
     pub phys_footprint_bytes: Option<u64>,
+    /// Unique set size — private (unshared) resident bytes (Linux `smaps_rollup`
+    /// `Private_Clean+Private_Dirty`). `None` where the platform can't report it cheaply. (SUM-33)
+    #[serde(default)]
+    pub uss_bytes: Option<u64>,
+    /// Bytes of this process paged out to swap (Linux `smaps_rollup` `Swap:`). A rising
+    /// per-process value is a direct thrashing signal for the pressure claims. (SUM-33)
+    #[serde(default)]
+    pub swap_bytes: Option<u64>,
+    /// Minor page faults so far (no I/O; Linux `stat` field 10). (SUM-33)
+    #[serde(default)]
+    pub minflt: Option<u64>,
+    /// Major page faults so far (backed by I/O — the thrashing signal; Linux `stat` field 12). (SUM-33)
+    #[serde(default)]
+    pub majflt: Option<u64>,
 }
 
 impl ProcessSample {
@@ -93,6 +107,10 @@ mod tests {
             rss_bytes: rss,
             pss_bytes: pss,
             phys_footprint_bytes: phys,
+            uss_bytes: None,
+            swap_bytes: None,
+            minflt: None,
+            majflt: None,
         }
     }
 
