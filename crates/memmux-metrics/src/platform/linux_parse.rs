@@ -86,24 +86,6 @@ pub fn parse_status_kb_field(content: &str, field: &str) -> Option<u64> {
     None
 }
 
-/// Parse the `Pss:` total from a `/proc/<pid>/smaps_rollup` file, returning **bytes**.
-///
-/// `smaps_rollup` has a single `Pss:` line, but we sum defensively in case a caller passes a
-/// full `smaps` file instead.
-pub fn parse_smaps_rollup_pss(content: &str) -> Option<u64> {
-    let mut total_kb: u64 = 0;
-    let mut found = false;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("Pss:") {
-            if let Ok(kb) = rest.trim().trim_end_matches("kB").trim().parse::<u64>() {
-                total_kb += kb;
-                found = true;
-            }
-        }
-    }
-    found.then_some(total_kb * 1024)
-}
-
 /// Parse PSS, USS (`Private_Clean+Private_Dirty`), and `Swap:` from a `/proc/<pid>/smaps_rollup`
 /// file, all in **bytes**. Each field is `None` if its line is absent (so a caller can tell
 /// "not reported" from "zero"). Values are summed defensively in case a full `smaps` is passed.
@@ -253,15 +235,12 @@ SwapFree:        6000000 kB
     }
 
     #[test]
-    fn parse_smaps_rollup_single_pss() {
+    fn parse_smaps_rollup_single_and_summed_pss() {
         let rollup = "55f0-55f9 ---p 00000000 00:00 0 [rollup]\nRss:  4096 kB\nPss:  1536 kB\n";
-        assert_eq!(parse_smaps_rollup_pss(rollup), Some(1536 * 1024));
-    }
-
-    #[test]
-    fn parse_smaps_rollup_sums_multiple_pss() {
+        assert_eq!(parse_smaps_rollup(rollup).pss_bytes, Some(1536 * 1024));
+        // Defensive summing if a full `smaps` (multiple Pss lines) is passed.
         let smaps = "Pss:  100 kB\nother\nPss:  200 kB\n";
-        assert_eq!(parse_smaps_rollup_pss(smaps), Some(300 * 1024));
-        assert_eq!(parse_smaps_rollup_pss("no pss here"), None);
+        assert_eq!(parse_smaps_rollup(smaps).pss_bytes, Some(300 * 1024));
+        assert_eq!(parse_smaps_rollup("no pss here").pss_bytes, None);
     }
 }
