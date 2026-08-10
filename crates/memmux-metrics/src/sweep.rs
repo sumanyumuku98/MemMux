@@ -88,6 +88,10 @@ mod tests {
             rss_bytes: rss,
             pss_bytes: None,
             phys_footprint_bytes: None,
+            uss_bytes: None,
+            swap_bytes: None,
+            minflt: None,
+            majflt: None,
         }
     }
 

@@ -17,6 +17,21 @@ pub struct StatInfo {
     pub state: char,
     /// The parent process id.
     pub ppid: Pid,
+    /// Minor faults (`stat` field 10) — cumulative; `None` if the field was absent/unparsable.
+    pub minflt: Option<u64>,
+    /// Major faults (`stat` field 12) — cumulative; the I/O-backed thrashing signal.
+    pub majflt: Option<u64>,
+}
+
+/// Memory fields extracted from a `/proc/<pid>/smaps_rollup` file, in **bytes**.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SmapsRollup {
+    /// Proportional set size (`Pss:`).
+    pub pss_bytes: Option<u64>,
+    /// Unique set size = `Private_Clean` + `Private_Dirty`.
+    pub uss_bytes: Option<u64>,
+    /// Swapped-out bytes (`Swap:`).
+    pub swap_bytes: Option<u64>,
 }
 
 impl StatInfo {
@@ -41,14 +56,20 @@ pub fn parse_stat(content: &str) -> Option<StatInfo> {
     let pid: Pid = content[..open].trim().parse().ok()?;
     let comm = content[open + 1..close].to_string();
     let rest = content[close + 1..].trim();
-    let mut fields = rest.split_whitespace();
-    let state = fields.next()?.chars().next()?;
-    let ppid: Pid = fields.next()?.parse().ok()?;
+    // Fields after `comm`, 0-indexed: 0=state, 1=ppid, …, 7=minflt, 9=majflt (these are `stat`
+    // fields 3, 4, 10, 12 respectively).
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let state = fields.first()?.chars().next()?;
+    let ppid: Pid = fields.get(1)?.parse().ok()?;
+    let minflt = fields.get(7).and_then(|f| f.parse::<u64>().ok());
+    let majflt = fields.get(9).and_then(|f| f.parse::<u64>().ok());
     Some(StatInfo {
         pid,
         comm,
         state,
         ppid,
+        minflt,
+        majflt,
     })
 }
 
@@ -81,6 +102,38 @@ pub fn parse_smaps_rollup_pss(content: &str) -> Option<u64> {
         }
     }
     found.then_some(total_kb * 1024)
+}
+
+/// Parse PSS, USS (`Private_Clean+Private_Dirty`), and `Swap:` from a `/proc/<pid>/smaps_rollup`
+/// file, all in **bytes**. Each field is `None` if its line is absent (so a caller can tell
+/// "not reported" from "zero"). Values are summed defensively in case a full `smaps` is passed.
+pub fn parse_smaps_rollup(content: &str) -> SmapsRollup {
+    let mut pss_kb: Option<u64> = None;
+    let mut private_kb: Option<u64> = None;
+    let mut swap_kb: Option<u64> = None;
+    let add = |slot: &mut Option<u64>, rest: &str| {
+        if let Ok(kb) = rest.trim().trim_end_matches("kB").trim().parse::<u64>() {
+            *slot = Some(slot.unwrap_or(0) + kb);
+        }
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("Pss:") {
+            add(&mut pss_kb, rest);
+        } else if let Some(rest) = line.strip_prefix("Private_Clean:") {
+            add(&mut private_kb, rest);
+        } else if let Some(rest) = line.strip_prefix("Private_Dirty:") {
+            add(&mut private_kb, rest);
+        } else if let Some(rest) = line.strip_prefix("Swap:") {
+            // Guard against `SwapPss:` also starting with "Swap" — strip_prefix("Swap:") already
+            // requires the colon, so `SwapPss:` does not match. Good.
+            add(&mut swap_kb, rest);
+        }
+    }
+    SmapsRollup {
+        pss_bytes: pss_kb.map(|kb| kb * 1024),
+        uss_bytes: private_kb.map(|kb| kb * 1024),
+        swap_bytes: swap_kb.map(|kb| kb * 1024),
+    }
 }
 
 /// Parse currently-used swap in **bytes** from `/proc/meminfo` (`SwapTotal - SwapFree`).
@@ -137,6 +190,40 @@ mod tests {
     fn parse_stat_rejects_garbage() {
         assert!(parse_stat("not a stat line").is_none());
         assert!(parse_stat("").is_none());
+    }
+
+    #[test]
+    fn parse_stat_extracts_page_faults() {
+        // stat field layout after comm: state(3) ppid(4) pgrp(5) session(6) tty(7) tpgid(8)
+        // flags(9) minflt(10) cminflt(11) majflt(12) cmajflt(13) ...
+        let line = "1234 (bash) S 1000 1234 1234 0 -1 4194304 111 0 22 0 0 0";
+        let info = parse_stat(line).unwrap();
+        assert_eq!(info.minflt, Some(111));
+        assert_eq!(info.majflt, Some(22));
+    }
+
+    #[test]
+    fn parse_smaps_rollup_pss_uss_swap() {
+        let rollup = "\
+Rss:               20000 kB
+Pss:               12000 kB
+Private_Clean:      3000 kB
+Private_Dirty:      5000 kB
+Swap:                800 kB
+SwapPss:             400 kB
+";
+        let r = parse_smaps_rollup(rollup);
+        assert_eq!(r.pss_bytes, Some(12000 * 1024));
+        // USS = Private_Clean + Private_Dirty = 8000 kB.
+        assert_eq!(r.uss_bytes, Some(8000 * 1024));
+        // `Swap:` only (not `SwapPss:`).
+        assert_eq!(r.swap_bytes, Some(800 * 1024));
+    }
+
+    #[test]
+    fn parse_smaps_rollup_absent_fields_are_none() {
+        let r = parse_smaps_rollup("Rss: 100 kB\n");
+        assert_eq!(r, SmapsRollup::default());
     }
 
     #[test]

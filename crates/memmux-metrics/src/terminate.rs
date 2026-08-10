@@ -177,6 +177,10 @@ mod tests {
             rss_bytes: 0,
             pss_bytes: None,
             phys_footprint_bytes: None,
+            uss_bytes: None,
+            swap_bytes: None,
+            minflt: None,
+            majflt: None,
         }
     }
 

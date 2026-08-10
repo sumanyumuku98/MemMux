@@ -7,10 +7,12 @@
 use crate::gates::{evaluate_gates, GateInputs, GateResult};
 use crate::launcher::{LaunchSpec, Launcher, LauncherKind};
 use crate::report::{render_markdown, ReportMeta, RunSummary};
-use crate::sampler::{sample_once_topology, TimeSeries};
+use crate::sampler::{
+    tagged_processes, write_tagged_processes_jsonl, TaggedProc, TimeSeries, TimeSeriesRecord,
+};
 use crate::scenario::Scenario;
 use memmux_core::Provider;
-use memmux_metrics::default_sampler;
+use memmux_metrics::{default_sampler, ProcessTree};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -121,17 +123,28 @@ pub fn run_launcher_scenario(
 
     let started = Instant::now();
     let mut records = Vec::new();
+    let mut proc_rows: Vec<TaggedProc> = Vec::new();
     loop {
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        if let Ok(record) = sample_once_topology(
-            sampler.as_ref(),
-            session.topology(),
-            launcher.name(),
-            &version,
-            scenario.slug(),
-            elapsed_ms,
-        ) {
-            records.push(record);
+        // One snapshot per tick feeds both the aggregate record and the per-process rows (SUM-33).
+        if let Ok(snapshot) = sampler.snapshot() {
+            let tree = ProcessTree::from_samples(snapshot.samples.clone());
+            records.push(TimeSeriesRecord::from_snapshot_topology(
+                &snapshot,
+                session.topology(),
+                launcher.name(),
+                &version,
+                scenario.slug(),
+                elapsed_ms,
+            ));
+            proc_rows.extend(tagged_processes(
+                &tree,
+                session.topology(),
+                launcher.name(),
+                scenario.slug(),
+                snapshot.taken_at_unix_ms,
+                elapsed_ms,
+            ));
         }
 
         if records.len() >= cfg.max_samples {
@@ -146,6 +159,16 @@ pub fn run_launcher_scenario(
 
     // Tear the whole session down so we never leak processes (§2.4 "own what you launch").
     session.stop();
+
+    // Persist the detailed per-process tagged rows next to the aggregate series (SUM-33).
+    if !proc_rows.is_empty() {
+        let procs_path = cfg.workdir.join(format!(
+            "{}-{}.procs.jsonl",
+            launcher.name(),
+            scenario.slug()
+        ));
+        write_tagged_processes_jsonl(&procs_path, &proc_rows)?;
+    }
     Ok(TimeSeries::new(records))
 }
 
