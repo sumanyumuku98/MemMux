@@ -118,6 +118,27 @@ pub fn parse_smaps_rollup(content: &str) -> SmapsRollup {
     }
 }
 
+/// Parse cumulative CPU jiffies from `/proc/<pid>/stat`: `(utime, stime)` in clock ticks.
+///
+/// `utime` is `stat` field 14 and `stime` is field 15 (both cumulative, in clock ticks). After
+/// the `comm` field the remaining fields are space-separated and 0-indexed here: index 11 is
+/// `utime` (field 14) and index 12 is `stime` (field 15). `comm` is delimited by the first `(`
+/// and the *last* `)` because it may itself contain spaces/parens. Returns `None` if the line is
+/// malformed or either field is absent/unparsable; the caller divides by `sysconf(_SC_CLK_TCK)`
+/// to convert ticks to seconds.
+pub fn parse_stat_cpu_ticks(content: &str) -> Option<(u64, u64)> {
+    let open = content.find('(')?;
+    let close = content.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let rest = content[close + 1..].trim();
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    Some((utime, stime))
+}
+
 /// Parse currently-used swap in **bytes** from `/proc/meminfo` (`SwapTotal - SwapFree`).
 ///
 /// Both fields are in kiB. Returns `None` only if either line is absent; a system with swap
@@ -206,6 +227,33 @@ SwapPss:             400 kB
     fn parse_smaps_rollup_absent_fields_are_none() {
         let r = parse_smaps_rollup("Rss: 100 kB\n");
         assert_eq!(r, SmapsRollup::default());
+    }
+
+    #[test]
+    fn parse_stat_cpu_ticks_reads_utime_and_stime() {
+        // stat field layout after comm: state(3) ppid(4) pgrp(5) session(6) tty(7) tpgid(8)
+        // flags(9) minflt(10) cminflt(11) majflt(12) cmajflt(13) utime(14) stime(15) ...
+        // 0-indexed after comm: idx 11 = utime (field 14), idx 12 = stime (field 15).
+        let line = "1234 (bash) S 1000 1234 1234 0 -1 4194304 111 0 22 0 500 250 0 0 20 0 1 0 100";
+        let (utime, stime) = parse_stat_cpu_ticks(line).unwrap();
+        assert_eq!(utime, 500);
+        assert_eq!(stime, 250);
+    }
+
+    #[test]
+    fn parse_stat_cpu_ticks_handles_comm_with_spaces_and_parens() {
+        let line = "42 (a (weird) name) R 7 42 42 0 -1 0 3 0 9 0 700 300 0 0 20 0 1 0 5";
+        let (utime, stime) = parse_stat_cpu_ticks(line).unwrap();
+        assert_eq!(utime, 700);
+        assert_eq!(stime, 300);
+    }
+
+    #[test]
+    fn parse_stat_cpu_ticks_rejects_short_or_garbage() {
+        assert!(parse_stat_cpu_ticks("not a stat line").is_none());
+        assert!(parse_stat_cpu_ticks("").is_none());
+        // Present comm but too few trailing fields to reach utime/stime.
+        assert!(parse_stat_cpu_ticks("1 (x) S 0 0 0 0 0 0 0 0 0").is_none());
     }
 
     #[test]

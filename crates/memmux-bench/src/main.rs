@@ -60,6 +60,9 @@ enum Command {
         /// Number of identical stub agents to launch per launcher.
         #[arg(long, default_value_t = 3)]
         agents: usize,
+        /// Number of repeated trials per (launcher, scenario) for mean/CI statistics (SUM-162).
+        #[arg(long, default_value_t = 1)]
+        trials: usize,
         /// Also list competitor launchers (dmux/cmux/agentmux) — currently always skipped.
         #[arg(long, default_value_t = false)]
         include_competitors: bool,
@@ -99,6 +102,7 @@ fn main() -> anyhow::Result<()> {
             interval_ms,
             max_samples,
             agents,
+            trials,
             include_competitors,
             out,
         } => {
@@ -110,6 +114,7 @@ fn main() -> anyhow::Result<()> {
                 interval_ms,
                 max_samples,
                 agents,
+                trials,
                 bench_exe: std::env::current_exe()?,
                 workdir: out.clone(),
             };

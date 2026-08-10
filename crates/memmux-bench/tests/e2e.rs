@@ -32,6 +32,7 @@ fn short_cfg(dir: PathBuf, agents: usize) -> RunConfig {
         interval_ms: 30,
         max_samples: 5,
         agents,
+        trials: 1,
         bench_exe: bench_exe(),
         workdir: dir,
     }
@@ -139,9 +140,12 @@ fn benchmark_report_has_total_and_manager_columns_plus_metadata() {
         .iter()
         .find(|s| s.launcher == "raw-baseline")
         .expect("raw-baseline must always run");
-    assert!(raw.peak_total_mib > 0.0, "raw total footprint was zero");
+    assert!(
+        raw.peak_total_mib.mean > 0.0,
+        "raw total footprint was zero"
+    );
     assert_eq!(
-        raw.peak_manager_mib, 0.0,
+        raw.peak_manager_mib.mean, 0.0,
         "raw manager overhead must be zero"
     );
 

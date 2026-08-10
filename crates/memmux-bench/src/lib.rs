@@ -13,6 +13,8 @@
 //! * [`report`] — Markdown + sparkline report generator (SUM-37).
 //! * [`matrix`] — §18.2 test-matrix enumeration (SUM-39).
 //! * [`gates`] — §18.5 launch-gate checks (SUM-40).
+//! * [`stats`] — multi-trial descriptive statistics + 95% CI (SUM-162).
+//! * [`plot`] — dependency-free SVG line-chart figures (SUM-163).
 //! * [`run`] — live orchestration tying it together.
 
 #![forbid(unsafe_code)]
@@ -21,10 +23,12 @@
 pub mod gates;
 pub mod launcher;
 pub mod matrix;
+pub mod plot;
 pub mod report;
 pub mod run;
 pub mod sampler;
 pub mod scenario;
+pub mod stats;
 pub mod stub;
 
 pub use scenario::Scenario;

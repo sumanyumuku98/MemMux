@@ -6,6 +6,7 @@
 
 use crate::gates::{GateResult, GateStatus};
 use crate::sampler::TimeSeries;
+use crate::stats::{summarize, TrialStats};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +35,12 @@ impl ReportMeta {
     }
 }
 
-/// Per-run summary distilled from one launcher × scenario time series.
+/// Per-run summary distilled from one launcher × scenario, aggregated across K trials (SUM-162).
+///
+/// Each headline metric is a [`TrialStats`] over the K per-trial values (mean / median / sample
+/// stddev / 95% CI half-width). A single-trial run (K=1) yields stats with `n == 1` and zero
+/// spread, so the single-trial path stays coherent. Scalar fields (`mean_sample_us`, `samples`,
+/// `peak_procs`, `footprint_spark`) are taken from the first (representative) trial.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     /// Launcher name.
@@ -43,34 +49,39 @@ pub struct RunSummary {
     pub launcher_version: String,
     /// Scenario slug.
     pub scenario: String,
-    /// Peak tracked-subtree footprint, mebibytes.
+    /// Peak tracked-subtree footprint, mebibytes (representative trial).
     pub peak_root_mib: f64,
-    /// First→last growth of the tracked subtree, mebibytes.
+    /// First→last growth of the tracked subtree, mebibytes (representative trial).
     pub growth_mib: f64,
-    /// Peak **total** footprint (providers + manager overhead), mebibytes.
-    pub peak_total_mib: f64,
-    /// Steady-state (last-sample) **total** footprint, mebibytes.
-    pub steady_total_mib: f64,
-    /// Peak **manager overhead** (multiplexer server/daemon RSS), mebibytes.
-    pub peak_manager_mib: f64,
-    /// Steady-state (last-sample) **manager overhead**, mebibytes.
-    pub steady_manager_mib: f64,
-    /// Worst-case attributed fraction.
-    pub min_attributed_fraction: f64,
-    /// Mean per-sample cost, microseconds.
+    /// Peak **total** footprint (providers + manager overhead), mebibytes, across trials.
+    pub peak_total_mib: TrialStats,
+    /// Steady-state (last-sample) **total** footprint, mebibytes, across trials.
+    pub steady_total_mib: TrialStats,
+    /// Peak **manager overhead** (multiplexer server/daemon RSS), mebibytes, across trials.
+    pub peak_manager_mib: TrialStats,
+    /// Steady-state (last-sample) **manager overhead**, mebibytes, across trials.
+    pub steady_manager_mib: TrialStats,
+    /// Worst-case launched-tree attributed fraction across trials.
+    pub min_attributed_fraction: TrialStats,
+    /// Sampling overhead fraction at the run's interval, across trials.
+    pub overhead_fraction: TrialStats,
+    /// Measured manager-process CPU% over the run (H5), averaged across trials that could read
+    /// it. `None` when no launcher had a manager pid or CPU time was unreadable on this host.
+    pub manager_cpu_pct: Option<f64>,
+    /// Mean per-sample cost, microseconds (representative trial).
     pub mean_sample_us: f64,
-    /// Sampling overhead percent at the run's interval.
-    pub overhead_pct: f64,
-    /// Number of samples.
+    /// Number of samples (representative trial).
     pub samples: usize,
-    /// Peak number of processes in the launched tree.
+    /// Peak number of processes in the launched tree (representative trial).
     pub peak_procs: usize,
-    /// Sparkline of the total footprint over time.
+    /// Sparkline of the total footprint over time (representative trial).
     pub footprint_spark: String,
+    /// Number of trials aggregated (K).
+    pub trials: usize,
 }
 
 impl RunSummary {
-    /// Distill a time series into a summary at the given sampling interval.
+    /// Distill a single time series into a summary (the K=1 path); each metric stat has `n == 1`.
     pub fn from_series(
         launcher: &str,
         version: &str,
@@ -78,32 +89,96 @@ impl RunSummary {
         ts: &TimeSeries,
         interval_ms: u64,
     ) -> Self {
-        let footprint: Vec<f64> = ts
-            .records
+        Self::from_trials(
+            launcher,
+            version,
+            scenario,
+            std::slice::from_ref(ts),
+            interval_ms,
+            None,
+        )
+    }
+
+    /// Aggregate K per-trial time series into one summary, computing a [`TrialStats`] for each
+    /// headline metric from the K per-series values (SUM-162).
+    ///
+    /// `manager_cpu_pct` is the real measured manager-process CPU% for the run (SUM-164 / H5) when
+    /// a manager pid could be sampled, else `None` (the report then falls back to the per-sample
+    /// overhead proxy). The representative scalar fields come from the first trial.
+    pub fn from_trials(
+        launcher: &str,
+        version: &str,
+        scenario: &str,
+        trials: &[TimeSeries],
+        interval_ms: u64,
+        manager_cpu_pct: Option<f64>,
+    ) -> Self {
+        let peak_total: Vec<f64> = trials
             .iter()
-            .map(|r| r.total_bytes as f64 / MIB)
+            .map(|ts| ts.peak_total_bytes() as f64 / MIB)
             .collect();
+        let steady_total: Vec<f64> = trials
+            .iter()
+            .map(|ts| ts.steady_total_bytes() as f64 / MIB)
+            .collect();
+        let peak_manager: Vec<f64> = trials
+            .iter()
+            .map(|ts| ts.peak_manager_overhead_bytes() as f64 / MIB)
+            .collect();
+        let steady_manager: Vec<f64> = trials
+            .iter()
+            .map(|ts| ts.steady_manager_overhead_bytes() as f64 / MIB)
+            .collect();
+        // The launched-tree attribution is the meaningful metric (see sampler docs); an empty
+        // series is treated as fully attributed so it never drags the gate metric down.
+        let attributed: Vec<f64> = trials
+            .iter()
+            .map(|ts| {
+                if ts.is_empty() {
+                    1.0
+                } else {
+                    ts.min_tree_attributed_fraction()
+                }
+            })
+            .collect();
+        let overhead: Vec<f64> = trials
+            .iter()
+            .map(|ts| ts.overhead_fraction(interval_ms))
+            .collect();
+
+        // Representative (first) trial for scalar/shape fields.
+        let rep = trials.first();
+        let footprint: Vec<f64> = rep
+            .map(|ts| {
+                ts.records
+                    .iter()
+                    .map(|r| r.total_bytes as f64 / MIB)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             launcher: launcher.to_string(),
             launcher_version: version.to_string(),
             scenario: scenario.to_string(),
-            peak_root_mib: ts.peak_root_subtree_bytes() as f64 / MIB,
-            growth_mib: ts.root_subtree_growth_bytes() as f64 / MIB,
-            peak_total_mib: ts.peak_total_bytes() as f64 / MIB,
-            steady_total_mib: ts.steady_total_bytes() as f64 / MIB,
-            peak_manager_mib: ts.peak_manager_overhead_bytes() as f64 / MIB,
-            steady_manager_mib: ts.steady_manager_overhead_bytes() as f64 / MIB,
-            // The launched-tree attribution is the meaningful metric (see sampler docs).
-            min_attributed_fraction: if ts.is_empty() {
-                1.0
-            } else {
-                ts.min_tree_attributed_fraction()
-            },
-            mean_sample_us: ts.mean_sample_duration_us(),
-            overhead_pct: ts.overhead_fraction(interval_ms) * 100.0,
-            samples: ts.records.len(),
-            peak_procs: ts.peak_root_process_count(),
+            peak_root_mib: rep
+                .map(|ts| ts.peak_root_subtree_bytes() as f64 / MIB)
+                .unwrap_or(0.0),
+            growth_mib: rep
+                .map(|ts| ts.root_subtree_growth_bytes() as f64 / MIB)
+                .unwrap_or(0.0),
+            peak_total_mib: summarize(&peak_total),
+            steady_total_mib: summarize(&steady_total),
+            peak_manager_mib: summarize(&peak_manager),
+            steady_manager_mib: summarize(&steady_manager),
+            min_attributed_fraction: summarize(&attributed),
+            overhead_fraction: summarize(&overhead),
+            manager_cpu_pct,
+            mean_sample_us: rep.map(|ts| ts.mean_sample_duration_us()).unwrap_or(0.0),
+            samples: rep.map(|ts| ts.records.len()).unwrap_or(0),
+            peak_procs: rep.map(|ts| ts.peak_root_process_count()).unwrap_or(0),
             footprint_spark: sparkline(&footprint),
+            trials: trials.len(),
         }
     }
 }
@@ -120,6 +195,7 @@ pub fn render_markdown(
     gates: &[GateResult],
     meta: &ReportMeta,
     skipped: &[(String, String)],
+    figures: &[(String, String)],
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# {title}\n");
@@ -146,6 +222,8 @@ rather than estimated (§19.5)._\n"
 
     // Per-run table.
     let _ = writeln!(out, "## Runs\n");
+    // Report the max K across summaries so the ± note states the actual trial count.
+    let trials = summaries.iter().map(|s| s.trials).max().unwrap_or(1);
     let _ = writeln!(
         out,
         "_\"Total footprint\" is provider (agent) memory plus the multiplexer's own **manager \
@@ -154,30 +232,47 @@ launched process tree mapped back to the owning task._\n"
     );
     let _ = writeln!(
         out,
-        "| Launcher | Version | Scenario | Procs | Total peak MiB | Total steady MiB | Manager overhead peak MiB | Manager overhead steady MiB | Tree attributed | Mean sample (µs) | Overhead % | Samples | Footprint |"
+        "_Each `mean ±halfwidth` cell is the mean over **K = {trials}** trial(s); ± is the 95% \
+confidence-interval half-width (`1.96·σ/√n`, sample σ), so it is `0.0` for a single trial. \
+\"Manager CPU %\" is the measured CPU utilization of the multiplexer's manager process across \
+the run (H5); it is `n/a` when the launcher has no manager process or CPU time is unreadable on \
+this host._\n"
     );
     let _ = writeln!(
         out,
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        "| Launcher | Version | Scenario | Procs | Total peak MiB | Total steady MiB | Manager overhead peak MiB | Manager overhead steady MiB | Tree attributed | Mean sample (µs) | Overhead % | Manager CPU % | Samples | Footprint |"
+    );
+    let _ = writeln!(
+        out,
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
     );
     for s in summaries {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1}% | {:.0} | {:.3} | {} | `{}` |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | `{}` |",
             s.launcher,
             s.launcher_version,
             s.scenario,
             s.peak_procs,
-            s.peak_total_mib,
-            s.steady_total_mib,
-            s.peak_manager_mib,
-            s.steady_manager_mib,
-            s.min_attributed_fraction * 100.0,
+            fmt_stat(&s.peak_total_mib, 1),
+            fmt_stat(&s.steady_total_mib, 1),
+            fmt_stat(&s.peak_manager_mib, 1),
+            fmt_stat(&s.steady_manager_mib, 1),
+            fmt_stat_pct(&s.min_attributed_fraction),
             s.mean_sample_us,
-            s.overhead_pct,
+            fmt_stat_pct(&s.overhead_fraction),
+            fmt_cpu_pct(s.manager_cpu_pct),
             s.samples,
             s.footprint_spark,
         );
+    }
+
+    // Figures (embedded dependency-free SVG next to the report; SUM-163).
+    if !figures.is_empty() {
+        let _ = writeln!(out, "\n## Figures\n");
+        for (fig_title, file) in figures {
+            let _ = writeln!(out, "![{fig_title}]({file})\n");
+        }
     }
 
     // Skipped launchers.
@@ -205,6 +300,24 @@ launched process tree mapped back to the owning task._\n"
     }
 
     out
+}
+
+/// Format a metric [`TrialStats`] as `mean ±halfwidth` at `prec` decimal places (SUM-162).
+fn fmt_stat(s: &TrialStats, prec: usize) -> String {
+    format!("{:.*} ±{:.*}", prec, s.mean, prec, s.ci95_halfwidth)
+}
+
+/// Format a fractional metric [`TrialStats`] as a percentage `mean% ±halfwidth%`.
+fn fmt_stat_pct(s: &TrialStats) -> String {
+    format!("{:.1}% ±{:.1}", s.mean * 100.0, s.ci95_halfwidth * 100.0)
+}
+
+/// Format the optional measured manager CPU% (H5); `n/a` when unmeasured.
+fn fmt_cpu_pct(pct: Option<f64>) -> String {
+    match pct {
+        Some(p) => format!("{p:.3}%"),
+        None => "n/a".to_string(),
+    }
 }
 
 fn status_badge(status: GateStatus) -> &'static str {
@@ -313,12 +426,37 @@ mod tests {
             rec(100, (180.0 * MIB) as u64, (20.0 * MIB) as u64),
         ]);
         let s = RunSummary::from_series("memmux", "memmux 0.0.0", "leak", &ts, 1000);
-        assert!((s.peak_total_mib - 200.0).abs() < 0.5);
-        assert!((s.steady_total_mib - 200.0).abs() < 0.5);
-        assert!((s.peak_manager_mib - 20.0).abs() < 0.5);
-        assert!((s.steady_manager_mib - 20.0).abs() < 0.5);
+        // Single-trial: each metric stat has n == 1 and zero spread.
+        assert_eq!(s.trials, 1);
+        assert_eq!(s.peak_total_mib.n, 1);
+        assert!((s.peak_total_mib.mean - 200.0).abs() < 0.5);
+        assert_eq!(s.peak_total_mib.ci95_halfwidth, 0.0);
+        assert!((s.steady_total_mib.mean - 200.0).abs() < 0.5);
+        assert!((s.peak_manager_mib.mean - 20.0).abs() < 0.5);
+        assert!((s.steady_manager_mib.mean - 20.0).abs() < 0.5);
         assert_eq!(s.samples, 2);
         assert_eq!(s.footprint_spark.chars().count(), 2);
+    }
+
+    #[test]
+    fn from_trials_aggregates_across_k_series() {
+        // Two trials with different peak totals → mean stat with non-zero CI.
+        let t1 = TimeSeries::new(vec![rec(0, (100.0 * MIB) as u64, (10.0 * MIB) as u64)]);
+        let t2 = TimeSeries::new(vec![rec(0, (140.0 * MIB) as u64, (10.0 * MIB) as u64)]);
+        let s = RunSummary::from_trials(
+            "memmux",
+            "memmux 0.0.0",
+            "burst",
+            &[t1, t2],
+            1000,
+            Some(1.23),
+        );
+        assert_eq!(s.trials, 2);
+        assert_eq!(s.peak_total_mib.n, 2);
+        // Provider 100 + manager 10 = 110, and 140 + 10 = 150 → mean 130.
+        assert!((s.peak_total_mib.mean - 130.0).abs() < 0.5);
+        assert!(s.peak_total_mib.ci95_halfwidth > 0.0);
+        assert_eq!(s.manager_cpu_pct, Some(1.23));
     }
 
     #[test]
@@ -349,17 +487,39 @@ mod tests {
             launcher_versions: vec![("tmux".into(), "tmux 3.6a".into())],
         };
         let skipped = vec![("cmux".into(), "binary not available on this host".into())];
-        let md = render_markdown("MemMux benchmark", &summaries, &gates, &meta, &skipped);
+        let figures = vec![(
+            "Footprint over time".to_string(),
+            "footprint-over-time.svg".to_string(),
+        )];
+        let md = render_markdown(
+            "MemMux benchmark",
+            &summaries,
+            &gates,
+            &meta,
+            &skipped,
+            &figures,
+        );
         assert!(md.contains("## Runs"));
         assert!(md.contains("## Launch gates"));
         assert!(md.contains("raw-baseline"));
         assert!(md.contains("Total peak MiB"));
         assert!(md.contains("Manager overhead peak MiB"));
+        assert!(md.contains("Manager CPU %"));
+        // The ± CI note states the trial count K and the manager-CPU column semantics.
+        assert!(md.contains("95%"));
+        assert!(md.contains("K = 1"));
+        // A single-trial cell renders `mean ±0.0`.
+        assert!(md.contains("±0.0"));
+        // raw baseline has no manager pid → CPU cell is n/a.
+        assert!(md.contains("n/a"));
         assert!(md.contains("Measured (UTC)"));
         assert!(md.contains("2026-08-09"));
         assert!(md.contains("tmux 3.6a"));
         assert!(md.contains("## Skipped launchers"));
         assert!(md.contains("cmux"));
+        // The figures section references the embedded SVG.
+        assert!(md.contains("## Figures"));
+        assert!(md.contains("![Footprint over time](footprint-over-time.svg)"));
         assert!(md.contains("✅ pass"));
         assert!(md.contains("⚪ skipped"));
     }

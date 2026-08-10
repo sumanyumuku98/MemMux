@@ -6,14 +6,16 @@
 
 use crate::gates::{evaluate_gates, GateInputs, GateResult};
 use crate::launcher::{LaunchSpec, Launcher, LauncherKind};
+use crate::plot::{line_chart_svg, Series, PALETTE};
 use crate::report::{render_markdown, ReportMeta, RunSummary};
 use crate::sampler::{
     tagged_processes, write_tagged_processes_jsonl, TaggedProc, TimeSeries, TimeSeriesRecord,
 };
 use crate::scenario::Scenario;
+use memmux_core::ids::Pid;
 use memmux_core::Provider;
-use memmux_metrics::{default_sampler, ProcessTree};
-use std::path::PathBuf;
+use memmux_metrics::{default_sampler, process_cpu_seconds, ProcessTree};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
@@ -34,6 +36,8 @@ pub struct RunConfig {
     pub max_samples: usize,
     /// Number of identical stub agents to launch per launcher (default 3).
     pub agents: usize,
+    /// Number of repeated trials per (launcher, scenario) for statistics (default 1) (SUM-162).
+    pub trials: usize,
     /// Path to the `memmux-bench` binary (used to execute the stub).
     pub bench_exe: PathBuf,
     /// Directory for recordings and JSONL output.
@@ -48,13 +52,14 @@ impl Default for RunConfig {
             interval_ms: 100,
             max_samples: 20,
             agents: 3,
+            trials: 1,
             bench_exe: PathBuf::new(),
             workdir: PathBuf::from("bench-out"),
         }
     }
 }
 
-/// The result of running one launcher against one scenario.
+/// The result of running one launcher against one scenario across K trials.
 #[derive(Clone, Debug)]
 pub struct LauncherRun {
     /// Launcher name.
@@ -63,8 +68,14 @@ pub struct LauncherRun {
     pub version: String,
     /// Scenario.
     pub scenario: Scenario,
-    /// Sampled time series.
+    /// Representative sampled time series (trial 1), retained for backward-compatible accessors.
     pub series: TimeSeries,
+    /// All K per-trial time series (SUM-162).
+    pub trials: Vec<TimeSeries>,
+    /// All K per-trial tagged per-process row sets (trial 1 first), for the swap figure (SUM-163).
+    pub trial_proc_rows: Vec<Vec<TaggedProc>>,
+    /// Mean measured manager CPU% across the trials that could read it (SUM-164 / H5), or `None`.
+    pub manager_cpu_pct: Option<f64>,
 }
 
 /// Aggregate result of a benchmark across launchers and scenarios.
@@ -80,10 +91,13 @@ pub struct BenchOutcome {
     pub skipped: Vec<(String, String)>,
     /// Report metadata (measurement time, host OS, per-launcher versions).
     pub meta: ReportMeta,
+    /// Generated figures as `(title, relative_svg_filename)` pairs, referenced from the report
+    /// (SUM-163). Empty when no figure could be produced.
+    pub figures: Vec<(String, String)>,
 }
 
 impl BenchOutcome {
-    /// Render the outcome as a Markdown report.
+    /// Render the outcome as a Markdown report, embedding references to the generated SVG figures.
     pub fn to_markdown(&self, title: &str) -> String {
         render_markdown(
             title,
@@ -91,8 +105,22 @@ impl BenchOutcome {
             &self.gates,
             &self.meta,
             &self.skipped,
+            &self.figures,
         )
     }
+}
+
+/// The measured outcome of one trial: the sampled series plus, for launchers with a manager
+/// process, the real manager-process CPU% over the run (SUM-164 / H5).
+#[derive(Clone, Debug)]
+pub struct TrialResult {
+    /// The sampled time series for this trial.
+    pub series: TimeSeries,
+    /// Measured manager-process CPU utilization over the run (e.g. `0.6` = 0.6%), or `None` when
+    /// the launcher has no manager pid or CPU time could not be read on this host.
+    pub manager_cpu_pct: Option<f64>,
+    /// Tagged per-process rows for this trial (for the swap-over-time figure, SUM-163).
+    pub proc_rows: Vec<TaggedProc>,
 }
 
 /// Run one launcher against one scenario, launching `cfg.agents` identical stubs and sampling the
@@ -102,6 +130,20 @@ pub fn run_launcher_scenario(
     scenario: Scenario,
     cfg: &RunConfig,
 ) -> anyhow::Result<TimeSeries> {
+    Ok(run_launcher_scenario_measured(launcher, scenario, cfg)?.series)
+}
+
+/// Run one trial and also measure the manager process's CPU% across the run (SUM-164).
+///
+/// The manager CPU% is `(Σ cpu_seconds(manager_pids, end) − Σ cpu_seconds(manager_pids, start)) /
+/// wall_seconds × 100`, sampled right after launch and right before teardown. It is `None` when
+/// the topology declares no manager pid (e.g. the raw baseline) or CPU time is unreadable on this
+/// host — in which case the caller falls back to the per-sample-duration overhead proxy.
+pub fn run_launcher_scenario_measured(
+    launcher: &dyn Launcher,
+    scenario: Scenario,
+    cfg: &RunConfig,
+) -> anyhow::Result<TrialResult> {
     std::fs::create_dir_all(&cfg.workdir)?;
 
     // Materialize the recording as JSON so the stub subprocess can load it.
@@ -120,6 +162,10 @@ pub fn run_launcher_scenario(
     let session = launcher.start(cfg.agents.max(1), &spec)?;
     let version = launcher.version();
     let sampler = default_sampler();
+
+    // Baseline manager CPU time immediately after launch, before the sampling loop.
+    let manager_pids = session.topology().manager_pids.clone();
+    let cpu_start = sum_cpu_seconds(&manager_pids);
 
     let started = Instant::now();
     let mut records = Vec::new();
@@ -157,6 +203,11 @@ pub fn run_launcher_scenario(
         std::thread::sleep(Duration::from_millis(cfg.interval_ms));
     }
 
+    // Final manager CPU time + wall clock, sampled before teardown while the pids still live.
+    let cpu_end = sum_cpu_seconds(&manager_pids);
+    let wall_seconds = started.elapsed().as_secs_f64();
+    let manager_cpu_pct = manager_cpu_pct(cpu_start, cpu_end, wall_seconds);
+
     // Tear the whole session down so we never leak processes (§2.4 "own what you launch").
     session.stop();
 
@@ -169,7 +220,46 @@ pub fn run_launcher_scenario(
         ));
         write_tagged_processes_jsonl(&procs_path, &proc_rows)?;
     }
-    Ok(TimeSeries::new(records))
+    Ok(TrialResult {
+        series: TimeSeries::new(records),
+        manager_cpu_pct,
+        proc_rows,
+    })
+}
+
+/// Sum cumulative CPU seconds across a set of manager pids, or `None` if the set is empty or no
+/// pid's CPU time can be read (so an absent measurement stays honest, never a fabricated 0).
+fn sum_cpu_seconds(pids: &[Pid]) -> Option<f64> {
+    if pids.is_empty() {
+        return None;
+    }
+    let mut total = 0.0;
+    let mut any = false;
+    for &pid in pids {
+        if let Some(s) = process_cpu_seconds(pid) {
+            total += s;
+            any = true;
+        }
+    }
+    if any {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// Compute manager CPU% from start/end CPU seconds and wall seconds, as a percentage.
+///
+/// H5: the paper's ≤2% CPU-at-N=20 claim is exactly this measured manager-process CPU%.
+/// Returns `None` unless both CPU readings and a positive wall duration are available; a tiny
+/// negative delta (from CPU-time quantization) is clamped to 0.
+fn manager_cpu_pct(start: Option<f64>, end: Option<f64>, wall_seconds: f64) -> Option<f64> {
+    let (start, end) = (start?, end?);
+    if wall_seconds <= 0.0 {
+        return None;
+    }
+    let delta = (end - start).max(0.0);
+    Some(delta / wall_seconds * 100.0)
 }
 
 /// Whether none of the topology's agent roots are still alive in the live process tree.
@@ -212,37 +302,74 @@ pub fn run_benchmark(
         }
         let version = launcher.version();
         versions.push((launcher.name().to_string(), version.clone()));
+        let n_trials = cfg.trials.max(1);
         for &scenario in scenarios {
-            let series = match run_launcher_scenario(launcher.as_ref(), scenario, cfg) {
-                Ok(s) => s,
-                Err(e) => {
-                    skipped.push((
-                        format!("{} ({})", launcher.name(), scenario.slug()),
-                        e.to_string(),
-                    ));
-                    continue;
+            // Run K trials, collecting one TimeSeries + one CPU% + one proc-row set per trial.
+            let mut trial_series: Vec<TimeSeries> = Vec::with_capacity(n_trials);
+            let mut trial_proc_rows: Vec<Vec<TaggedProc>> = Vec::with_capacity(n_trials);
+            let mut cpu_samples: Vec<f64> = Vec::new();
+            let mut trial_error: Option<String> = None;
+            for trial in 0..n_trials {
+                match run_launcher_scenario_measured(launcher.as_ref(), scenario, cfg) {
+                    Ok(result) => {
+                        // Persist each trial's raw JSONL so raw data is kept (SUM-162).
+                        let jsonl = cfg.workdir.join(format!(
+                            "{}-{}.trial{}.jsonl",
+                            launcher.name(),
+                            scenario.slug(),
+                            trial + 1
+                        ));
+                        result.series.write_jsonl(&jsonl)?;
+                        if let Some(pct) = result.manager_cpu_pct {
+                            cpu_samples.push(pct);
+                        }
+                        trial_series.push(result.series);
+                        trial_proc_rows.push(result.proc_rows);
+                    }
+                    Err(e) => {
+                        trial_error = Some(e.to_string());
+                        break;
+                    }
                 }
+            }
+
+            // If no trial produced a series, record the launcher/scenario as skipped-with-reason.
+            if trial_series.is_empty() {
+                skipped.push((
+                    format!("{} ({})", launcher.name(), scenario.slug()),
+                    trial_error.unwrap_or_else(|| "no trials produced a series".to_string()),
+                ));
+                continue;
+            }
+
+            let manager_cpu_pct = if cpu_samples.is_empty() {
+                None
+            } else {
+                Some(cpu_samples.iter().sum::<f64>() / cpu_samples.len() as f64)
             };
-            // Persist the raw series next to the report for auditability.
-            let jsonl = cfg
-                .workdir
-                .join(format!("{}-{}.jsonl", launcher.name(), scenario.slug()));
-            series.write_jsonl(&jsonl)?;
-            summaries.push(RunSummary::from_series(
+
+            summaries.push(RunSummary::from_trials(
                 launcher.name(),
                 &version,
                 scenario.slug(),
-                &series,
+                &trial_series,
                 cfg.interval_ms,
+                manager_cpu_pct,
             ));
             runs.push(LauncherRun {
                 launcher: launcher.name().to_string(),
                 version: version.clone(),
                 scenario,
-                series,
+                series: trial_series[0].clone(),
+                trials: trial_series,
+                trial_proc_rows,
+                manager_cpu_pct,
             });
         }
     }
+
+    // Emit the embedded SVG figures next to the report (SUM-163); failures are non-fatal.
+    let figures = write_figures(&cfg.workdir, &runs).unwrap_or_default();
 
     let gates = evaluate_gates(&derive_gate_inputs(launchers, &runs));
     let meta = ReportMeta::now(versions);
@@ -252,7 +379,131 @@ pub fn run_benchmark(
         gates,
         skipped,
         meta,
+        figures,
     })
+}
+
+/// Write the embedded SVG figures next to the report and return `(title, filename)` references
+/// for the ones actually produced (SUM-163).
+///
+/// Figures:
+/// 1. `footprint-over-time.svg` — per-launcher total footprint (MiB) vs elapsed ms (trial 1).
+/// 2. `swap-over-time.svg` — per-launcher total provider swap (bytes) vs elapsed ms. On a host
+///    that never swaps this is a flat zero line, which is rendered honestly rather than dropped.
+/// 3. `footprint-vs-N.svg` — peak total vs agent count; only emitted when an N-sweep is present
+///    (multiple distinct agent counts across runs), otherwise skipped gracefully (N-sweep
+///    orchestration is SUM-169/P3).
+fn write_figures(workdir: &Path, runs: &[LauncherRun]) -> anyhow::Result<Vec<(String, String)>> {
+    if runs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut figures: Vec<(String, String)> = Vec::new();
+
+    // Figure 1: footprint over time (one series per launcher, using the representative trial).
+    let footprint_series: Vec<Series> = runs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let points: Vec<(f64, f64)> = r
+                .series
+                .records
+                .iter()
+                .map(|rec| (rec.elapsed_ms as f64, rec.total_bytes as f64 / MIB as f64))
+                .collect();
+            Series::new(
+                format!("{} / {}", r.launcher, r.scenario.slug()),
+                points,
+                PALETTE[i % PALETTE.len()],
+            )
+        })
+        .collect();
+    let svg = line_chart_svg(
+        "Footprint over time",
+        "elapsed (ms)",
+        "total footprint (MiB)",
+        &footprint_series,
+    );
+    let name = "footprint-over-time.svg";
+    std::fs::write(workdir.join(name), svg)?;
+    figures.push(("Footprint over time".to_string(), name.to_string()));
+
+    // Figure 2: swap over time (per-launcher sum of provider swap_bytes per tick, from proc rows).
+    let swap_series: Vec<Series> = runs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            // Sum provider swap per elapsed_ms bucket across the representative trial's rows.
+            let rows = r.trial_proc_rows.first();
+            let mut points: Vec<(f64, f64)> = Vec::new();
+            if let Some(rows) = rows {
+                let mut by_tick: std::collections::BTreeMap<u64, u64> =
+                    std::collections::BTreeMap::new();
+                for row in rows {
+                    let swap = row.swap_bytes.unwrap_or(0);
+                    *by_tick.entry(row.elapsed_ms).or_insert(0) += swap;
+                }
+                points = by_tick
+                    .into_iter()
+                    .map(|(t, b)| (t as f64, b as f64))
+                    .collect();
+            }
+            Series::new(
+                format!("{} / {}", r.launcher, r.scenario.slug()),
+                points,
+                PALETTE[i % PALETTE.len()],
+            )
+        })
+        .collect();
+    let svg = line_chart_svg(
+        "Provider swap over time",
+        "elapsed (ms)",
+        "provider swap (bytes)",
+        &swap_series,
+    );
+    let name = "swap-over-time.svg";
+    std::fs::write(workdir.join(name), svg)?;
+    figures.push(("Provider swap over time".to_string(), name.to_string()));
+
+    // Figure 3: footprint vs N — only when an N-sweep is present (multiple agent counts). Here a
+    // single run has one agent count, so we detect distinct peak-process counts per launcher as a
+    // proxy; with no sweep we skip gracefully (SUM-169/P3 owns N-sweep orchestration).
+    let mut by_launcher: std::collections::BTreeMap<String, Vec<(f64, f64)>> =
+        std::collections::BTreeMap::new();
+    for r in runs {
+        let n = r.series.peak_root_process_count() as f64;
+        let peak = r.series.peak_total_bytes() as f64 / MIB as f64;
+        by_launcher
+            .entry(r.launcher.clone())
+            .or_default()
+            .push((n, peak));
+    }
+    let has_sweep = by_launcher.values().any(|pts| {
+        let mut xs: Vec<f64> = pts.iter().map(|(x, _)| *x).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        xs.dedup();
+        xs.len() > 1
+    });
+    if has_sweep {
+        let series: Vec<Series> = by_launcher
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, mut pts))| {
+                pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                Series::new(name, pts, PALETTE[i % PALETTE.len()])
+            })
+            .collect();
+        let svg = line_chart_svg(
+            "Peak footprint vs N (agents)",
+            "processes in launched tree (N)",
+            "peak total footprint (MiB)",
+            &series,
+        );
+        let name = "footprint-vs-N.svg";
+        std::fs::write(workdir.join(name), svg)?;
+        figures.push(("Peak footprint vs N".to_string(), name.to_string()));
+    }
+
+    Ok(figures)
 }
 
 /// Derive launch-gate inputs from the collected runs.
@@ -269,21 +520,35 @@ fn derive_gate_inputs(launchers: &[Box<dyn Launcher>], runs: &[LauncherRun]) -> 
         inputs.min_attributed_fraction = Some(min_attr);
     }
 
-    // Overhead: cost of one sample against the daemon's realistic steady-state cadence, not
-    // the (much tighter) benchmark sampling interval. §4.2 asks for < 2% CPU at 20 tasks; a
-    // steady daemon samples on the order of once per second, so we evaluate against that.
+    // Overhead: the §4.2 NFR asks for < 2% CPU at 20 tasks. When we can read the MemMux manager
+    // process's real CPU% across the run (SUM-164 / H5), that measured number IS the gate input
+    // (converted percent → fraction). Only when CPU time is unreadable do we fall back to the
+    // per-sample-duration proxy against the daemon's realistic steady-state cadence (a steady
+    // daemon samples on the order of once per second, so we evaluate the proxy against that).
     let memmux_names: Vec<&str> = launchers
         .iter()
         .filter(|l| l.kind() == LauncherKind::MemMux)
         .map(|l| l.name())
         .collect();
-    let max_overhead = runs
-        .iter()
-        .filter(|r| memmux_names.contains(&r.launcher.as_str()))
-        .map(|r| r.series.overhead_fraction(REFERENCE_CADENCE_MS))
-        .fold(0.0_f64, f64::max);
+    let memmux_runs = || {
+        runs.iter()
+            .filter(|r| memmux_names.contains(&r.launcher.as_str()))
+    };
+    // Prefer the real measured manager CPU% (worst-case across MemMux runs).
+    let real_overhead = memmux_runs()
+        .filter_map(|r| r.manager_cpu_pct)
+        .fold(f64::NEG_INFINITY, f64::max);
     if !memmux_names.is_empty() {
-        inputs.sampling_overhead_fraction = Some(max_overhead);
+        if real_overhead.is_finite() {
+            // Measured CPU% is a percentage; the gate compares a fraction.
+            inputs.sampling_overhead_fraction = Some(real_overhead / 100.0);
+        } else {
+            // Fallback proxy: per-sample cost against the steady-state cadence.
+            let max_overhead = memmux_runs()
+                .map(|r| r.series.overhead_fraction(REFERENCE_CADENCE_MS))
+                .fold(0.0_f64, f64::max);
+            inputs.sampling_overhead_fraction = Some(max_overhead);
+        }
     }
 
     // Bounded memory: growth of the memmux soak run, if present.
@@ -303,38 +568,70 @@ mod tests {
     use super::*;
     use crate::launcher::MemMuxLauncher;
 
-    #[test]
-    fn gate_inputs_take_worst_attribution() {
-        let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
-        let runs = vec![LauncherRun {
+    fn memmux_record() -> crate::sampler::TimeSeriesRecord {
+        crate::sampler::TimeSeriesRecord {
+            t_unix_ms: 0,
+            elapsed_ms: 0,
+            launcher: "memmux".into(),
+            scenario: "burst".into(),
+            sample_duration_us: 100,
+            process_count: 2,
+            total_bytes: 100,
+            owned_bytes: 90,
+            shared_bytes: 0,
+            escaped_bytes: 0,
+            unknown_bytes: 10,
+            attributed_fraction: 0.9,
+            root_subtree_bytes: 90,
+            root_process_count: 2,
+            tree_attributed_fraction: 0.95,
+            provider_bytes: 90,
+            manager_overhead_bytes: 10,
+            provider_proc_count: 2,
+            manager_proc_count: 1,
+            launcher_version: "memmux 0.0.0".into(),
+        }
+    }
+
+    fn memmux_run(manager_cpu_pct: Option<f64>) -> LauncherRun {
+        let series = TimeSeries::new(vec![memmux_record()]);
+        LauncherRun {
             launcher: "memmux".into(),
             version: "memmux 0.0.0".into(),
             scenario: Scenario::Burst,
-            series: TimeSeries::new(vec![crate::sampler::TimeSeriesRecord {
-                t_unix_ms: 0,
-                elapsed_ms: 0,
-                launcher: "memmux".into(),
-                scenario: "burst".into(),
-                sample_duration_us: 100,
-                process_count: 2,
-                total_bytes: 100,
-                owned_bytes: 90,
-                shared_bytes: 0,
-                escaped_bytes: 0,
-                unknown_bytes: 10,
-                attributed_fraction: 0.9,
-                root_subtree_bytes: 90,
-                root_process_count: 2,
-                tree_attributed_fraction: 0.95,
-                provider_bytes: 90,
-                manager_overhead_bytes: 10,
-                provider_proc_count: 2,
-                manager_proc_count: 1,
-                launcher_version: "memmux 0.0.0".into(),
-            }]),
-        }];
+            series: series.clone(),
+            trials: vec![series],
+            trial_proc_rows: vec![Vec::new()],
+            manager_cpu_pct,
+        }
+    }
+
+    #[test]
+    fn gate_inputs_take_worst_attribution() {
+        let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
+        let runs = vec![memmux_run(None)];
         let inputs = derive_gate_inputs(&launchers, &runs);
         assert_eq!(inputs.min_attributed_fraction, Some(0.95));
+        // With no measured CPU%, the overhead falls back to the per-sample proxy.
         assert!(inputs.sampling_overhead_fraction.is_some());
+    }
+
+    #[test]
+    fn real_cpu_pct_becomes_the_overhead_gate_input() {
+        let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
+        // Measured 1.5% CPU → overhead fraction 0.015 (real number, not the proxy).
+        let runs = vec![memmux_run(Some(1.5))];
+        let inputs = derive_gate_inputs(&launchers, &runs);
+        assert_eq!(inputs.sampling_overhead_fraction, Some(0.015));
+    }
+
+    #[test]
+    fn manager_cpu_pct_math_is_delta_over_wall() {
+        // 0.5 CPU-seconds over 2 wall-seconds = 25% CPU.
+        assert_eq!(manager_cpu_pct(Some(1.0), Some(1.5), 2.0), Some(25.0));
+        // Missing readings or non-positive wall → None; negative delta clamps to 0.
+        assert_eq!(manager_cpu_pct(None, Some(1.0), 1.0), None);
+        assert_eq!(manager_cpu_pct(Some(1.0), Some(2.0), 0.0), None);
+        assert_eq!(manager_cpu_pct(Some(2.0), Some(1.0), 1.0), Some(0.0));
     }
 }
