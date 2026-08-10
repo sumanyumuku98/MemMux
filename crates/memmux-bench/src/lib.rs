@@ -7,9 +7,10 @@
 //!
 //! Modules:
 //! * [`stub`] — deterministic stub agent (SUM-32).
-//! * [`scenario`] — burst / soak / idle / leak scenarios (SUM-36).
+//! * [`scenario`] — burst / soak / idle / leak / hold scenarios (SUM-36, SUM-165).
 //! * [`launcher`] — baseline / MemMux / competitor launchers (SUM-34, SUM-35).
 //! * [`sampler`] — time-series sampling to JSONL + overhead accounting (SUM-33, SUM-31).
+//! * [`cleanup`] — cleanup / leak-on-teardown measurement (SUM-165 / H2).
 //! * [`report`] — Markdown + sparkline report generator (SUM-37).
 //! * [`matrix`] — §18.2 test-matrix enumeration (SUM-39).
 //! * [`gates`] — §18.5 launch-gate checks (SUM-40).
@@ -20,6 +21,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cleanup;
 pub mod gates;
 pub mod launcher;
 pub mod matrix;

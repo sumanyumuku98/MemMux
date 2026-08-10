@@ -4,8 +4,9 @@
 //! into an end-to-end run and is the integration point that actually exercises
 //! `memmux-metrics` against real processes.
 
+use crate::cleanup::{survivors_of, CleanupResult, OwnedProc};
 use crate::gates::{evaluate_gates, GateInputs, GateResult};
-use crate::launcher::{LaunchSpec, Launcher, LauncherKind};
+use crate::launcher::{LaunchSpec, LaunchTopology, Launcher, LauncherKind};
 use crate::plot::{line_chart_svg, Series, PALETTE};
 use crate::report::{render_markdown, ReportMeta, RunSummary};
 use crate::sampler::{
@@ -22,6 +23,11 @@ const MIB: u64 = 1024 * 1024;
 
 /// Realistic steady-state sampling cadence the overhead gate is evaluated against (ms).
 const REFERENCE_CADENCE_MS: u64 = 1000;
+
+/// Total grace window we allow a launcher's normal teardown before counting survivors (SUM-165).
+const CLEANUP_GRACE_MS: u64 = 10_000;
+/// Poll cadence within the cleanup grace window (20 × 500ms = 10s).
+const CLEANUP_POLL_MS: u64 = 500;
 
 /// Configuration for a single benchmark run.
 #[derive(Clone, Debug)]
@@ -76,6 +82,9 @@ pub struct LauncherRun {
     pub trial_proc_rows: Vec<Vec<TaggedProc>>,
     /// Mean measured manager CPU% across the trials that could read it (SUM-164 / H5), or `None`.
     pub manager_cpu_pct: Option<f64>,
+    /// Per-trial cleanup / leak-on-teardown measurements (SUM-165 / H2); `None` for a trial where
+    /// nothing was owned. Aggregated into the report's "Cleanup on teardown" table.
+    pub trial_cleanup: Vec<Option<CleanupResult>>,
 }
 
 /// Aggregate result of a benchmark across launchers and scenarios.
@@ -121,6 +130,9 @@ pub struct TrialResult {
     pub manager_cpu_pct: Option<f64>,
     /// Tagged per-process rows for this trial (for the swap-over-time figure, SUM-163).
     pub proc_rows: Vec<TaggedProc>,
+    /// Cleanup / leak-on-teardown measurement for this trial (SUM-165 / H2), or `None` when the
+    /// launcher owned no live agent processes at teardown (measurement is n/a, never a fake 100%).
+    pub cleanup: Option<CleanupResult>,
 }
 
 /// Run one launcher against one scenario, launching `cfg.agents` identical stubs and sampling the
@@ -208,8 +220,18 @@ pub fn run_launcher_scenario_measured(
     let wall_seconds = started.elapsed().as_secs_f64();
     let manager_cpu_pct = manager_cpu_pct(cpu_start, cpu_end, wall_seconds);
 
-    // Tear the whole session down so we never leak processes (§2.4 "own what you launch").
+    // Cleanup / leak-on-teardown (SUM-165 / H2): capture the owned agent subtree WHILE it is still
+    // alive, then measure how much of it survives the launcher's own normal teardown.
+    let owned = capture_owned_set(session.topology());
+
+    // Tear the whole session down so we never leak processes (§2.4 "own what you launch"). Each
+    // launcher runs its OWN normal teardown here — no MemMux special-casing (fairness is the whole
+    // point of H2).
     session.stop();
+
+    // Poll survivors for the grace window; kill any leftovers so the harness never leaks the
+    // processes it caused to exist.
+    let cleanup = measure_cleanup(&owned);
 
     // Persist the detailed per-process tagged rows next to the aggregate series (SUM-33).
     if !proc_rows.is_empty() {
@@ -224,8 +246,102 @@ pub fn run_launcher_scenario_measured(
         series: TimeSeries::new(records),
         manager_cpu_pct,
         proc_rows,
+        cleanup,
     })
 }
+
+/// Capture the *owned set* for the cleanup measurement: every live pid in each agent-root subtree,
+/// with the bytes we accounted to it (SUM-165 / H2).
+///
+/// Uses one live snapshot; only agent-root subtrees are included (the agent subtrees the launcher
+/// promised to own), deliberately excluding manager pids' non-provider descendants — H2 is about
+/// whether the launcher reclaims the agents it launched. Roots that are already dead contribute
+/// nothing. An empty owned set later yields a `None` cleanup result (n/a, not a fake 100%).
+fn capture_owned_set(topology: &LaunchTopology) -> Vec<OwnedProc> {
+    let snapshot = match default_sampler().snapshot() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let tree = ProcessTree::from_samples(snapshot.samples);
+    let mut owned: Vec<OwnedProc> = Vec::new();
+    let mut seen: std::collections::HashSet<Pid> = std::collections::HashSet::new();
+    for &root in &topology.agent_roots {
+        // Only count a root that is actually alive right now.
+        if tree.get(root).is_none() {
+            continue;
+        }
+        for pid in std::iter::once(root).chain(tree.descendants(root)) {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(sample) = tree.get(pid) {
+                owned.push(OwnedProc {
+                    pid,
+                    accounted_bytes: sample.accounted_bytes(),
+                });
+            }
+        }
+    }
+    owned
+}
+
+/// Measure teardown cleanup: poll the live tree for up to the grace window, tracking how many owned
+/// pids survive, then SIGKILL any survivors so the benchmark itself never leaks them (SUM-165).
+///
+/// Returns `None` when nothing was owned (measurement is n/a). Otherwise returns a
+/// [`CleanupResult`] built from the survivor set at the end of the grace, or as soon as it reaches
+/// zero.
+fn measure_cleanup(owned: &[OwnedProc]) -> Option<CleanupResult> {
+    if owned.is_empty() {
+        return None;
+    }
+    let polls = (CLEANUP_GRACE_MS / CLEANUP_POLL_MS).max(1);
+    let mut survivors = owned.iter().map(|o| o.pid).collect::<Vec<Pid>>();
+    for i in 0..polls {
+        // Sleep first so the launcher's teardown has a moment to take effect before the first poll.
+        std::thread::sleep(Duration::from_millis(CLEANUP_POLL_MS));
+        survivors = current_survivors(owned);
+        if survivors.is_empty() {
+            let _ = i; // reached zero early; stop polling.
+            break;
+        }
+    }
+    let result = CleanupResult::from_owned_and_survivors(owned, &survivors);
+    // Reap what the harness caused to exist: best-effort SIGKILL of any survivors (fine to clean
+    // up AFTER measuring). `#![forbid(unsafe_code)]` rules out a raw `libc::kill`, so shell out to
+    // the platform `kill` on unix; on other platforms there is nothing portable to do here.
+    kill_survivors(&survivors);
+    Some(result)
+}
+
+/// One live poll: which owned pids are still present in the current process tree.
+fn current_survivors(owned: &[OwnedProc]) -> Vec<Pid> {
+    match default_sampler().snapshot() {
+        Ok(snapshot) => {
+            let tree = ProcessTree::from_samples(snapshot.samples);
+            survivors_of(owned, &tree)
+        }
+        // If we cannot sample, assume everything still survives (never under-report a leak).
+        Err(_) => owned.iter().map(|o| o.pid).collect(),
+    }
+}
+
+/// Best-effort SIGKILL of leftover pids so the harness reaps what it caused to exist (SUM-165).
+#[cfg(unix)]
+fn kill_survivors(pids: &[Pid]) {
+    for &pid in pids {
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// Non-unix hosts have no portable SIGKILL-by-pid here; survivors are left to the launcher.
+#[cfg(not(unix))]
+fn kill_survivors(_pids: &[Pid]) {}
 
 /// Sum cumulative CPU seconds across a set of manager pids, or `None` if the set is empty or no
 /// pid's CPU time can be read (so an absent measurement stays honest, never a fabricated 0).
@@ -307,6 +423,7 @@ pub fn run_benchmark(
             // Run K trials, collecting one TimeSeries + one CPU% + one proc-row set per trial.
             let mut trial_series: Vec<TimeSeries> = Vec::with_capacity(n_trials);
             let mut trial_proc_rows: Vec<Vec<TaggedProc>> = Vec::with_capacity(n_trials);
+            let mut trial_cleanup: Vec<Option<CleanupResult>> = Vec::with_capacity(n_trials);
             let mut cpu_samples: Vec<f64> = Vec::new();
             let mut trial_error: Option<String> = None;
             for trial in 0..n_trials {
@@ -325,6 +442,7 @@ pub fn run_benchmark(
                         }
                         trial_series.push(result.series);
                         trial_proc_rows.push(result.proc_rows);
+                        trial_cleanup.push(result.cleanup);
                     }
                     Err(e) => {
                         trial_error = Some(e.to_string());
@@ -355,6 +473,7 @@ pub fn run_benchmark(
                 &trial_series,
                 cfg.interval_ms,
                 manager_cpu_pct,
+                &trial_cleanup,
             ));
             runs.push(LauncherRun {
                 launcher: launcher.name().to_string(),
@@ -364,6 +483,7 @@ pub fn run_benchmark(
                 trials: trial_series,
                 trial_proc_rows,
                 manager_cpu_pct,
+                trial_cleanup,
             });
         }
     }
@@ -560,6 +680,16 @@ fn derive_gate_inputs(launchers: &[Box<dyn Launcher>], runs: &[LauncherRun]) -> 
     }
     inputs.bounded_growth_limit_bytes = 100 * MIB;
 
+    // Cleanup (SUM-165 / H2): worst-case reclaimed fraction across all MemMux trials that produced
+    // a cleanup measurement. `None` (gate stays skipped) if no MemMux trial owned live agents.
+    let min_cleanup = memmux_runs()
+        .flat_map(|r| r.trial_cleanup.iter())
+        .filter_map(|c| c.as_ref().and_then(|c| c.cleanup_fraction))
+        .fold(f64::INFINITY, f64::min);
+    if min_cleanup.is_finite() {
+        inputs.min_cleanup_fraction = Some(min_cleanup);
+    }
+
     inputs
 }
 
@@ -594,6 +724,13 @@ mod tests {
     }
 
     fn memmux_run(manager_cpu_pct: Option<f64>) -> LauncherRun {
+        memmux_run_with_cleanup(manager_cpu_pct, vec![None])
+    }
+
+    fn memmux_run_with_cleanup(
+        manager_cpu_pct: Option<f64>,
+        trial_cleanup: Vec<Option<CleanupResult>>,
+    ) -> LauncherRun {
         let series = TimeSeries::new(vec![memmux_record()]);
         LauncherRun {
             launcher: "memmux".into(),
@@ -603,6 +740,7 @@ mod tests {
             trials: vec![series],
             trial_proc_rows: vec![Vec::new()],
             manager_cpu_pct,
+            trial_cleanup,
         }
     }
 
@@ -623,6 +761,36 @@ mod tests {
         let runs = vec![memmux_run(Some(1.5))];
         let inputs = derive_gate_inputs(&launchers, &runs);
         assert_eq!(inputs.sampling_overhead_fraction, Some(0.015));
+    }
+
+    #[test]
+    fn cleanup_gate_input_takes_worst_memmux_reclaim() {
+        use crate::cleanup::CleanupResult;
+        let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
+        // Two trials: one fully reclaimed, one that leaked a quarter → worst-case 0.75.
+        let full = CleanupResult {
+            owned_procs: 4,
+            leaked_procs: 0,
+            leaked_bytes: 0,
+            cleanup_fraction: Some(1.0),
+        };
+        let leaky = CleanupResult {
+            owned_procs: 4,
+            leaked_procs: 1,
+            leaked_bytes: 1024,
+            cleanup_fraction: Some(0.75),
+        };
+        let runs = vec![memmux_run_with_cleanup(None, vec![Some(full), Some(leaky)])];
+        let inputs = derive_gate_inputs(&launchers, &runs);
+        assert_eq!(inputs.min_cleanup_fraction, Some(0.75));
+    }
+
+    #[test]
+    fn cleanup_gate_input_absent_when_no_data() {
+        let launchers: Vec<Box<dyn Launcher>> = vec![Box::new(MemMuxLauncher)];
+        let runs = vec![memmux_run(None)]; // trial_cleanup is [None]
+        let inputs = derive_gate_inputs(&launchers, &runs);
+        assert_eq!(inputs.min_cleanup_fraction, None);
     }
 
     #[test]

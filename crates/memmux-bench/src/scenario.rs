@@ -20,10 +20,20 @@ pub enum Scenario {
     Idle,
     /// A child that allocates memory monotonically and never frees it.
     Leak,
+    /// A long-lived resident agent (with a child subtree) that stays alive ~60s.
+    ///
+    /// Explicitly-selectable and **not** part of [`Scenario::ALL`]: it is the concurrency
+    /// prerequisite for the cleanup/leak-on-teardown measurement (SUM-165 / H2), where N agents
+    /// must stay concurrently resident long enough to outlive sampling **and** the 10s teardown
+    /// grace. The other scenarios finish in ~1s, so they cannot host that measurement.
+    Hold,
 }
 
 impl Scenario {
-    /// All scenarios, in declaration order.
+    /// The canonical scenarios, in declaration order.
+    ///
+    /// This is deliberately the four Phase-0 targets so that `--scenario all` behaviour is
+    /// unchanged; [`Scenario::Hold`] is an explicitly-selectable extra, not part of `ALL`.
     pub const ALL: [Scenario; 4] = [
         Scenario::Burst,
         Scenario::Soak,
@@ -38,6 +48,7 @@ impl Scenario {
             Scenario::Soak => "soak",
             Scenario::Idle => "idle",
             Scenario::Leak => "leak",
+            Scenario::Hold => "hold",
         }
     }
 
@@ -50,12 +61,15 @@ impl Scenario {
             }
             Scenario::Idle => "Mostly idle session; candidate for hibernation.",
             Scenario::Leak => "Monotonic, un-freed memory growth (leak injection).",
+            Scenario::Hold => {
+                "Long-lived resident agent + child subtree (~60s) for the teardown-cleanup measurement."
+            }
         }
     }
 
     /// Whether this scenario is expected to keep resident memory bounded.
     ///
-    /// Burst/Soak/Idle should stay flat; Leak should grow (that is the point).
+    /// Burst/Soak/Idle/Hold should stay flat; Leak should grow (that is the point).
     pub fn expects_bounded_memory(self) -> bool {
         !matches!(self, Scenario::Leak)
     }
@@ -115,6 +129,22 @@ impl Scenario {
                     mib_per_tick: 8,
                     ticks: 10 * intensity,
                 }),
+            // Fixed hold, independent of `intensity`: a resident agent WITH a child subtree that
+            // stays alive ~60s, long enough to outlive sampling plus the 10s cleanup grace so
+            // every agent is still concurrently resident when teardown is measured (SUM-165 / H2).
+            //
+            // The 40 MiB is held resident for the whole sleep and freed only at the very end, so
+            // the modeled trajectory rises to a plateau and returns to baseline — bounded, and
+            // (unlike Leak) NOT monotonic growth. The child holds its own 30 MiB live in its own
+            // process (observed via the process tree, not this model).
+            Scenario::Hold => SessionRecording::new("hold", provider, base)
+                .with(Step::Allocate { mib: 40 })
+                .with(Step::SpawnChild {
+                    mib: 30,
+                    hold_ms: 60_000,
+                })
+                .with(Step::Sleep { ms: 60_000 })
+                .with(Step::Free { mib: 40 }),
         }
     }
 }
@@ -183,5 +213,29 @@ mod tests {
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(slugs.len(), Scenario::ALL.len());
+        // Hold is deliberately NOT in ALL, but its slug must still be distinct from the four.
+        assert_eq!(Scenario::Hold.slug(), "hold");
+        assert!(!slugs.contains(&Scenario::Hold.slug()));
+    }
+
+    #[test]
+    fn hold_is_bounded_and_not_a_leak() {
+        // Only ever `.simulate()` Hold in a unit test — `.execute()` sleeps for a real 60s.
+        let traj = Scenario::Hold.recording(Provider::Generic, 1).simulate();
+        assert!(Scenario::Hold.expects_bounded_memory());
+        // The 40 MiB is held during the sleep then freed: the trajectory rises to a plateau and
+        // returns to baseline — bounded, and NOT the monotonic growth that flags a leak.
+        assert!(!traj.is_monotonic_growth(), "hold looks like a leak");
+        assert_eq!(traj.peak_resident_mib(), 64 + 40);
+        assert_eq!(traj.final_resident_mib(), 64);
+    }
+
+    #[test]
+    fn hold_ignores_intensity() {
+        // The hold is fixed; the step list must not scale with intensity.
+        let a = Scenario::Hold.recording(Provider::Generic, 1);
+        let b = Scenario::Hold.recording(Provider::Generic, 8);
+        assert_eq!(a.steps.len(), b.steps.len());
+        assert_eq!(a.steps, b.steps);
     }
 }
