@@ -54,3 +54,38 @@ pub fn swap_used_bytes() -> Option<u64> {
         None
     }
 }
+
+/// Cumulative CPU time consumed by a process so far, in **seconds** (user + system), or `None` if
+/// the platform can't report it or the process is gone.
+///
+/// This is the primitive behind the benchmark's real sampling-overhead measurement (SUM-164, H5):
+/// sampling the manager process's CPU seconds at the start and end of a run yields the wall-clock
+/// CPU% the multiplexer's own bookkeeping costs, rather than a per-sample-duration proxy.
+///
+/// * Linux → `utime`+`stime` from `/proc/<pid>/stat` (clock ticks) divided by
+///   `sysconf(_SC_CLK_TCK)`.
+/// * macOS → `ri_user_time`+`ri_system_time` from `proc_pid_rusage(RUSAGE_INFO_V2)` (nanoseconds).
+/// * Other → `None`.
+pub fn process_cpu_seconds(pid: memmux_core::ids::Pid) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (utime, stime) = linux_parse::parse_stat_cpu_ticks(&content)?;
+        // SAFETY: `sysconf` is a pure query of a system constant with no pointer arguments.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz <= 0 {
+            return None;
+        }
+        let ticks = utime.checked_add(stime)?;
+        Some(ticks as f64 / hz as f64)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_cpu_seconds(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}

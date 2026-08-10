@@ -131,6 +131,25 @@ fn phys_footprint(pid: libc::pid_t) -> Option<u64> {
     }
 }
 
+/// Cumulative CPU time (user + system) for a pid, in **seconds**, via
+/// `proc_pid_rusage(RUSAGE_INFO_V2)`. `ri_user_time` and `ri_system_time` are nanoseconds (SUM-164).
+pub fn process_cpu_seconds(pid: memmux_core::ids::Pid) -> Option<f64> {
+    let mut rusage: libc::rusage_info_v2 = unsafe { mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::pid_t,
+            libc::RUSAGE_INFO_V2,
+            &mut rusage as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        )
+    };
+    if rc == 0 {
+        let nanos = rusage.ri_user_time.saturating_add(rusage.ri_system_time);
+        Some(nanos as f64 / 1_000_000_000.0)
+    } else {
+        None
+    }
+}
+
 /// Convert a NUL-terminated C `char` array into an owned `String` (lossy, stops at NUL).
 fn c_array_to_string(bytes: &[libc::c_char]) -> Option<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
