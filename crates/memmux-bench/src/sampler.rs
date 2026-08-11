@@ -231,6 +231,11 @@ pub struct TimeSeriesRecord {
     /// Human-readable launcher version at measurement time (e.g. `"tmux 3.6a"`).
     #[serde(default)]
     pub launcher_version: String,
+    /// Number of agents requested for this run (the N of an N-sweep, SUM-169 / P3). Defaults to `0`
+    /// so older JSONL files (written before the sweep) still deserialize; a single-N run tags every
+    /// record with that N.
+    #[serde(default)]
+    pub agents: usize,
 }
 
 impl TimeSeriesRecord {
@@ -299,6 +304,7 @@ impl TimeSeriesRecord {
             provider_proc_count: 0,
             manager_proc_count: 0,
             launcher_version: String::new(),
+            agents: 0,
         }
     }
 
@@ -308,7 +314,9 @@ impl TimeSeriesRecord {
     /// The legacy single-root attribution fields are filled against the first agent root (so old
     /// consumers of `root_subtree_bytes` keep working), while the new provider/manager fields are
     /// filled from [`classify`]. `total_bytes` here is the topology total (provider + manager),
-    /// not the host-wide total.
+    /// not the host-wide total. `agents` is the run's requested agent count (the N of an N-sweep,
+    /// SUM-169), tagged onto every record so per-N JSONL is self-describing.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_snapshot_topology(
         snapshot: &Snapshot,
         topology: &LaunchTopology,
@@ -316,6 +324,7 @@ impl TimeSeriesRecord {
         version: &str,
         scenario: &str,
         elapsed_ms: u64,
+        agents: usize,
     ) -> Self {
         let tree = ProcessTree::from_samples(snapshot.samples.clone());
         let acct = classify(&tree, topology);
@@ -376,11 +385,13 @@ impl TimeSeriesRecord {
             provider_proc_count: acct.provider_proc_count,
             manager_proc_count: acct.manager_proc_count,
             launcher_version: version.to_string(),
+            agents,
         }
     }
 }
 
 /// Take one live topology-aware sample using `sampler` (SUM-33 core).
+#[allow(clippy::too_many_arguments)]
 pub fn sample_once_topology(
     sampler: &dyn ProcessSampler,
     topology: &LaunchTopology,
@@ -388,10 +399,11 @@ pub fn sample_once_topology(
     version: &str,
     scenario: &str,
     elapsed_ms: u64,
+    agents: usize,
 ) -> io::Result<TimeSeriesRecord> {
     let snapshot = sampler.snapshot()?;
     Ok(TimeSeriesRecord::from_snapshot_topology(
-        &snapshot, topology, launcher, version, scenario, elapsed_ms,
+        &snapshot, topology, launcher, version, scenario, elapsed_ms, agents,
     ))
 }
 
@@ -673,6 +685,7 @@ mod tests {
             provider_proc_count: 1,
             manager_proc_count: 0,
             launcher_version: "memmux 0.0.0".into(),
+            agents: 3,
         };
         let ts = TimeSeries::new(vec![mk(0, 100, 500, 1.0), mk(100, 300, 700, 0.98)]);
         assert_eq!(ts.peak_root_subtree_bytes(), 300);
@@ -714,6 +727,7 @@ mod tests {
             provider_proc_count: 2,
             manager_proc_count: 1,
             launcher_version: "raw (direct spawn)".into(),
+            agents: 5,
         }]);
         ts.write_jsonl(&path).unwrap();
         let back = TimeSeries::read_jsonl(&path).unwrap();

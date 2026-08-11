@@ -32,6 +32,7 @@ fn short_cfg(dir: PathBuf, agents: usize) -> RunConfig {
         interval_ms: 30,
         max_samples: 5,
         agents,
+        agents_sweep: None,
         trials: 1,
         bench_exe: bench_exe(),
         workdir: dir,
