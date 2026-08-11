@@ -19,6 +19,16 @@ const MIB: f64 = 1024.0 * 1024.0;
 /// Grace window (seconds) cited in the cleanup table caption; matches `run::CLEANUP_GRACE_MS`.
 const CLEANUP_GRACE_SECONDS: u64 = 10;
 
+/// Static exclusion notes for the known competitor tools that the harness cannot drive headlessly
+/// (SUM-170). Rendered in the "Launchers & exclusions" section for any of these not otherwise
+/// listed (ran or live-skipped) so the reproducer report always documents WHY the competitor
+/// comparison is limited on this host — never a fabricated number.
+const STATIC_EXCLUSIONS: &[(&str, &str)] = &[
+    ("dmux", "requires a TTY; not headlessly drivable"),
+    ("cmux", "not installed"),
+    ("agentmux", "not installed"),
+];
+
 /// Aggregated cleanup / leak-on-teardown statistics for one launcher × scenario (SUM-165 / H2).
 ///
 /// Each field is a [`TrialStats`] over the trials that produced a cleanup measurement (trials with
@@ -177,6 +187,10 @@ pub struct ReportMeta {
     pub host_os: String,
     /// Per-launcher `(name, version)` citations for launchers that actually ran.
     pub launcher_versions: Vec<(String, String)>,
+    /// Captured host spec (OS/arch/RAM/CPU/version) for the reproducer header (SUM-171 / P3), or
+    /// `None` for the plain `run` report (single-N `run` keeps its lighter header).
+    #[serde(default)]
+    pub host: Option<crate::host::HostSpec>,
 }
 
 impl ReportMeta {
@@ -186,6 +200,21 @@ impl ReportMeta {
             measured_at_utc: format_utc(SystemTime::now()),
             host_os: std::env::consts::OS.to_string(),
             launcher_versions,
+            host: None,
+        }
+    }
+
+    /// Capture metadata plus a full [`HostSpec`](crate::host::HostSpec) header for the reproducer
+    /// report (SUM-171).
+    pub fn now_with_host(
+        launcher_versions: Vec<(String, String)>,
+        host: crate::host::HostSpec,
+    ) -> Self {
+        Self {
+            measured_at_utc: format_utc(SystemTime::now()),
+            host_os: host.os.clone(),
+            launcher_versions,
+            host: Some(host),
         }
     }
 }
@@ -204,6 +233,9 @@ pub struct RunSummary {
     pub launcher_version: String,
     /// Scenario slug.
     pub scenario: String,
+    /// Requested agent count for this run (the N of an N-sweep, SUM-169 / P3). Rendered as an extra
+    /// `N` column in the Runs table when a sweep produced more than one distinct N.
+    pub agents: usize,
     /// Peak tracked-subtree footprint, mebibytes (representative trial).
     pub peak_root_mib: f64,
     /// First→last growth of the tracked subtree, mebibytes (representative trial).
@@ -260,6 +292,8 @@ impl RunSummary {
             launcher,
             version,
             scenario,
+            // Single-N helper (K=1 path, used by tests): agent count is not sweep-derived, so 0.
+            0,
             std::slice::from_ref(ts),
             interval_ms,
             None,
@@ -287,6 +321,7 @@ impl RunSummary {
         launcher: &str,
         version: &str,
         scenario: &str,
+        agents: usize,
         trials: &[TimeSeries],
         interval_ms: u64,
         manager_cpu_pct: Option<f64>,
@@ -343,6 +378,7 @@ impl RunSummary {
             launcher: launcher.to_string(),
             launcher_version: version.to_string(),
             scenario: scenario.to_string(),
+            agents,
             peak_root_mib: rep
                 .map(|ts| ts.peak_root_subtree_bytes() as f64 / MIB)
                 .unwrap_or(0.0),
@@ -389,6 +425,14 @@ pub fn render_markdown(
     // Metadata header.
     let _ = writeln!(out, "- **Measured (UTC):** {}", meta.measured_at_utc);
     let _ = writeln!(out, "- **Host OS:** {}", meta.host_os);
+    // Full host-spec header for the reproducer (SUM-171): OS/arch, RAM, CPU, cores, and version.
+    if let Some(host) = &meta.host {
+        let _ = writeln!(out, "- **Host arch:** {}", host.arch);
+        let _ = writeln!(out, "- **Physical RAM:** {}", host.ram_display());
+        let _ = writeln!(out, "- **CPU:** {}", host.cpu_display());
+        let _ = writeln!(out, "- **Logical cores:** {}", host.cores_display());
+        let _ = writeln!(out, "- **memmux/bench version:** {}", host.bench_version);
+    }
     if !meta.launcher_versions.is_empty() {
         let cited = meta
             .launcher_versions
@@ -405,6 +449,36 @@ pub fn render_markdown(
 present on `PATH` and could be driven headlessly; others are listed as skipped-with-reason \
 rather than estimated (§19.5)._\n"
     );
+
+    // Launchers & exclusions (SUM-170 / P3): for this host, which launchers ran (with versions)
+    // and which were skipped and why. Skip reasons come from the live `skipped` vec plus a static
+    // exclusion note for the known-but-absent competitor tools.
+    let _ = writeln!(out, "## Launchers & exclusions\n");
+    let _ = writeln!(
+        out,
+        "_Fairness at scale (§19.5): every launcher that produced numbers is listed with its \
+resolved version; every launcher that could not be driven on this host is listed as \
+skipped-with-reason and never contributes a fabricated or partial number._\n"
+    );
+    let _ = writeln!(out, "| Launcher | Status | Version / reason |");
+    let _ = writeln!(out, "| --- | --- | --- |");
+    for (name, ver) in &meta.launcher_versions {
+        let _ = writeln!(out, "| {name} | ran | {ver} |");
+    }
+    for (name, reason) in skipped {
+        let _ = writeln!(out, "| {name} | skipped | {reason} |");
+    }
+    // Static exclusion notes for known competitor tools that never run here, even when they were
+    // not in the live `skipped` vec (e.g. a plain `run` that did not add competitors), so the
+    // reproducer report always documents WHY the competitor comparison is limited.
+    for (name, note) in STATIC_EXCLUSIONS {
+        let already = meta.launcher_versions.iter().any(|(n, _)| n == name)
+            || skipped.iter().any(|(n, _)| n.starts_with(name));
+        if !already {
+            let _ = writeln!(out, "| {name} | excluded | {note} |");
+        }
+    }
+    let _ = writeln!(out);
 
     // Per-run table.
     let _ = writeln!(out, "## Runs\n");
@@ -424,33 +498,73 @@ confidence-interval half-width (`1.96·σ/√n`, sample σ), so it is `0.0` for 
 the run (H5); it is `n/a` when the launcher has no manager process or CPU time is unreadable on \
 this host._\n"
     );
-    let _ = writeln!(
-        out,
-        "| Launcher | Version | Scenario | Procs | Total peak MiB | Total steady MiB | Manager overhead peak MiB | Manager overhead steady MiB | Tree attributed | Mean sample (µs) | Overhead % | Manager CPU % | Samples | Footprint |"
-    );
-    let _ = writeln!(
-        out,
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
-    );
-    for s in summaries {
+    // Add an `N` column only when an N-sweep produced more than one distinct agent count, so the
+    // single-N table is byte-for-byte unchanged (SUM-169 / P3).
+    let has_sweep = {
+        let mut ns: Vec<usize> = summaries.iter().map(|s| s.agents).collect();
+        ns.sort_unstable();
+        ns.dedup();
+        ns.iter().filter(|&&n| n > 0).count() > 1
+    };
+    if has_sweep {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | `{}` |",
-            s.launcher,
-            s.launcher_version,
-            s.scenario,
-            s.peak_procs,
-            fmt_stat(&s.peak_total_mib, 1),
-            fmt_stat(&s.steady_total_mib, 1),
-            fmt_stat(&s.peak_manager_mib, 1),
-            fmt_stat(&s.steady_manager_mib, 1),
-            fmt_stat_pct(&s.min_attributed_fraction),
-            s.mean_sample_us,
-            fmt_stat_pct(&s.overhead_fraction),
-            fmt_cpu_pct(s.manager_cpu_pct),
-            s.samples,
-            s.footprint_spark,
+            "| Launcher | Version | Scenario | N | Procs | Total peak MiB | Total steady MiB | Manager overhead peak MiB | Manager overhead steady MiB | Tree attributed | Mean sample (µs) | Overhead % | Manager CPU % | Samples | Footprint |"
         );
+        let _ = writeln!(
+            out,
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        );
+        for s in summaries {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | `{}` |",
+                s.launcher,
+                s.launcher_version,
+                s.scenario,
+                s.agents,
+                s.peak_procs,
+                fmt_stat(&s.peak_total_mib, 1),
+                fmt_stat(&s.steady_total_mib, 1),
+                fmt_stat(&s.peak_manager_mib, 1),
+                fmt_stat(&s.steady_manager_mib, 1),
+                fmt_stat_pct(&s.min_attributed_fraction),
+                s.mean_sample_us,
+                fmt_stat_pct(&s.overhead_fraction),
+                fmt_cpu_pct(s.manager_cpu_pct),
+                s.samples,
+                s.footprint_spark,
+            );
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "| Launcher | Version | Scenario | Procs | Total peak MiB | Total steady MiB | Manager overhead peak MiB | Manager overhead steady MiB | Tree attributed | Mean sample (µs) | Overhead % | Manager CPU % | Samples | Footprint |"
+        );
+        let _ = writeln!(
+            out,
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        );
+        for s in summaries {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} | {} | {} | {} | `{}` |",
+                s.launcher,
+                s.launcher_version,
+                s.scenario,
+                s.peak_procs,
+                fmt_stat(&s.peak_total_mib, 1),
+                fmt_stat(&s.steady_total_mib, 1),
+                fmt_stat(&s.peak_manager_mib, 1),
+                fmt_stat(&s.steady_manager_mib, 1),
+                fmt_stat_pct(&s.min_attributed_fraction),
+                s.mean_sample_us,
+                fmt_stat_pct(&s.overhead_fraction),
+                fmt_cpu_pct(s.manager_cpu_pct),
+                s.samples,
+                s.footprint_spark,
+            );
+        }
     }
 
     // Cleanup on teardown (H2, SUM-165): one row per launcher×scenario that produced cleanup data.
@@ -782,6 +896,7 @@ mod tests {
             provider_proc_count: 2,
             manager_proc_count: if manager > 0 { 1 } else { 0 },
             launcher_version: "memmux 0.0.0".into(),
+            agents: 3,
         }
     }
 
@@ -823,6 +938,7 @@ mod tests {
             "memmux",
             "memmux 0.0.0",
             "burst",
+            3,
             &[t1, t2],
             1000,
             Some(1.23),
@@ -832,6 +948,7 @@ mod tests {
             None,
         );
         assert_eq!(s.trials, 2);
+        assert_eq!(s.agents, 3);
         assert_eq!(s.peak_total_mib.n, 2);
         // Provider 100 + manager 10 = 110, and 140 + 10 = 150 → mean 130.
         assert!((s.peak_total_mib.mean - 130.0).abs() < 0.5);
@@ -865,6 +982,7 @@ mod tests {
             measured_at_utc: "2026-08-09 12:00:00Z".into(),
             host_os: "macos".into(),
             launcher_versions: vec![("tmux".into(), "tmux 3.6a".into())],
+            host: None,
         };
         let skipped = vec![("cmux".into(), "binary not available on this host".into())];
         let figures = vec![(
@@ -902,6 +1020,120 @@ mod tests {
         assert!(md.contains("![Footprint over time](footprint-over-time.svg)"));
         assert!(md.contains("✅ pass"));
         assert!(md.contains("⚪ skipped"));
+    }
+
+    #[test]
+    fn runs_table_gains_an_n_column_only_for_a_sweep() {
+        let ts = TimeSeries::new(vec![rec(0, (50.0 * MIB) as u64, (5.0 * MIB) as u64)]);
+        // Two summaries at distinct N (1 and 5) → the N column appears.
+        let sweep = vec![
+            RunSummary::from_trials(
+                "memmux",
+                "memmux 0.0.0",
+                "hold",
+                1,
+                std::slice::from_ref(&ts),
+                1000,
+                None,
+                &[],
+                &[],
+                &[],
+                None,
+            ),
+            RunSummary::from_trials(
+                "memmux",
+                "memmux 0.0.0",
+                "hold",
+                5,
+                std::slice::from_ref(&ts),
+                1000,
+                None,
+                &[],
+                &[],
+                &[],
+                None,
+            ),
+        ];
+        let md = render_markdown("t", &sweep, &[], &ReportMeta::default(), &[], &[]);
+        assert!(md.contains("| Launcher | Version | Scenario | N | Procs |"));
+
+        // A single-N run keeps the old header (no N column).
+        let single = vec![RunSummary::from_trials(
+            "memmux",
+            "memmux 0.0.0",
+            "hold",
+            3,
+            std::slice::from_ref(&ts),
+            1000,
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+        )];
+        let md = render_markdown("t", &single, &[], &ReportMeta::default(), &[], &[]);
+        assert!(md.contains("| Launcher | Version | Scenario | Procs |"));
+        assert!(!md.contains("| Launcher | Version | Scenario | N | Procs |"));
+    }
+
+    #[test]
+    fn report_header_renders_host_spec_when_present() {
+        let ts = TimeSeries::new(vec![rec(0, (50.0 * MIB) as u64, (5.0 * MIB) as u64)]);
+        let summaries = vec![RunSummary::from_series(
+            "memmux",
+            "memmux 0.0.0",
+            "hold",
+            &ts,
+            1000,
+        )];
+        let host = crate::host::HostSpec {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            physical_ram_bytes: Some(16 * 1024 * 1024 * 1024),
+            cpu_model: Some("Intel(R) Core(TM) i7-9750H".into()),
+            logical_cores: Some(12),
+            bench_version: "0.4.0".into(),
+        };
+        let meta = ReportMeta::now_with_host(vec![("memmux".into(), "memmux 0.4.0".into())], host);
+        let md = render_markdown("t", &summaries, &[], &meta, &[], &[]);
+        assert!(md.contains("**Host arch:** x86_64"));
+        assert!(md.contains("**Physical RAM:** 16.0 GiB"));
+        assert!(md.contains("Intel(R) Core(TM) i7-9750H"));
+        assert!(md.contains("**Logical cores:** 12"));
+        assert!(md.contains("**memmux/bench version:** 0.4.0"));
+        // The plain (no-host) meta omits the extra header lines.
+        let plain = render_markdown("t", &summaries, &[], &ReportMeta::default(), &[], &[]);
+        assert!(!plain.contains("**Host arch:**"));
+    }
+
+    #[test]
+    fn launchers_and_exclusions_lists_ran_skipped_and_static() {
+        let ts = TimeSeries::new(vec![rec(0, (50.0 * MIB) as u64, (5.0 * MIB) as u64)]);
+        let summaries = vec![RunSummary::from_series(
+            "memmux",
+            "memmux 0.0.0",
+            "hold",
+            &ts,
+            1000,
+        )];
+        let meta = ReportMeta {
+            measured_at_utc: "2026-08-11 00:00:00Z".into(),
+            host_os: "linux".into(),
+            launcher_versions: vec![("memmux".into(), "memmux 0.4.0".into())],
+            host: None,
+        };
+        // dmux is live-skipped; cmux/agentmux fall to the static exclusion notes.
+        let skipped = vec![(
+            "dmux".into(),
+            "requires a TTY; not headlessly drivable".into(),
+        )];
+        let md = render_markdown("t", &summaries, &[], &meta, &skipped, &[]);
+        assert!(md.contains("## Launchers & exclusions"));
+        assert!(md.contains("| memmux | ran | memmux 0.4.0 |"));
+        assert!(md.contains("| dmux | skipped | requires a TTY"));
+        // cmux + agentmux come from STATIC_EXCLUSIONS since they are neither ran nor live-skipped.
+        assert!(md.contains("| cmux | excluded | not installed |"));
+        assert!(md.contains("| agentmux | excluded | not installed |"));
     }
 
     #[test]
@@ -953,6 +1185,7 @@ mod tests {
                 "raw-baseline",
                 "raw (direct spawn)",
                 "hold",
+                3,
                 std::slice::from_ref(&ts),
                 1000,
                 None,
@@ -965,6 +1198,7 @@ mod tests {
                 "memmux",
                 "memmux 0.0.0",
                 "hold",
+                3,
                 std::slice::from_ref(&ts),
                 1000,
                 None,
@@ -978,6 +1212,7 @@ mod tests {
             measured_at_utc: "2026-08-10 00:00:00Z".into(),
             host_os: "macos".into(),
             launcher_versions: vec![],
+            host: None,
         };
         let md = render_markdown("t", &summaries, &[], &meta, &[], &[]);
         assert!(md.contains("## Cleanup on teardown (H2)"));
@@ -1057,6 +1292,7 @@ mod tests {
                 "raw-baseline",
                 "raw (direct spawn)",
                 "escape",
+                3,
                 std::slice::from_ref(&ts),
                 1000,
                 None,
@@ -1069,6 +1305,7 @@ mod tests {
                 "memmux",
                 "memmux 0.0.0",
                 "escape",
+                3,
                 std::slice::from_ref(&ts),
                 1000,
                 None,

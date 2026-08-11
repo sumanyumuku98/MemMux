@@ -18,6 +18,8 @@
 //! * [`gates`] — §18.5 launch-gate checks (SUM-40).
 //! * [`stats`] — multi-trial descriptive statistics + 95% CI (SUM-162).
 //! * [`plot`] — dependency-free SVG line-chart figures (SUM-163).
+//! * [`sweep`] — N-sweep agent-count list parsing (SUM-169 / P3).
+//! * [`host`] — host-spec capture for the one-command reproducer (SUM-171 / P3).
 //! * [`run`] — live orchestration tying it together.
 
 #![forbid(unsafe_code)]
@@ -27,6 +29,7 @@ pub mod cleanup;
 pub mod escape;
 pub mod gates;
 pub mod h4;
+pub mod host;
 pub mod launcher;
 pub mod matrix;
 pub mod plot;
@@ -36,6 +39,7 @@ pub mod sampler;
 pub mod scenario;
 pub mod stats;
 pub mod stub;
+pub mod sweep;
 
 pub use scenario::Scenario;
 pub use stub::SessionRecording;

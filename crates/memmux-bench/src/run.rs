@@ -43,6 +43,11 @@ pub struct RunConfig {
     pub max_samples: usize,
     /// Number of identical stub agents to launch per launcher (default 3).
     pub agents: usize,
+    /// Optional agent-count sweep (SUM-169 / P3): when `Some`, it overrides [`agents`](Self::agents)
+    /// and every (launcher × scenario) cell is run once per N in this list (already sorted +
+    /// deduplicated by [`crate::sweep::parse_agents_sweep`]). `None` runs a single N = `agents`
+    /// (the pre-sweep behaviour, unchanged).
+    pub agents_sweep: Option<Vec<usize>>,
     /// Number of repeated trials per (launcher, scenario) for statistics (default 1) (SUM-162).
     pub trials: usize,
     /// Path to the `memmux-bench` binary (used to execute the stub).
@@ -63,6 +68,7 @@ impl Default for RunConfig {
             interval_ms: 100,
             max_samples: 20,
             agents: 3,
+            agents_sweep: None,
             trials: 1,
             bench_exe: PathBuf::new(),
             workdir: PathBuf::from("bench-out"),
@@ -80,6 +86,8 @@ pub struct LauncherRun {
     pub version: String,
     /// Scenario.
     pub scenario: Scenario,
+    /// Requested agent count for this run (the N of an N-sweep, SUM-169 / P3).
+    pub agents: usize,
     /// Representative sampled time series (trial 1), retained for backward-compatible accessors.
     pub series: TimeSeries,
     /// All K per-trial time series (SUM-162).
@@ -176,12 +184,14 @@ pub fn run_launcher_scenario_measured(
 ) -> anyhow::Result<TrialResult> {
     std::fs::create_dir_all(&cfg.workdir)?;
 
-    // Materialize the recording as JSON so the stub subprocess can load it.
+    // Materialize the recording as JSON so the stub subprocess can load it. The filename is tagged
+    // with N so concurrent per-N cells of a sweep never share/clobber one recording (SUM-169).
     let recording = scenario.recording(cfg.provider, cfg.intensity);
     let recording_path = cfg.workdir.join(format!(
-        "{}-{}.recording.json",
+        "{}-{}-n{}.recording.json",
         launcher.name(),
-        scenario.slug()
+        scenario.slug(),
+        cfg.agents.max(1),
     ));
     std::fs::write(&recording_path, serde_json::to_vec_pretty(&recording)?)?;
 
@@ -238,6 +248,7 @@ pub fn run_launcher_scenario_measured(
                 &version,
                 scenario.slug(),
                 elapsed_ms,
+                cfg.agents.max(1),
             ));
             proc_rows.extend(tagged_processes(
                 &tree,
@@ -307,9 +318,10 @@ pub fn run_launcher_scenario_measured(
     // Persist the detailed per-process tagged rows next to the aggregate series (SUM-33).
     if !proc_rows.is_empty() {
         let procs_path = cfg.workdir.join(format!(
-            "{}-{}.procs.jsonl",
+            "{}-{}-n{}.procs.jsonl",
             launcher.name(),
-            scenario.slug()
+            scenario.slug(),
+            cfg.agents.max(1),
         ));
         write_tagged_processes_jsonl(&procs_path, &proc_rows)?;
     }
@@ -531,88 +543,103 @@ pub fn run_benchmark(
         let version = launcher.version();
         versions.push((launcher.name().to_string(), version.clone()));
         let n_trials = cfg.trials.max(1);
-        for &scenario in scenarios {
-            // Run K trials, collecting one TimeSeries + one CPU% + one proc-row set per trial.
-            let mut trial_series: Vec<TimeSeries> = Vec::with_capacity(n_trials);
-            let mut trial_proc_rows: Vec<Vec<TaggedProc>> = Vec::with_capacity(n_trials);
-            let mut trial_cleanup: Vec<Option<CleanupResult>> = Vec::with_capacity(n_trials);
-            let mut trial_escape: Vec<Option<EscapeResult>> = Vec::with_capacity(n_trials);
-            let mut trial_h4: Vec<Option<crate::h4::H4Evidence>> = Vec::with_capacity(n_trials);
-            let mut cpu_samples: Vec<f64> = Vec::new();
-            let mut trial_error: Option<String> = None;
-            for trial in 0..n_trials {
-                match run_launcher_scenario_measured(launcher.as_ref(), scenario, cfg) {
-                    Ok(result) => {
-                        // Persist each trial's raw JSONL so raw data is kept (SUM-162).
-                        let jsonl = cfg.workdir.join(format!(
-                            "{}-{}.trial{}.jsonl",
-                            launcher.name(),
-                            scenario.slug(),
-                            trial + 1
-                        ));
-                        result.series.write_jsonl(&jsonl)?;
-                        if let Some(pct) = result.manager_cpu_pct {
-                            cpu_samples.push(pct);
+        // The N-sweep dimension (SUM-169 / P3): `Some(list)` runs every (launcher × scenario) cell
+        // once per N; `None` is the single-N (`cfg.agents`) path, byte-for-byte the old behaviour.
+        let n_values: Vec<usize> = match &cfg.agents_sweep {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => vec![cfg.agents.max(1)],
+        };
+        for &n in &n_values {
+            // Per-N config: only the agent count changes; everything else is inherited.
+            let mut cfg_n = cfg.clone();
+            cfg_n.agents = n;
+            for &scenario in scenarios {
+                // Run K trials, collecting one TimeSeries + one CPU% + one proc-row set per trial.
+                let mut trial_series: Vec<TimeSeries> = Vec::with_capacity(n_trials);
+                let mut trial_proc_rows: Vec<Vec<TaggedProc>> = Vec::with_capacity(n_trials);
+                let mut trial_cleanup: Vec<Option<CleanupResult>> = Vec::with_capacity(n_trials);
+                let mut trial_escape: Vec<Option<EscapeResult>> = Vec::with_capacity(n_trials);
+                let mut trial_h4: Vec<Option<crate::h4::H4Evidence>> = Vec::with_capacity(n_trials);
+                let mut cpu_samples: Vec<f64> = Vec::new();
+                let mut trial_error: Option<String> = None;
+                for trial in 0..n_trials {
+                    match run_launcher_scenario_measured(launcher.as_ref(), scenario, &cfg_n) {
+                        Ok(result) => {
+                            // Persist each trial's raw JSONL (N-tagged filename) so the raw data of
+                            // every sweep cell is kept and never clobbers another N (SUM-162/169).
+                            let jsonl = cfg.workdir.join(format!(
+                                "{}-{}-n{}.trial{}.jsonl",
+                                launcher.name(),
+                                scenario.slug(),
+                                n,
+                                trial + 1
+                            ));
+                            result.series.write_jsonl(&jsonl)?;
+                            if let Some(pct) = result.manager_cpu_pct {
+                                cpu_samples.push(pct);
+                            }
+                            trial_series.push(result.series);
+                            trial_proc_rows.push(result.proc_rows);
+                            trial_cleanup.push(result.cleanup);
+                            trial_escape.push(result.escape);
+                            trial_h4.push(result.h4);
                         }
-                        trial_series.push(result.series);
-                        trial_proc_rows.push(result.proc_rows);
-                        trial_cleanup.push(result.cleanup);
-                        trial_escape.push(result.escape);
-                        trial_h4.push(result.h4);
-                    }
-                    Err(e) => {
-                        trial_error = Some(e.to_string());
-                        break;
+                        Err(e) => {
+                            trial_error = Some(e.to_string());
+                            break;
+                        }
                     }
                 }
-            }
 
-            // If no trial produced a series, record the launcher/scenario as skipped-with-reason.
-            if trial_series.is_empty() {
-                skipped.push((
-                    format!("{} ({})", launcher.name(), scenario.slug()),
-                    trial_error.unwrap_or_else(|| "no trials produced a series".to_string()),
+                // If no trial produced a series, record the cell as skipped-with-reason (N-tagged).
+                if trial_series.is_empty() {
+                    skipped.push((
+                        format!("{} ({}, n={n})", launcher.name(), scenario.slug()),
+                        trial_error.unwrap_or_else(|| "no trials produced a series".to_string()),
+                    ));
+                    continue;
+                }
+
+                let manager_cpu_pct = if cpu_samples.is_empty() {
+                    None
+                } else {
+                    Some(cpu_samples.iter().sum::<f64>() / cpu_samples.len() as f64)
+                };
+
+                // The overcommit budget (MiB) is a run-level constant shown in the H4a table; `None`
+                // outside the overcommit scenario or when no budget override was set.
+                let overcommit_budget_mib = if scenario.is_overcommit() {
+                    cfg.agent_budget_bytes.map(|b| b as f64 / MIB as f64)
+                } else {
+                    None
+                };
+                summaries.push(RunSummary::from_trials(
+                    launcher.name(),
+                    &version,
+                    scenario.slug(),
+                    n,
+                    &trial_series,
+                    cfg.interval_ms,
+                    manager_cpu_pct,
+                    &trial_cleanup,
+                    &trial_escape,
+                    &trial_h4,
+                    overcommit_budget_mib,
                 ));
-                continue;
+                runs.push(LauncherRun {
+                    launcher: launcher.name().to_string(),
+                    version: version.clone(),
+                    scenario,
+                    agents: n,
+                    series: trial_series[0].clone(),
+                    trials: trial_series,
+                    trial_proc_rows,
+                    manager_cpu_pct,
+                    trial_cleanup,
+                    trial_escape,
+                    trial_h4,
+                });
             }
-
-            let manager_cpu_pct = if cpu_samples.is_empty() {
-                None
-            } else {
-                Some(cpu_samples.iter().sum::<f64>() / cpu_samples.len() as f64)
-            };
-
-            // The overcommit budget (MiB) is a run-level constant shown in the H4a table; `None`
-            // outside the overcommit scenario or when no budget override was set.
-            let overcommit_budget_mib = if scenario.is_overcommit() {
-                cfg.agent_budget_bytes.map(|b| b as f64 / MIB as f64)
-            } else {
-                None
-            };
-            summaries.push(RunSummary::from_trials(
-                launcher.name(),
-                &version,
-                scenario.slug(),
-                &trial_series,
-                cfg.interval_ms,
-                manager_cpu_pct,
-                &trial_cleanup,
-                &trial_escape,
-                &trial_h4,
-                overcommit_budget_mib,
-            ));
-            runs.push(LauncherRun {
-                launcher: launcher.name().to_string(),
-                version: version.clone(),
-                scenario,
-                series: trial_series[0].clone(),
-                trials: trial_series,
-                trial_proc_rows,
-                manager_cpu_pct,
-                trial_cleanup,
-                trial_escape,
-                trial_h4,
-            });
         }
     }
 
@@ -716,37 +743,40 @@ fn write_figures(workdir: &Path, runs: &[LauncherRun]) -> anyhow::Result<Vec<(St
     std::fs::write(workdir.join(name), svg)?;
     figures.push(("Provider swap over time".to_string(), name.to_string()));
 
-    // Figure 3: footprint vs N — only when an N-sweep is present (multiple agent counts). Here a
-    // single run has one agent count, so we detect distinct peak-process counts per launcher as a
-    // proxy; with no sweep we skip gracefully (SUM-169/P3 owns N-sweep orchestration).
-    let mut by_launcher: std::collections::BTreeMap<String, Vec<(f64, f64)>> =
-        std::collections::BTreeMap::new();
+    // Figure 3: footprint vs N — one polyline per launcher, x = the run's requested agent count N
+    // (from the N-sweep, SUM-169), y = peak total footprint (MiB). Emitted only when a sweep
+    // actually produced ≥2 distinct N (for at least one launcher, and only distinct N contribute a
+    // point); a single-N run has no sweep, so we skip it gracefully. When more than one scenario is
+    // present at the same N for a launcher, the worst (max) peak is plotted so the curve is a true
+    // upper bound.
+    let mut by_launcher: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<usize, f64>,
+    > = std::collections::BTreeMap::new();
     for r in runs {
-        let n = r.series.peak_root_process_count() as f64;
+        let n = r.agents;
+        if n == 0 {
+            continue;
+        }
         let peak = r.series.peak_total_bytes() as f64 / MIB as f64;
-        by_launcher
-            .entry(r.launcher.clone())
-            .or_default()
-            .push((n, peak));
+        let entry = by_launcher.entry(r.launcher.clone()).or_default();
+        let slot = entry.entry(n).or_insert(peak);
+        *slot = slot.max(peak);
     }
-    let has_sweep = by_launcher.values().any(|pts| {
-        let mut xs: Vec<f64> = pts.iter().map(|(x, _)| *x).collect();
-        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        xs.dedup();
-        xs.len() > 1
-    });
+    let has_sweep = by_launcher.values().any(|by_n| by_n.len() > 1);
     if has_sweep {
         let series: Vec<Series> = by_launcher
             .into_iter()
             .enumerate()
-            .map(|(i, (name, mut pts))| {
-                pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            .map(|(i, (name, by_n))| {
+                let pts: Vec<(f64, f64)> =
+                    by_n.into_iter().map(|(n, peak)| (n as f64, peak)).collect();
                 Series::new(name, pts, PALETTE[i % PALETTE.len()])
             })
             .collect();
         let svg = line_chart_svg(
             "Peak footprint vs N (agents)",
-            "processes in launched tree (N)",
+            "agents (N)",
             "peak total footprint (MiB)",
             &series,
         );
@@ -886,6 +916,7 @@ mod tests {
             provider_proc_count: 2,
             manager_proc_count: 1,
             launcher_version: "memmux 0.0.0".into(),
+            agents: 3,
         }
     }
 
@@ -902,6 +933,7 @@ mod tests {
             launcher: "memmux".into(),
             version: "memmux 0.0.0".into(),
             scenario: Scenario::Burst,
+            agents: 3,
             series: series.clone(),
             trials: vec![series],
             trial_proc_rows: vec![Vec::new()],
@@ -969,5 +1001,73 @@ mod tests {
         assert_eq!(manager_cpu_pct(None, Some(1.0), 1.0), None);
         assert_eq!(manager_cpu_pct(Some(1.0), Some(2.0), 0.0), None);
         assert_eq!(manager_cpu_pct(Some(2.0), Some(1.0), 1.0), Some(0.0));
+    }
+
+    /// Build a `LauncherRun` for the figure tests: launcher name, N (agents), and a single-record
+    /// series whose total is `peak_bytes`.
+    fn run_with_n(launcher: &str, n: usize, peak_bytes: u64) -> LauncherRun {
+        let mut rec = memmux_record();
+        rec.launcher = launcher.into();
+        rec.total_bytes = peak_bytes;
+        rec.agents = n;
+        let series = TimeSeries::new(vec![rec]);
+        LauncherRun {
+            launcher: launcher.into(),
+            version: "v".into(),
+            scenario: Scenario::Hold,
+            agents: n,
+            series: series.clone(),
+            trials: vec![series],
+            trial_proc_rows: vec![Vec::new()],
+            manager_cpu_pct: None,
+            trial_cleanup: vec![None],
+            trial_escape: vec![None],
+            trial_h4: vec![None],
+        }
+    }
+
+    #[test]
+    fn footprint_vs_n_svg_emitted_only_with_two_or_more_distinct_n() {
+        let dir = std::env::temp_dir().join(format!("mmxb-fig-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A real sweep: memmux at N=1 and N=5 → footprint-vs-N figure is produced.
+        let runs = vec![
+            run_with_n("memmux", 1, 100 * MIB),
+            run_with_n("memmux", 5, 500 * MIB),
+        ];
+        let figures = write_figures(&dir, &runs).unwrap();
+        let svg = dir.join("footprint-vs-N.svg");
+        assert!(svg.is_file(), "footprint-vs-N.svg must exist for a sweep");
+        assert!(figures
+            .iter()
+            .any(|(t, f)| t == "Peak footprint vs N" && f == "footprint-vs-N.svg"));
+        // Well-formed SVG with one polyline for the single launcher's two-point curve.
+        let content = std::fs::read_to_string(&svg).unwrap();
+        assert!(content.starts_with("<svg"));
+        assert!(content.trim_end().ends_with("</svg>"));
+        assert_eq!(content.matches("<polyline").count(), 1);
+        assert!(content.contains("agents (N)"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn footprint_vs_n_svg_skipped_for_single_n() {
+        let dir = std::env::temp_dir().join(format!("mmxb-fig-single-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // No sweep: a single N (even across two launchers) → figure is skipped gracefully.
+        let runs = vec![
+            run_with_n("memmux", 3, 300 * MIB),
+            run_with_n("tmux", 3, 320 * MIB),
+        ];
+        let figures = write_figures(&dir, &runs).unwrap();
+        assert!(
+            !dir.join("footprint-vs-N.svg").is_file(),
+            "no footprint-vs-N.svg without ≥2 distinct N"
+        );
+        assert!(!figures.iter().any(|(t, _)| t == "Peak footprint vs N"));
+        // The always-on figures are still written.
+        assert!(dir.join("footprint-over-time.svg").is_file());
+        assert!(dir.join("swap-over-time.svg").is_file());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
