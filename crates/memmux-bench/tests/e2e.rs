@@ -37,6 +37,8 @@ fn short_cfg(dir: PathBuf, agents: usize) -> RunConfig {
         bench_exe: bench_exe(),
         workdir: dir,
         agent_budget_bytes: None,
+        agent_cmd: None,
+        agent_cwd: None,
     }
 }
 

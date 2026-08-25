@@ -29,6 +29,23 @@ fn stub_argv(spec: &LaunchSpec) -> Vec<String> {
     ]
 }
 
+/// The argv every launcher runs once per agent.
+///
+/// When [`LaunchSpec::agent_argv`] is set (a real external command, e.g. `claude -p "…"`, wrapped
+/// as `sh -lc "<cmd>"`), that is used verbatim so the SAME measurement harness measures a real
+/// agent process tree instead of the deterministic stub. Otherwise it falls back to the stub argv
+/// exactly as before, so default behaviour is 100% unchanged.
+fn agent_argv(spec: &LaunchSpec) -> Vec<String> {
+    spec.agent_argv.clone().unwrap_or_else(|| stub_argv(spec))
+}
+
+/// The working directory an agent command runs in, if one was requested.
+///
+/// Only meaningful when [`LaunchSpec::agent_argv`] is set (the stub is cwd-agnostic).
+fn agent_cwd(spec: &LaunchSpec) -> Option<&Path> {
+    spec.agent_cwd.as_deref()
+}
+
 /// What category a launcher belongs to (used for reporting and fairness notes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LauncherKind {
@@ -56,6 +73,17 @@ pub struct LaunchSpec {
     /// `capture_checkpoint` reads a real git HEAD + non-empty patch hash when it must preserve a
     /// victim under pressure (SUM-168 / H4b). Baseline launchers ignore it. Off by default.
     pub dirty_repos: bool,
+    /// Optional real external command to run as each agent, already tokenized as a full argv (e.g.
+    /// `["sh", "-lc", "claude -p \"add a greet() function\""]`). When `Some`, EVERY launcher runs
+    /// this instead of the deterministic stub, so the same footprint/attribution/teardown harness
+    /// measures a real coding-agent process tree. When `None`, launchers run the stub exactly as
+    /// before (default, 100% unchanged).
+    pub agent_argv: Option<Vec<String>>,
+    /// Working directory the real agent command runs in. Only meaningful alongside
+    /// [`agent_argv`](Self::agent_argv); the stub is cwd-agnostic. For [`RawLauncher`] it is the
+    /// spawned process's cwd; for tmux/herdr it is prefixed as `cd <cwd> && …`; for
+    /// [`MemMuxLauncher`] it becomes the task's `repository_path`.
+    pub agent_cwd: Option<PathBuf>,
 }
 
 /// The process topology of a launched session: which pids are agents vs. manager overhead.
@@ -147,7 +175,8 @@ impl Launcher for RawLauncher {
         "raw (direct spawn)".to_string()
     }
     fn start(&self, n: usize, spec: &LaunchSpec) -> io::Result<Box<dyn LaunchedSession>> {
-        let argv = stub_argv(spec);
+        let argv = agent_argv(spec);
+        let cwd = agent_cwd(spec);
         let mut children = Vec::with_capacity(n);
         let mut agent_roots = Vec::with_capacity(n);
         for _ in 0..n {
@@ -155,6 +184,9 @@ impl Launcher for RawLauncher {
             cmd.args(&argv[1..])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            if let Some(cwd) = cwd {
+                cmd.current_dir(cwd);
+            }
             let child = cmd.spawn()?;
             agent_roots.push(child.id() as Pid);
             children.push(child);
@@ -223,7 +255,8 @@ impl Launcher for TmuxLauncher {
         }
         let label = format!("memmux-bench-{}", std::process::id());
         // The pane command is a single shell string; quote each argv element for `sh -c` safety.
-        let cmd = shell_join(&stub_argv(spec));
+        // With a real agent command, prefix `cd <cwd> && ` so the pane's shell runs it there.
+        let cmd = pane_command(&agent_argv(spec), agent_cwd(spec));
 
         // First pane in a detached session with a fixed geometry (no attached client).
         tmux(
@@ -353,8 +386,9 @@ impl Launcher for HerdrLauncher {
                 )));
             }
 
-            // Run the identical stub command in each pane.
-            let line = format!("{}\n", shell_join(&stub_argv(spec)));
+            // Run the identical agent command in each pane (stub, or the real agent command with a
+            // `cd <cwd> &&` prefix when one was requested).
+            let line = format!("{}\n", pane_command(&agent_argv(spec), agent_cwd(spec)));
             for pid in &pane_ids {
                 herdr(&session, &["pane", "send-text", pid, &line])?;
             }
@@ -561,11 +595,17 @@ impl Launcher for MemMuxLauncher {
             let client = memmuxd::client::Client::new(&socket);
             wait_for_socket(&socket)?;
 
-            let argv = stub_argv(spec);
+            let argv = agent_argv(spec);
             // A neutral shared repo path (a temp dir); the generic provider falls back to it when
-            // it is not a git repo, so no worktree is cut. Used when `dirty_repos` is off.
+            // it is not a git repo, so no worktree is cut. Used when `dirty_repos` is off and no
+            // explicit agent cwd was requested.
             let shared_repo = root.join("repo");
             std::fs::create_dir_all(&shared_repo)?;
+            // A real agent command runs in its requested cwd: thread it through as the task's
+            // `repository_path` (the field that already carries a task's working path). When it is
+            // not a git repo the generic provider runs in place without cutting a worktree, exactly
+            // like the neutral shared dir.
+            let agent_cwd = agent_cwd(spec).map(|p| p.to_string_lossy().into_owned());
 
             let mut task_ids = Vec::with_capacity(n);
             for i in 0..n {
@@ -573,7 +613,10 @@ impl Launcher for MemMuxLauncher {
                 // checkpoint carries a real git HEAD + non-empty patch hash; otherwise share a
                 // neutral non-git dir. A dirty-repo creation failure falls back to the shared dir
                 // (the run stays honest — that agent simply has no git patch to preserve).
-                let repository_path = if spec.dirty_repos {
+                let repository_path = if let Some(cwd) = &agent_cwd {
+                    // A real agent command overrides everything: run it in the requested cwd.
+                    cwd.clone()
+                } else if spec.dirty_repos {
                     match make_dirty_repo(&root.join(format!("repo-{i}"))) {
                         Ok(p) => p,
                         Err(_) => shared_repo.to_string_lossy().into_owned(),
@@ -955,9 +998,27 @@ fn run_stdout(bin: &str, args: &[String]) -> io::Result<String> {
 /// Join argv into a single POSIX-shell command string with each element single-quoted.
 fn shell_join(argv: &[String]) -> String {
     argv.iter()
-        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Single-quote one argument for safe embedding in a POSIX-shell command string.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Build the single-string command a tmux/herdr pane shell runs for one agent.
+///
+/// The `argv` is shell-joined as before; when a `cwd` is present (only for a real agent command)
+/// it is prefixed as `cd <shell-quoted-cwd> && …` so the pane's own shell changes directory first.
+/// With no cwd this is byte-for-byte the previous `shell_join(argv)` behaviour.
+fn pane_command(argv: &[String], cwd: Option<&Path>) -> String {
+    let joined = shell_join(argv);
+    match cwd {
+        Some(dir) => format!("cd {} && {joined}", shell_quote(&dir.to_string_lossy())),
+        None => joined,
+    }
 }
 
 /// Extract every string value following a JSON `key` (e.g. `"pane_id":`) from `text`.
@@ -1119,6 +1180,43 @@ mod tests {
     fn shell_join_quotes_each_arg() {
         let j = shell_join(&["a b".into(), "c".into()]);
         assert_eq!(j, "'a b' 'c'");
+    }
+
+    #[test]
+    fn agent_argv_falls_back_to_stub_without_override() {
+        let spec = LaunchSpec {
+            bench_exe: PathBuf::from("/bin/bench"),
+            recording_path: PathBuf::from("/tmp/rec.json"),
+            ..Default::default()
+        };
+        // No agent command → the exact stub argv, so default behaviour is unchanged.
+        assert_eq!(agent_argv(&spec), stub_argv(&spec));
+        assert!(agent_cwd(&spec).is_none());
+    }
+
+    #[test]
+    fn agent_argv_uses_the_real_command_when_set() {
+        let spec = LaunchSpec {
+            bench_exe: PathBuf::from("/bin/bench"),
+            recording_path: PathBuf::from("/tmp/rec.json"),
+            agent_argv: Some(vec!["sh".into(), "-lc".into(), "claude -p \"hi\"".into()]),
+            agent_cwd: Some(PathBuf::from("/work/repo")),
+            ..Default::default()
+        };
+        assert_eq!(agent_argv(&spec), vec!["sh", "-lc", "claude -p \"hi\""]);
+        assert_eq!(agent_cwd(&spec), Some(Path::new("/work/repo")));
+    }
+
+    #[test]
+    fn pane_command_prefixes_cd_only_with_a_cwd() {
+        let argv = vec!["sh".to_string(), "-lc".to_string(), "echo hi".to_string()];
+        // No cwd → identical to the plain shell_join (unchanged stub behaviour).
+        assert_eq!(pane_command(&argv, None), shell_join(&argv));
+        // With a cwd → a `cd '<dir>' && …` prefix, with the dir shell-quoted.
+        assert_eq!(
+            pane_command(&argv, Some(Path::new("/a b/repo"))),
+            "cd '/a b/repo' && 'sh' '-lc' 'echo hi'"
+        );
     }
 
     #[test]
