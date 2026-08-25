@@ -1,42 +1,48 @@
-# MemMux paper (arXiv-style preprint)
+# MemMux paper — two builds
 
-Source for *"MemMux: Runtime Verification and Honest Resource Attribution for Fleets of Parallel
-Coding Agents"* (Sumanyu Muku, New York University).
+*"MemMux: Runtime Verification and Honest Resource Attribution for Fleets of Parallel Coding Agents"*
+(Sumanyu Muku, New York University).
 
-## Files
-- `main.tex` — the paper. Self-contained: standard `article` class + widely available packages
-  (`pgfplots`, `natbib`, `booktabs`, `hyperref`); all figures are drawn inline from the measured
-  data, so there are no external image files to manage.
-- `refs.bib` — bibliography (all references are real and verifiable).
+Both builds share one body (`body.tex`) and bibliography (`refs.bib`); only the wrapper differs:
+
+| Build | Wrapper | Mode | Author |
+|---|---|---|---|
+| **arXiv preprint** | `arxiv.tex` | `neurips_2026` `[preprint]` | **named** (Sumanyu Muku, NYU) |
+| **NeurIPS workshop** | `workshop.tex` | `neurips_2026` `[dblblindworkshop]` | **anonymized** (double-blind) |
+
+Target: *"Who Verifies the Agents?"* NeurIPS 2026 workshop — regular paper (4–9 pp excl. refs/appendix),
+double-blind, non-archival, deadline **2026-08-29 AoE**.
 
 ## Build
 
-With **tectonic** (recommended — fetches packages and runs all passes automatically):
+`tectonic` (recommended — fetches packages, runs all passes, uses the local `neurips_2026.sty`):
 
 ```sh
-tectonic main.tex        # -> main.pdf
+tectonic arxiv.tex      # -> arxiv.pdf     (named preprint)
+tectonic workshop.tex   # -> workshop.pdf  (anonymized, double-blind)
 ```
 
-With a classic **TeX Live / MacTeX** toolchain:
+or classic TeX Live: `pdflatex <build> && bibtex <build> && pdflatex <build> && pdflatex <build>`
+(the `neurips_2026.sty` is included, so no download needed), or upload to Overleaf.
 
-```sh
-pdflatex main
-bibtex   main
-pdflatex main
-pdflatex main
-```
-
-Or upload `main.tex` + `refs.bib` to **Overleaf** and compile.
+## Files
+- `body.tex` — shared paper body (abstract → appendix + bibliography). Figures are drawn inline with
+  `pgfplots` from the measured data (no image files).
+- `arxiv.tex`, `workshop.tex` — the two wrappers (packages, title/author, `\repourl`).
+- `refs.bib` — 13 references, all real and verified.
+- `neurips_2026.sty` — the official NeurIPS 2026 style (bundled so the builds are self-contained).
+- `linux-run/` — provenance for the numbers: `host.json`, the generated `report.md`, and the SVG
+  figures from the reference run.
 
 ## Numbers
 
-Every table and figure comes from the `memmux-bench` harness (`memmux-bench paper`), which also
-writes `host.json` and the raw JSONL time series. The values in this preprint are a **preliminary,
-single-host** evaluation (Apple M4 Max, 36 GiB, macOS); regenerate on a Linux reference host with the
-same command to extend the swap/USS and larger-fleet results (see the paper's Reproducibility
-section).
+All tables and Figure 1 come from the `memmux-bench` harness (`memmux-bench paper`) on the reference
+host recorded in `linux-run/host.json`: an AWS `m7i.2xlarge` — Intel Xeon Platinum 8488C, ≈31 GiB RAM,
+Ubuntu 24.04 (Linux 6.17), `tmux` 3.4, MemMux 0.8.0. Regenerate on any host with the same command
+(see the paper's Reproducibility section / Appendix A).
 
-## Status
-
-Named preprint. The double-blind workshop submission (e.g. NeurIPS "Who Verifies the Agents?") should
-be re-typeset in the venue template and anonymized.
+## Notes
+- The workshop build withholds the repository URL to preserve double-blind review; the arXiv build
+  links it. Nothing else in `body.tex` is de-anonymizing.
+- Non-archival + dual-submission is explicitly allowed, so the named arXiv preprint and the anonymized
+  workshop submission can coexist.

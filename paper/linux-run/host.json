@@ -1,0 +1,8 @@
+{
+  "os": "linux",
+  "arch": "x86_64",
+  "physical_ram_bytes": 33086730240,
+  "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+  "logical_cores": 8,
+  "bench_version": "0.8.0"
+}
