@@ -100,6 +100,17 @@ enum Command {
         /// other scenario and by non-MemMux launchers. `0`/unset leaves the host-derived default.
         #[arg(long)]
         agent_budget_mib: Option<u64>,
+        /// Run a REAL external command as each agent (e.g. `claude -p "add a greet() function"`)
+        /// instead of the built-in deterministic stub. Every launcher runs `sh -lc "<cmd>"`; the
+        /// SAME footprint/attribution/teardown/cleanup harness then measures the real agent process
+        /// tree. Forces hold-style semantics (launch + sample + teardown + measure cleanup); the
+        /// stub-only escape/overcommit injection is skipped. Unset = stub as today.
+        #[arg(long)]
+        agent_cmd: Option<String>,
+        /// Working directory the `--agent-cmd` command runs in. Ignored unless `--agent-cmd` is set;
+        /// defaults to the current directory when omitted.
+        #[arg(long)]
+        agent_cwd: Option<PathBuf>,
         /// Also list competitor launchers (dmux/cmux/agentmux) — currently always skipped.
         #[arg(long, default_value_t = false)]
         include_competitors: bool,
@@ -178,11 +189,30 @@ fn main() -> anyhow::Result<()> {
             agents_sweep,
             trials,
             agent_budget_mib,
+            agent_cmd,
+            agent_cwd,
             include_competitors,
             out,
         } => {
             let provider = parse_provider(&provider)?;
-            let scenarios = parse_scenarios(&scenario)?;
+            // A real agent command forces hold-style semantics: ignore any escape/overcommit
+            // selection (their stub-only injection cannot apply to an arbitrary command) and run
+            // the `hold` scenario — launch + sample footprint + teardown + measure cleanup.
+            let scenarios = if agent_cmd.is_some() {
+                let requested = parse_scenarios(&scenario)?;
+                if requested
+                    .iter()
+                    .any(|s| matches!(s, Scenario::Escape | Scenario::Overcommit))
+                {
+                    eprintln!(
+                        "note: --agent-cmd is set, so escape/overcommit selections are ignored; \
+                         running the `hold` scenario (launch + sample + teardown + cleanup)."
+                    );
+                }
+                vec![Scenario::Hold]
+            } else {
+                parse_scenarios(&scenario)?
+            };
             let agent_budget_bytes = agent_budget_mib.filter(|&m| m > 0).map(|m| m * 1024 * 1024);
             let agents_sweep = match agents_sweep {
                 Some(list) => Some(
@@ -202,6 +232,8 @@ fn main() -> anyhow::Result<()> {
                 bench_exe: std::env::current_exe()?,
                 workdir: out.clone(),
                 agent_budget_bytes,
+                agent_cmd,
+                agent_cwd,
             };
             let mut launchers: Vec<Box<dyn Launcher>> = builtin_launchers();
             if include_competitors {
@@ -417,6 +449,9 @@ fn run_paper(args: PaperArgs) -> anyhow::Result<()> {
         bench_exe: std::env::current_exe()?,
         workdir: args.out.clone(),
         agent_budget_bytes,
+        // The paper reproducer always runs the deterministic stub workload.
+        agent_cmd: None,
+        agent_cwd: None,
     };
 
     let mut outcome = run_benchmark(&launchers, &scenarios, &cfg)?;
