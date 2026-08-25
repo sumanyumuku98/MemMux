@@ -58,6 +58,37 @@ pub struct RunConfig {
     /// leaves the daemon at its host-derived default; only the `overcommit` scenario threads it into
     /// the [`LaunchSpec`], and only [`MemMuxLauncher`](crate::launcher::MemMuxLauncher) honors it.
     pub agent_budget_bytes: Option<u64>,
+    /// Optional REAL external command to run as each agent instead of the deterministic stub (e.g.
+    /// `claude -p "add a greet() function"`). When `Some`, every launcher runs `sh -lc "<cmd>"` with
+    /// its cwd set to [`agent_cwd`](Self::agent_cwd), and the run is forced into hold-style semantics
+    /// (launch + sample footprint + teardown + measure cleanup) — the stub-only escape/overcommit
+    /// injection is skipped, since it cannot apply to an arbitrary command. When `None`, behaviour is
+    /// 100% unchanged (stub as today).
+    pub agent_cmd: Option<String>,
+    /// Working directory for [`agent_cmd`](Self::agent_cmd). Ignored when `agent_cmd` is `None`; when
+    /// `agent_cmd` is `Some` and this is `None`, the current directory is used.
+    pub agent_cwd: Option<PathBuf>,
+}
+
+impl RunConfig {
+    /// The full argv every launcher runs per agent when a real agent command is configured:
+    /// `["sh", "-lc", "<agent_cmd>"]`. `None` when no `--agent-cmd` was given (stub path).
+    fn agent_argv(&self) -> Option<Vec<String>> {
+        self.agent_cmd
+            .as_ref()
+            .map(|cmd| vec!["sh".to_string(), "-lc".to_string(), cmd.clone()])
+    }
+
+    /// The working directory a real agent command runs in: the explicit `--agent-cwd`, else the
+    /// current directory. `None` when no `--agent-cmd` was given (the stub is cwd-agnostic).
+    fn resolved_agent_cwd(&self) -> Option<PathBuf> {
+        self.agent_cmd.as_ref()?;
+        Some(
+            self.agent_cwd
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        )
+    }
 }
 
 impl Default for RunConfig {
@@ -73,6 +104,8 @@ impl Default for RunConfig {
             bench_exe: PathBuf::new(),
             workdir: PathBuf::from("bench-out"),
             agent_budget_bytes: None,
+            agent_cmd: None,
+            agent_cwd: None,
         }
     }
 }
@@ -184,21 +217,35 @@ pub fn run_launcher_scenario_measured(
 ) -> anyhow::Result<TrialResult> {
     std::fs::create_dir_all(&cfg.workdir)?;
 
+    // A real external agent command replaces the deterministic stub for every launcher. When it is
+    // set, the run is forced into hold-style semantics: launch → sample footprint → teardown →
+    // measure cleanup. The stub-only escape (double-fork) and overcommit budget injection cannot
+    // apply to an arbitrary command, so they are skipped here rather than fabricated.
+    let agent_argv = cfg.agent_argv();
+    let real_agent = agent_argv.is_some();
+    let agent_cwd = cfg.resolved_agent_cwd();
+
     // Materialize the recording as JSON so the stub subprocess can load it. The filename is tagged
     // with N so concurrent per-N cells of a sweep never share/clobber one recording (SUM-169).
-    let recording = scenario.recording(cfg.provider, cfg.intensity);
+    //
+    // With a real agent command no stub recording is required (the launchers ignore it), so we skip
+    // writing one entirely and hand the launcher an unused placeholder path.
     let recording_path = cfg.workdir.join(format!(
         "{}-{}-n{}.recording.json",
         launcher.name(),
         scenario.slug(),
         cfg.agents.max(1),
     ));
-    std::fs::write(&recording_path, serde_json::to_vec_pretty(&recording)?)?;
+    if !real_agent {
+        let recording = scenario.recording(cfg.provider, cfg.intensity);
+        std::fs::write(&recording_path, serde_json::to_vec_pretty(&recording)?)?;
+    }
 
     // The constrained budget + dirty per-agent git repos are enabled ONLY for the overcommit
-    // scenario (SUM-167/168 / H4); every other scenario leaves them at their defaults so its
-    // behaviour is unchanged.
-    let overcommit = scenario.is_overcommit();
+    // scenario (SUM-167/168 / H4), and only for the stub workload; a real agent command forces
+    // hold-style behaviour, so they stay off. Every other scenario leaves them at their defaults so
+    // its behaviour is unchanged.
+    let overcommit = scenario.is_overcommit() && !real_agent;
     let spec = LaunchSpec {
         recording_path,
         bench_exe: cfg.bench_exe.clone(),
@@ -208,6 +255,8 @@ pub fn run_launcher_scenario_measured(
             None
         },
         dirty_repos: overcommit,
+        agent_argv,
+        agent_cwd,
     };
     let session = launcher.start(cfg.agents.max(1), &spec)?;
     let version = launcher.version();
@@ -219,8 +268,13 @@ pub fn run_launcher_scenario_measured(
 
     // How many escapes this scenario injects per agent (SUM-166 / H3); 0 for every scenario but
     // Escape. When > 0 we track which pids we ever saw under an agent-root subtree, so we can
-    // later independently confirm the ones that reparented away.
-    let escapes_per_agent = scenario.escapes_per_agent(cfg.provider);
+    // later independently confirm the ones that reparented away. A real agent command injects NO
+    // escapes (it is an arbitrary command, not the double-fork stub), so force 0 there.
+    let escapes_per_agent = if real_agent {
+        0
+    } else {
+        scenario.escapes_per_agent(cfg.provider)
+    };
     let mut ever_seen_under_root: std::collections::HashSet<Pid> = std::collections::HashSet::new();
 
     let started = Instant::now();
@@ -298,9 +352,11 @@ pub fn run_launcher_scenario_measured(
     };
 
     // H4 governance + no-lost-work evidence (SUM-167/168): only meaningful for the overcommit
-    // scenario, and only a governed launcher (MemMux) surfaces any (the trait default is `None`).
-    // Read while the daemon is still alive, before teardown.
-    let h4 = if scenario.is_overcommit() {
+    // scenario driven by the stub workload, and only a governed launcher (MemMux) surfaces any (the
+    // trait default is `None`). A real agent command forces hold-style behaviour (no constrained
+    // budget), so there is no governance to read. Read while the daemon is still alive, before
+    // teardown.
+    let h4 = if scenario.is_overcommit() && !real_agent {
         session.h4_evidence()
     } else {
         None
