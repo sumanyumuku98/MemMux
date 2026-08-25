@@ -48,7 +48,7 @@ footprint is the product.
 - **`memmuxd`** — authoritative Rust + Tokio daemon (state, scheduling, lifecycle, audit).
 - **`memmux`** — dense Ratatui/Crossterm TUI client.
 - **`memmux-metrics`** — cross-platform process accounting & attribution (Phase 0 core).
-- **`memmux-bench`** — competitive benchmark harness (stub agent, scenarios, reports).
+- **`memmux-bench`** — competitive verification benchmark (H1–H5 signals, stub or real-agent workloads, host-stamped reports).
 - **`memmux-core`** — shared domain types (tasks, state machine, events).
 - **`memmux-lifecycle`** — pure lifecycle logic (checkpoints, safe-points, recycling, resume).
 - **`memmux-proto`** — versioned client/daemon protocol types.
@@ -135,13 +135,46 @@ cargo run -p memmux
 
 # Or drive the daemon directly over the Unix socket:
 cargo run -p memmuxd -- create --title "Refactor auth" --repo ~/src/product --provider claude-code
+cargo run -p memmuxd -- start <task-id>   # admit (budget-gated) + launch the provider
 cargo run -p memmuxd -- list
-cargo run -p memmuxd -- pressure
+cargo run -p memmuxd -- pressure          # current memory pressure + reservations
 
-# Phase 0 tooling is still here too:
+# Process-tree attribution snapshot for any pid:
 cargo run -p memmuxd -- snapshot --root 1
-cargo run -p memmux-bench -- run --scenario all --provider claude-code --out bench-out
 ```
+
+## Benchmarks & verification
+
+MemMux ships a claims-disciplined benchmark that treats each guarantee as a **runtime-verification
+signal** and measures MemMux head-to-head against `raw`, `tmux`, and (when installed) `herdr`:
+
+| Signal | What it checks |
+| --- | --- |
+| **H1 — Attribution** | ≥ 95% of sampled private memory (PSS on Linux) mapped to a task or shared service |
+| **H2 — Cleanup** | ≥ 99.5% of an agent's descendant processes reclaimed within 10 s of teardown (no leaks) |
+| **H3 — Escaped-process visibility** | double-forked / reparented workers stay attributable (a capability the baselines lack) |
+| **H4 — Bounded footprint + no lost work** | resident set stays flat under overcommit; dirty Git state survives reclamation |
+| **H5 — Overhead** | manager CPU cost of monitoring the fleet |
+
+One command reproduces the whole matrix into a self-contained artifact (all JSONL, a `report.md`
+with a host-spec header, embedded figures, and `host.json`):
+
+```bash
+cargo run -p memmux-bench -- paper --out paper-out   # full matrix; add --trials 1 for a fast smoke run
+```
+
+You can also drive a single scenario, sweep the agent count, or point the harness at a **real coding
+agent** instead of the deterministic stub:
+
+```bash
+cargo run -p memmux-bench -- run --scenario hold --agents 5 --out bench-out
+cargo run -p memmux-bench -- run --scenario overcommit --agents-sweep 1,5,10,20 --out bench-out
+cargo run -p memmux-bench -- run --agents 3 \
+  --agent-cmd 'claude -p "add a greet() function"' --agent-cwd ~/src/product --out bench-out
+```
+
+A write-up of the methodology and reference results lives in [`paper/`](./paper) (arXiv preprint +
+anonymized workshop build).
 
 See the docs site: [Phase 0](https://sumanyumuku98.github.io/MemMux/phases/phase-0/),
 [Phase 1](https://sumanyumuku98.github.io/MemMux/phases/phase-1/),
@@ -150,13 +183,27 @@ See the docs site: [Phase 0](https://sumanyumuku98.github.io/MemMux/phases/phase
 
 ## Status
 
-🚧 Early development; APIs are unstable. **Phases 0–2 are complete**: process accounting and
-attribution (Phase 0); the memory-safe multiplexer — daemon, scheduler, bounded capture,
-worktrees, provider adapters, process ownership, and the TUI (Phase 1); and the lifecycle
-runtime — checkpoint/hibernate, native + reconstructed resume, RSS-threshold recycling with a
-reclaimed-bytes ledger, and Gemini CLI + OpenCode adapters (Phase 2, see
-[the Phase 2 notes](https://sumanyumuku98.github.io/MemMux/phases/phase-2/)). Phase 3 (active
-optimization) is next.
+🚧 Early development (current release **v0.8.0**); APIs are unstable. **Phases 0–2 are complete and
+the daemon now actively *enforces* the memory contract:**
+
+- **Attribution (Phase 0):** real per-task memory sampling wired into the daemon — per-process
+  PSS/USS/swap/faults on Linux, phys-footprint on macOS — with ≥ 95% of private memory attributed
+  to a task or shared service.
+- **Memory-safe multiplexer (Phase 1):** daemon, scheduler, bounded terminal capture, per-task Git
+  worktrees, provider adapters, process ownership, and the Ratatui TUI (herdr-style live panes,
+  resizable splits, interactive attach, self-update).
+- **Enforcement:** **recursive termination + escaped-process reconciliation** (reparented workers
+  are still reclaimed), the **graduated pressure ladder** (staged reclamation under memory
+  pressure), and **budget-gated admission** (reservations + a scoring queue that defers agents
+  which would breach the footprint budget).
+- **Lifecycle runtime (Phase 2):** checkpoint / hibernate, native + reconstructed resume,
+  RSS-threshold recycling with a reclaimed-bytes ledger, and Gemini CLI + OpenCode adapters
+  (see [the Phase 2 notes](https://sumanyumuku98.github.io/MemMux/phases/phase-2/)).
+- **Verification & evidence:** the [`memmux-bench`](#benchmarks--verification) suite quantifies the
+  H1–H5 guarantees against `raw`/`tmux`/`herdr`, with a one-command reproducer and a
+  write-up in [`paper/`](./paper).
+
+Phase 3 (active optimization — incremental transcripts, MCP leases, lazy services) is next.
 
 ## License
 
