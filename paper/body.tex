@@ -23,7 +23,9 @@ a terminated agent's process subtree where the raw baseline strands half of it (
 processes, 303\,MiB, at $N{=}10$); and it is the only system that surfaces an escaped child, detecting
 10/10 injected escapes versus a capability the others structurally lack. We report an honest cost:
 the always-on 1\,Hz attribution scan stays near 0.6\% CPU for a single agent but reaches 2.7\% at ten,
-over our 2\% target. We release the engine, the benchmark, and a one-command reproducer.
+over our 2\% target. Driving the same harness with real Claude Code sessions confirms that 100\%
+attribution and low overhead carry over from the stub to live, multi-process agent trees. We release
+the engine, the benchmark, and a one-command reproducer.
 \end{abstract}
 
 \section{Introduction}
@@ -301,6 +303,48 @@ and 2.7\% at ten---over our 2\% target once the fleet reaches ten. The scan is $
 and currently re-reads the whole tree each tick; incremental sampling that touches only changed pids
 is the obvious fix and is future work. We state the miss rather than bury it.
 
+\subsection{Validation on real coding agents}
+\label{sec:realagent}
+
+To test whether the attribution and overhead results are artifacts of the stub, we ran the
+\emph{same} harness against a real coding agent. Each ``agent'' is a headless Claude Code session
+(\code{claude -p}, v2.1.170) editing a scratch Git repository, launched through the identical
+sampling and teardown pipeline via the benchmark's \code{-{}-agent-cmd} mode. We report an $N{=}3$
+hold run on the macOS host (Apple M4 Max, 36\,GiB). A live Claude Code session is a multi-process,
+Node-based tree, so this is a strictly harder attribution target than the single-process stub.
+
+Table~\ref{tab:realagent} gives the result. \sys{} attributes 100\% of every real agent tree to its
+owning task---the H1 gate holds on live agents, not just the stub---and the manager cost stays small
+(7.2\,MiB resident, 0.012\% CPU at three agents, consistent with the small-fleet end of the H5
+curve). Three concurrent real sessions occupy $\sim$0.85\,GB ($\sim$290\,MiB each), confirming that
+the pressure the system governs is real and per-agent-substantial. We are deliberate about what this
+run does \emph{not} show: because these sessions ran to completion and exited cleanly, every launcher
+(including the raw baseline) reclaimed 100\% of its tree, so the cleanup and escaped-process
+\emph{differentiators} do not appear here---they require the forced-termination and double-fork
+conditions that the controlled H2 and H3 scenarios above isolate. This experiment validates that
+attribution and overhead generalize from the stub to real, multi-process agent trees; the controlled
+scenarios remain the setting in which the governance differentiators are exercised.
+
+\begin{table}[t]
+\centering
+\caption{Real Claude Code agents ($N{=}3$, hold scenario, macOS) driven through the identical
+harness. Every launcher attributes the full real (Node-based) agent tree; \sys{}'s manager overhead
+is small. Footprint is steady-state provider$+$manager memory; at $N{=}3$ without an overcommit
+budget the totals are comparable across launchers---this run isolates \emph{attribution and overhead
+on real trees}, not the overcommit footprint differentiator of Figure~\ref{fig:vsn}.}
+\label{tab:realagent}
+\begin{tabular}{lrrr}
+\toprule
+Launcher & Total steady (MiB) & Manager (MiB) & Tree attributed \\
+\midrule
+raw baseline    & 883.6 & 0.0  & 100\% \\
+\code{tmux} 3.6a   & 883.6 & 2.4  & 100\% \\
+\code{herdr} 0.8.0 & 929.6 & 18.2 & 100\% \\
+\sys{} 0.8.0    & 843.5 & 7.2  & 100\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \section{Discussion and Limitations}
 \label{sec:limits}
 
@@ -308,8 +352,11 @@ is the obvious fix and is future work. We state the miss rather than bury it.
 memory-ballast stub, not live models. We trade realism for reproducibility and for identical
 workloads across launchers, which is what makes the comparison fair. The \emph{qualitative}
 guarantees---attribution, cleanup, escape visibility, admission---do not depend on the workload, but
-the specific megabytes for a real Claude- or GPT-driven session will differ, and validating on live
-agents is the most important next step.
+the specific megabytes for a real Claude- or GPT-driven session will differ. We take a first step in
+\S\ref{sec:realagent}, running real Claude Code sessions through the same harness and confirming that
+100\% attribution and low overhead hold on live, multi-process agent trees; a larger live-agent
+study---more agents, longer sessions, and the forced-termination conditions that expose the cleanup
+differentiator---remains the most important next step.
 
 \paragraph{One host, modest fleets.} We evaluate a single 32\,GB Linux host (with a macOS cross-check)
 and $N \le 10$. The harness sweeps to $N{=}20$ and the reproducer emits the full curve; we simply did
@@ -334,7 +381,10 @@ launcher, scenario, and fleet size, with repeated trials---captures the host spe
 regenerates every table and figure here plus the raw per-sample and per-process time series.
 Competitor versions and the measurement date are embedded in the generated report, and any launcher
 that could not be driven is listed with its reason. Reproducing the evaluation on another host is one
-invocation.
+invocation. The same harness accepts a \code{-{}-agent-cmd} flag that substitutes a real coding-agent
+command (e.g.\ \code{claude -p ...}) for the stub, so the real-agent validation of
+\S\ref{sec:realagent} is reproducible through the identical pipeline; that run's report and raw
+per-process series are archived under \code{paper/realagent-run/}.
 
 \section{Conclusion}
 
