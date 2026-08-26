@@ -1,0 +1,83 @@
+% ==========================================================================
+% Shared preamble for both builds (arxiv.tex, workshop.tex). The wrappers set
+% the documentclass + the neurips_2026 option (preprint vs dblblindworkshop)
+% and the author/repo macros; everything visual and structural lives here so
+% the two PDFs never drift.
+% ==========================================================================
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit,backgrounds,calc}
+
+% ------- palette ----------------------------------------------------------
+\definecolor{rawcol}{HTML}{DC2626}   % raw baseline  (red)
+\definecolor{tmuxcol}{HTML}{D97706}  % tmux          (amber)
+\definecolor{herdrcol}{HTML}{0D9488} % herdr         (teal)
+\definecolor{syscol}{HTML}{2563EB}   % MemMux        (blue)
+\definecolor{accentcol}{HTML}{6D28D9}% accent        (violet)
+\definecolor{inkcol}{HTML}{1F2937}   % near-black ink
+\definecolor{panelcol}{HTML}{F3F4F6} % light panel fill
+
+\hypersetup{colorlinks=true, linkcolor=syscol, citecolor=accentcol,
+  urlcolor=syscol, filecolor=syscol}
+
+% ------- shared plot style ------------------------------------------------
+\pgfplotsset{
+  memmux/.style={
+    width=\linewidth, height=5.2cm,
+    tick align=outside, tick pos=left,
+    axis line style={inkcol!55}, axis lines=left,
+    grid=major, grid style={inkcol!10, line width=0.4pt},
+    label style={font=\small}, tick label style={font=\footnotesize},
+    legend style={font=\footnotesize, draw=inkcol!20, rounded corners=2pt,
+      fill=white, fill opacity=0.92, text opacity=1, inner sep=3pt},
+    legend cell align=left,
+    every axis plot/.append style={line width=1.2pt},
+    mark size=2.4pt,
+    clip=false,
+  },
+}
+
+% ------- listing style ----------------------------------------------------
+\lstdefinestyle{shell}{
+  basicstyle=\ttfamily\footnotesize\color{inkcol},
+  backgroundcolor=\color{panelcol},
+  frame=leftline, framerule=1.2pt, rulecolor=\color{syscol!55},
+  xleftmargin=8pt, framexleftmargin=8pt, aboveskip=6pt, belowskip=2pt,
+  breaklines=true, breakatwhitespace=true, columns=fullflexible,
+  keepspaces=true, showstringspaces=false,
+}
+
+% ------- architecture-diagram node styles ---------------------------------
+\tikzset{
+  comp/.style={rounded corners=2.5pt, draw=syscol!45, fill=white,
+    inner sep=4pt, font=\scriptsize, align=center, minimum height=7mm},
+  taskbox/.style={rounded corners=4pt, draw=inkcol!25, fill=inkcol!3,
+    inner sep=5pt},
+  proc/.style={rounded corners=2pt, draw=inkcol!35, fill=white,
+    font=\scriptsize, inner sep=2.5pt, align=center, minimum width=13mm},
+  root/.style={proc, draw=syscol!60, fill=syscol!8, font=\scriptsize\bfseries},
+  escaped/.style={proc, draw=rawcol!70, fill=rawcol!7, font=\scriptsize},
+  client/.style={rounded corners=3pt, draw=inkcol!45, fill=panelcol,
+    inner sep=5pt, font=\scriptsize, align=center},
+  flow/.style={-{Stealth[length=5pt]}, inkcol!75, line width=0.9pt},
+  biflow/.style={{Stealth[length=5pt]}-{Stealth[length=5pt]}, inkcol!75, line width=0.9pt},
+  scan/.style={-{Stealth[length=5pt]}, dashed, syscol!75, line width=0.9pt},
+  esc/.style={-{Stealth[length=5pt]}, dashed, rawcol!75, line width=0.9pt},
+}
+
+% Shared title for both builds.
+\newcommand{\sys}{\textsc{MemMux}}
+\newcommand{\code}[1]{\texttt{#1}}
+\title{\sys{}: Runtime Verification and Honest Resource Attribution\\
+for Fleets of Parallel Coding Agents}

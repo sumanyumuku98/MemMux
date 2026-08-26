@@ -1,30 +1,14 @@
 % ==========================================================================
 % NeurIPS 2026 workshop build — DOUBLE-BLIND (anonymized by the class).
-% Build: tectonic workshop.tex . Shares body.tex with arxiv.tex.
+% Build: tectonic workshop.tex . Shares preamble.tex + body.tex with arxiv.tex.
 % ==========================================================================
 \documentclass{article}
 \usepackage[dblblindworkshop]{neurips_2026} % double-blind workshop; loads natbib; anonymizes authors
+\input{preamble}
 
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\usepackage{microtype}
-\usepackage{hyperref}
-\usepackage{url}
-\usepackage{booktabs}
-\usepackage{amsmath,amssymb}
-\usepackage{graphicx}
-\usepackage{xcolor}
-\usepackage{pgfplots}
-\pgfplotsset{compat=1.17}
-
-\newcommand{\sys}{\textsc{MemMux}}
-\newcommand{\code}[1]{\texttt{#1}}
 % Anonymized build: do NOT reveal the repository (it deanonymizes the author).
 \newcommand{\repourl}{\footnote{Code, benchmark, and a one-command reproducer are open-source and
 will be released; the repository URL is withheld to preserve double-blind review.}}
-
-\title{\sys{}: Runtime Verification and Honest Resource Attribution\\
-for Fleets of Parallel Coding Agents}
 
 % The workshop template requires both \title and \workshoptitle.
 \workshoptitle{Who Verifies the Agents? NeurIPS 2026 Workshop}
