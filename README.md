@@ -6,10 +6,16 @@
   **The memory-aware local runtime for parallel AI coding agents.**
 
   [![CI](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml/badge.svg)](https://github.com/sumanyumuku98/MemMux/actions/workflows/ci.yml)
+  [![Release](https://github.com/sumanyumuku98/MemMux/actions/workflows/release.yml/badge.svg)](https://github.com/sumanyumuku98/MemMux/actions/workflows/release.yml)
   [![Docs](https://github.com/sumanyumuku98/MemMux/actions/workflows/docs.yml/badge.svg)](https://sumanyumuku98.github.io/MemMux/)
 
-  **📖 Full documentation: [sumanyumuku98.github.io/MemMux](https://sumanyumuku98.github.io/MemMux/)**
+  [![Latest release](https://img.shields.io/github/v/release/sumanyumuku98/MemMux?include_prereleases&sort=semver&label=release)](https://github.com/sumanyumuku98/MemMux/releases/latest)
+  [![Downloads](https://img.shields.io/github/downloads/sumanyumuku98/MemMux/total?label=downloads)](https://github.com/sumanyumuku98/MemMux/releases)
+  [![Rust](https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust)](https://www.rust-lang.org/)
+  [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](https://github.com/sumanyumuku98/MemMux/releases/latest)
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
+  **📖 Full documentation: [sumanyumuku98.github.io/MemMux](https://sumanyumuku98.github.io/MemMux/)**
 </div>
 
 ---
