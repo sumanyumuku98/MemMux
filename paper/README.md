@@ -3,7 +3,8 @@
 *"MemMux: Runtime Verification and Honest Resource Attribution for Fleets of Parallel Coding Agents"*
 (Sumanyu Muku, New York University).
 
-Both builds share one body (`body.tex`) and bibliography (`refs.bib`); only the wrapper differs:
+Both builds share one preamble (`preamble.tex`), body (`body.tex`), and bibliography (`refs.bib`);
+only the thin wrapper differs:
 
 | Build | Wrapper | Mode | Author |
 |---|---|---|---|
@@ -26,9 +27,13 @@ or classic TeX Live: `pdflatex <build> && bibtex <build> && pdflatex <build> && 
 (the `neurips_2026.sty` is included, so no download needed), or upload to Overleaf.
 
 ## Files
-- `body.tex` — shared paper body (abstract → appendix + bibliography). Figures are drawn inline with
-  `pgfplots` from the measured data (no image files).
-- `arxiv.tex`, `workshop.tex` — the two wrappers (packages, title/author, `\repourl`).
+- `body.tex` — shared paper body (abstract → conclusion + bibliography). The architecture diagram is
+  drawn in TikZ and every chart is drawn inline with `pgfplots` from the measured data (no image
+  files).
+- `preamble.tex` — shared preamble for both builds: packages, the colour palette, the reusable
+  `pgfplots` chart style, the code-listing style, and the TikZ diagram styles + `\title`.
+- `arxiv.tex`, `workshop.tex` — the two thin wrappers (documentclass + `neurips_2026` option,
+  `\input{preamble}`, author/`\repourl`).
 - `refs.bib` — 13 references, all real and verified.
 - `neurips_2026.sty` — the official NeurIPS 2026 style (bundled so the builds are self-contained).
 - `linux-run/` — provenance for the numbers: `host.json`, the generated `report.md`, and the SVG
