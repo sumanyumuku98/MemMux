@@ -18,11 +18,12 @@ a local runtime that treats resource governance as a set of checkable guarantees
 attribution, complete reclamation, escaped-process visibility, bounded footprint under overcommit,
 and low monitoring overhead---and a claims-disciplined benchmark that measures each guarantee against
 \code{tmux}, a purpose-built agent multiplexer, and a raw-process baseline running identical
-workloads. On a 32\,GB Linux reference host, as the fleet grows to ten agents, \sys{} holds peak
-footprint flat at 435\,MiB while the ungoverned tools grow linearly to 2.1\,GB; it reclaims 100\% of
-a terminated agent's process subtree where the raw baseline strands half of it (ten orphaned
-processes, 303\,MiB, at $N{=}10$); and it is the only system that surfaces an escaped child, detecting
-10/10 injected escapes versus a capability the others structurally lack. We report an honest cost:
+workloads. Under a binding memory budget on a Linux host, \sys{} holds the fleet \emph{under} budget
+(7.5\,GiB) with zero swap---admitting a subset and reclaiming under pressure---while the ungoverned
+tools run every agent, pin the machine at its RAM ceiling ($2\times$ over budget), and spill $\sim$2\,GiB
+into swap; it reclaims 100\% of a terminated agent's process subtree where the raw baseline strands
+half of it (ten orphaned processes, 303\,MiB); and it is the only system that surfaces an escaped
+child, detecting 10/10 injected escapes versus a capability the others structurally lack. We report an honest cost:
 the always-on 1\,Hz attribution scan stays near 0.6\% CPU for a single agent but reaches 2.7\% at ten,
 over our 2\% target. Driving the same harness with real Claude Code sessions confirms that 100\%
 attribution and low overhead carry over from the stub to live, multi-process agent trees. We release
@@ -270,68 +271,83 @@ It is that native capability, not the oracle's coverage, that Table~\ref{tab:mat
 \section{Evaluation}
 \label{sec:eval}
 
-\paragraph{Setup.} The reference host is an AWS \code{m7i.2xlarge}: 8 vCPUs (Intel Xeon Platinum
-8488C), $\approx$31\,GiB RAM, an 8\,GiB swap file, Ubuntu 24.04 (Linux 6.17). Versions: \code{tmux}
-3.4, \sys{} 0.8.0. Each cell is two trials; we report mean\,$\pm$\,95\% CI. We swept fleet sizes
-$N \in \{1,5,10\}$ across three scenarios. A macOS cross-check (Apple M4 Max, 32\,GiB) that also
-exercised \code{herdr} agreed qualitatively: like the other ungoverned managers, \code{herdr} reaped
-its subtrees on teardown but saw no escapes and grew with the fleet. Table~\ref{tab:matrix}
-summarises the head-to-head; the subsections that follow are the evidence behind each cell.
+\paragraph{Setup.} Signals H1--H3 and H5 run on an AWS \code{m7i.2xlarge} reference host (8 vCPUs,
+Intel Xeon Platinum 8488C, $\approx$31\,GiB RAM, Ubuntu 24.04), sweeping $N \in \{1,5,10\}$ over two
+trials. The bounded-footprint claim (H4) needs \emph{real} memory pressure, so we run it on a
+deliberately smaller 15.3\,GiB host (\code{m7i.xlarge}, 4 vCPUs, 12\,GiB swap) with a \emph{realistic}
+per-agent footprint: each agent holds $\sim$1.4\,GiB, matching the Standard-class reservation prior,
+so admission is well-calibrated (reservation $\approx$ actual) rather than over-reserving, and
+$N{=}12$ agents ($\sim$18\,GiB) genuinely overcommit the machine. That run is \emph{five} trials; we
+report mean\,$\pm$\,95\% CI throughout (at the two-trial sweeps the interval is indicative). A macOS
+cross-check (Apple M4 Max, 32\,GiB) that also exercised \code{herdr} agreed qualitatively: like the
+other ungoverned managers, \code{herdr} reaped its subtrees on teardown but saw no escapes and grew
+with the fleet. Table~\ref{tab:matrix} summarises the head-to-head; the subsections that follow are
+the evidence behind each cell.
 
 \begin{table}[t]
 \centering\small
 \setlength{\tabcolsep}{5pt}
 \begin{tabular}{@{}lcccrcr@{}}
 \toprule
-Launcher & Attrib. & Cleanup & Escaped & Footprint$_{N=10}$ & Ckpt. & Overhead \\
+Launcher & Attrib. & Cleanup & Escaped & Footprint (budget) & Swap & Ckpt. \\
 \midrule
-raw baseline    & \xmark & 50\%          & \xmark & 2146\,MiB          & \xmark & ---        \\
-\code{tmux} 3.4 & \xmark & \textbf{100\%}& \xmark & 2149\,MiB          & \xmark & $\approx$0 \\
-\sys{} 0.8.0    & \cmark & \textbf{100\%}& \cmark~10/10 & \textbf{435\,MiB} & \cmark$^\dagger$ & 2.7\% \\
+raw baseline    & \xmark & 50\%          & \xmark & 15075\,MiB          & 1882\,MiB          & \xmark \\
+\code{tmux} 3.4 & \xmark & \textbf{100\%}& \xmark & 15347\,MiB          & 2165\,MiB          & \xmark \\
+\sys{} 0.9.0    & \cmark & \textbf{100\%}& \cmark~10/10 & \textbf{7479\,MiB} & \textbf{0} & \cmark$^\dagger$ \\
 \bottomrule
 \end{tabular}
-\caption{Head-to-head on the five signals (Linux reference host). \sys{} is the only launcher that
-natively attributes per-agent memory (H1), surfaces escaped processes (H3), bounds the fleet's
-footprint under overcommit (H4), and can checkpoint dirty work before a reclaim. It \emph{matches}
-\code{tmux} on teardown cleanup (H2) and---stated plainly---pays a monitoring cost the ungoverned
-tools do not (H5). Attribution is the \emph{native} capability, not the oracle's coverage
-(\S\ref{sec:method}). $^\dagger$Checkpoint-before-reclaim is confirmed by a daemon-level unit test; the
-pressure path was not triggered end-to-end in this benchmark (\S\ref{sec:eval}). Each cell is the
-headline result for that signal; the subsections give the detail.}
+\caption{Head-to-head on the signals (Linux reference host). \sys{} is the only launcher that
+natively attributes per-agent memory (H1), surfaces escaped processes (H3), holds the fleet
+\emph{under} a binding memory budget with zero swap (H4), and can checkpoint dirty work before a
+reclaim. It \emph{matches} \code{tmux} on teardown cleanup (H2). Footprint/swap are peaks under a
+binding 7500\,MiB budget on a 15.3\,GiB host ($N{=}12$); the ungoverned tools overcommit to the RAM
+ceiling and spill $\sim$2\,GiB into swap. Attribution is the \emph{native} capability, not the
+oracle's coverage (\S\ref{sec:method}); \sys{} also pays a monitoring cost the baselines do not (H5,
+\S\ref{sec:eval}). $^\dagger$Checkpoint is confirmed by a daemon-level unit test, not triggered
+end-to-end. Each cell is the headline result for that signal.}
 \label{tab:matrix}
 \end{table}
 
 \subsection{H4: bounded footprint under overcommit}
 
-We give \sys{} a budget of 3000\,MiB---below the aggregate reservation of the larger fleets---and
-start all $N$ agents under each launcher. Table~\ref{tab:h4} reports peak total footprint against
-fleet size. The ungoverned launchers scale linearly: at ten agents they reach 2.1\,GB. \sys{} admits
-what fits (one agent at $N{=}1$; two at $N{=}5$ and $N{=}10$, deferring the rest with a visible
-reason---3 and 8 deferrals respectively) and holds peak footprint flat at 435\,MiB, a $4.9\times$
-separation at $N{=}10$: without a budget, a fleet's footprint is simply the sum of its agents.
+We make the budget \emph{binding}. Each agent holds a realistic $\sim$1.4\,GiB (the Standard-class
+reservation prior, so admission is well-calibrated rather than over-reserving a tiny stub), and
+$N{=}12$ such agents ($\sim$18\,GiB) overcommit a 15.3\,GiB host. \sys{} is given a 7500\,MiB
+budget---roughly half what the fleet wants. Table~\ref{tab:h4} reports peak total footprint and peak
+swap over five trials. The ungoverned launchers run all twelve agents: their resident set pins the
+machine at its $\sim$15\,GiB RAM ceiling---$2.0\times$ over the budget---and spills 1.9--2.2\,GiB into
+swap. \sys{} instead governs: its admission planner defers seven starts and its pressure ladder
+performs twelve reclamations, holding peak footprint at 7479\,MiB (\emph{under} budget), settling to
+4.5\,GiB steady, with \textbf{zero} swap.
 
 \begin{table}[t]
 \centering\small
 \begin{tabular}{@{}lrrr@{}}
 \toprule
-Launcher & $N{=}1$ & $N{=}5$ & $N{=}10$ \\
+Launcher & Peak (MiB) & Steady (MiB) & Peak swap (MiB) \\
 \midrule
-raw baseline & 215 & 1074 & 2146 \\
-\code{tmux} 3.4     & 218 & 1076 & 2149 \\
-\sys{} 0.8.0 & 220 & \textbf{435} & \textbf{435} \\
+raw baseline & 15075 & 15069 & 1882 \\
+\code{tmux} 3.4     & 15347 & 15069 & 2165 \\
+\sys{} 0.9.0 & \textbf{7479} & \textbf{4512} & \textbf{0} \\
 \bottomrule
 \end{tabular}
-\caption{Peak fleet footprint (MiB) under a 3000\,MiB budget (\emph{overcommit}). The ungoverned
-launchers scale linearly with the fleet (raw and \code{tmux} track each other to within noise); \sys{}
-holds flat at 435\,MiB by deferring admissions---a $4.9\times$ separation at $N{=}10$.}
+\caption{Binding-budget \emph{overcommit} ($N{=}12$ agents, $\sim$1.4\,GiB each, 15.3\,GiB host, five
+trials). \sys{}'s 7500\,MiB budget is half the $\sim$15\,GiB the ungoverned fleet uses; \sys{} holds
+peak footprint under budget with zero swap (7 deferrals $+$ 12 reclamations), while raw and \code{tmux}
+overcommit the machine $2\times$ and spill $\sim$2\,GiB into swap.}
 \label{tab:h4}
 \end{table}
 
-The \emph{no-lost-work} half of H4 is a capability we verify but did not trigger here: because \sys{}
-defers at admission, the pressure ladder rarely needs to reclaim a running victim. A daemon-level test
-confirms the guarantee directly---a task with a dirty Git worktree, forced into the emergency stage,
-produces a checkpoint carrying its patch hash \emph{before} the process is terminated. Ungoverned
-launchers have no checkpoint mechanism, so this is reported as a capability they lack, not a number.
+The honest trade-off is throughput: \sys{} keeps $\sim$5 agents resident and defers the rest, so
+enforcing the budget means not running every agent at once. But that is the \emph{point} of a
+budget---the ungoverned tools ``succeed'' at running all twelve only by driving the machine into swap,
+where an OOM kill can strike. The \emph{no-lost-work} half of H4 is the safety net for exactly that
+case: before the pressure ladder's \emph{emergency} stage terminates a victim it first captures a
+durable checkpoint (git HEAD $+$ patch hash). Here the twelve reclamations were hibernate/recycle
+actions that never reached emergency termination, so this path was not exercised end-to-end; a
+daemon-level test confirms it directly---a task with a dirty worktree, forced into the emergency
+stage, produces a checkpoint carrying its patch hash \emph{before} the process is terminated. Ungoverned
+launchers have no checkpoint mechanism at all.
 
 \subsection{H2: complete cleanup on teardown}
 
@@ -433,12 +449,12 @@ differentiator---remains the most important next step.
 and $N \le 10$. The harness sweeps to $N{=}20$ and the reproducer emits the full curve; we simply did
 not run larger fleets, on which the CPU-overhead question (H5) becomes sharper.
 
-\paragraph{Conservative admission.} \sys{} reserves each task's class-predicted peak, which for our
-stub is well above its actual RSS---so the flat 435\,MiB in Table~\ref{tab:h4} reflects admission
-protecting against the \emph{reservation}, and \sys{} leaves headroom on the table (it deferred agents
-that would have fit). An exponentially-weighted predictor that tightens reservations toward observed
-peaks is designed and is future work. The bounded-footprint claim stands; the specific admit count
-would rise with a tighter predictor.
+\paragraph{Static reservations.} \sys{} reserves each task's \emph{class-predicted} peak---a static
+prior. Our H4 run sizes agents to that prior on purpose, so admission is well-calibrated; but for an
+atypically small agent the prior over-reserves (deferring starts that would have fit), and for an
+atypically large one it under-reserves. An exponentially-weighted predictor that tightens the
+reservation toward each task's \emph{observed} peak is designed and is future work; the
+bounded-footprint guarantee is unaffected---only the admit count moves with the predictor's accuracy.
 
 \paragraph{Overhead not yet met.} Monitoring exceeds 2\% CPU by ten agents (above); incremental
 sampling is the planned fix. As stated in \S\ref{sec:method}, these are empirical monitors, not
@@ -459,23 +475,28 @@ per-process series are archived under \code{paper/realagent-run/}.
 
 \begin{lstlisting}[style=shell]
 memmux-bench paper --out paper-out              # full matrix
+MEMMUX_BENCH_HOLD_MIB=1400 memmux-bench paper \  # binding-budget H4 (Table 3)
+    --scenarios overcommit --agents-sweep 12 \
+    --agent-budget-mib 7500 --trials 5 --out oc-out
 memmux-bench run  --agents 3 --agent-cmd \
     'claude -p "..."' --out real-out            # same harness, real agent
 \end{lstlisting}
 
 \noindent Each run writes \code{host.json} (OS, CPU model, core count, physical RAM, tool versions),
 a Markdown report, and per-cell \code{*.jsonl} / \code{*.procs.jsonl} time series (RSS, PSS, USS,
-swap, and page faults per process on Linux), plus the figures.
+swap, and page faults per process on Linux), plus the figures. The binding-budget H4 run above is
+archived under \code{paper/overcommit-run/}.
 
 \section{Conclusion}
 
 Fleets of coding agents have outrun the tools we use to run them: multiplexers arrange them, but
 nothing governs them. We argued that memory governance for such fleets is a verification problem and
 built \sys{} to make five guarantees checkable at runtime, with a benchmark honest enough to admit
-where those guarantees do \emph{not} distinguish us. On a 32\,GB Linux host the payoff is concrete---a
-flat versus linear footprint under overcommit ($4.9\times$ at ten agents), complete cleanup where the
-raw baseline strands half a fleet, and full visibility into escaped processes that the alternatives
-cannot see---alongside an honest overhead cost we have not yet driven under 2\%. The path from here is
+where those guarantees do \emph{not} distinguish us. The payoff is concrete: under a binding budget
+\sys{} holds the fleet under budget and \emph{off swap} where the ungoverned tools overcommit the
+machine ($2\times$ over budget, $\sim$2\,GiB into swap), it reclaims a terminated agent's whole subtree
+where the raw baseline strands half a fleet, and it gives full visibility into escaped processes that
+the alternatives cannot see---alongside an honest overhead cost we have not yet driven under 2\%. The path from here is
 a live-agent workload and larger fleets; the reproducer makes both a single command away. Verifying
 an agent is not only checking what it produced---it is also checking that the system running it kept
 its promises; the signals and the claims discipline here are a step toward the latter.
