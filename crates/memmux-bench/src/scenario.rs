@@ -213,19 +213,38 @@ impl Scenario {
             // Fixed timing, independent of `intensity` (like Hold): a resident agent WITH a child
             // subtree, held ~60s so all N stay concurrently live under the constrained budget long
             // enough to be sampled and, if the budget is tight enough, reclaimed (SUM-167/168 / H4).
-            // The 120 MiB is held for the whole sleep then freed, so a single agent's own footprint
-            // is a bounded plateau (peak base+120) that returns to baseline — NOT a leak — while N
-            // such agents aggregate well past a few-hundred-MiB budget, forcing MemMux to govern.
-            Scenario::Overcommit => SessionRecording::new("overcommit", provider, base)
-                .with(Step::Allocate { mib: 120 })
-                .with(Step::SpawnChild {
-                    mib: 30,
-                    hold_ms: 60_000,
-                })
-                .with(Step::Sleep { ms: 60_000 })
-                .with(Step::Free { mib: 120 }),
+            // The held MiB is held for the whole sleep then freed, so a single agent's own footprint
+            // is a bounded plateau (peak base+hold) that returns to baseline — NOT a leak — while N
+            // such agents aggregate well past the budget, forcing MemMux to govern.
+            //
+            // The per-agent resident footprint is configurable via `MEMMUX_BENCH_HOLD_MIB` (default
+            // 120). Setting it near the Standard-class reservation prior (~1.4 GiB) makes the
+            // constrained budget genuinely BINDING against a realistic footprint — so admission is
+            // well-calibrated (reservation ≈ actual) rather than reserving ~7× the tiny default.
+            Scenario::Overcommit => {
+                let hold = overcommit_hold_mib();
+                SessionRecording::new("overcommit", provider, base)
+                    .with(Step::Allocate { mib: hold })
+                    .with(Step::SpawnChild {
+                        mib: 30,
+                        hold_ms: 60_000,
+                    })
+                    .with(Step::Sleep { ms: 60_000 })
+                    .with(Step::Free { mib: hold })
+            }
         }
     }
+}
+
+/// Per-agent resident footprint (MiB) held by the `overcommit` scenario, from
+/// `MEMMUX_BENCH_HOLD_MIB` (default 120). A positive parse wins; anything else falls back to the
+/// default. Used to make the H4 budget binding against a realistic footprint (SUM-167).
+fn overcommit_hold_mib() -> u64 {
+    std::env::var("MEMMUX_BENCH_HOLD_MIB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&m| m > 0)
+        .unwrap_or(120)
 }
 
 /// Bootstrap baseline resident memory per provider, in mebibytes (rough §7.3 priors).
