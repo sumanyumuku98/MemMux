@@ -258,7 +258,28 @@ is worse than none.
 3.4, \sys{} 0.8.0. Each cell is two trials; we report mean\,$\pm$\,95\% CI. We swept fleet sizes
 $N \in \{1,5,10\}$ across three scenarios. A macOS cross-check (Apple M4 Max, 32\,GiB) that also
 exercised \code{herdr} agreed qualitatively: like the other ungoverned managers, \code{herdr} reaped
-its subtrees on teardown but saw no escapes and grew with the fleet.
+its subtrees on teardown but saw no escapes and grew with the fleet. Table~\ref{tab:matrix}
+summarises the head-to-head; the subsections that follow are the evidence behind each cell.
+
+\begin{table}[t]
+\centering\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}lcccrcr@{}}
+\toprule
+Launcher & Attrib. & Cleanup & Escaped & Footprint$_{N=10}$ & Ckpt. & Overhead \\
+\midrule
+raw baseline    & \xmark & 50\%          & \xmark & 2146\,MiB          & \xmark & ---        \\
+\code{tmux} 3.4 & \xmark & \textbf{100\%}& \xmark & 2149\,MiB          & \xmark & $\approx$0 \\
+\sys{} 0.8.0    & \cmark & \textbf{100\%}& \cmark~10/10 & \textbf{435\,MiB} & \cmark & 2.7\% \\
+\bottomrule
+\end{tabular}
+\caption{Head-to-head on the five signals (Linux reference host). \sys{} is the only launcher that
+natively attributes per-agent memory (H1), surfaces escaped processes (H3), bounds the fleet's
+footprint under overcommit (H4), and checkpoints dirty work before any reclaim. It \emph{matches}
+\code{tmux} on teardown cleanup (H2) and---stated plainly---pays a monitoring cost the ungoverned
+tools do not (H5). Each cell is the headline result for that signal; the subsections give the detail.}
+\label{tab:matrix}
+\end{table}
 
 \subsection{H4: bounded footprint under overcommit}
 
@@ -296,57 +317,22 @@ launchers have no checkpoint mechanism, so this is reported as a capability they
 
 Each launcher starts a fleet whose agents each hold a memory-bearing child, then is torn down exactly
 as it normally would be (raw: kill the roots; \code{tmux}: \code{kill-server}; \sys{}: terminate each
-task). Ten seconds later we count survivors from the owned set (Table~\ref{tab:h2}). The raw baseline
-strands every child it spawned---its teardown kills only the roots, orphaning the grandchildren---and
-the leak grows with the fleet, to ten processes and 303\,MiB at $N{=}10$. \code{tmux} and \sys{} both
-reap their full subtree at every size.
-
-\begin{table}[t]
-\centering\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-Launcher & Fleet $N$ & Leaked procs & Leaked MiB & Reclaimed \\
-\midrule
-raw baseline & 1  & 1  & 30.6  & 50.0\% \\
-raw baseline & 5  & 5  & 151.8 & 50.0\% \\
-raw baseline & 10 & 10 & 303.0 & 50.0\% \\
-\code{tmux} 3.4     & 10 & 0  & 0.0   & 100.0\% \\
-\sys{} 0.8.0 & 10 & 0  & 0.0   & 100.0\% \\
-\bottomrule
-\end{tabular}
-\caption{Survivors after normal teardown (\emph{hold}). The raw baseline leaks half of every fleet,
-growing to 303\,MiB at $N{=}10$; \code{tmux} and \sys{} reclaim 100\% at all $N$.}
-\label{tab:h2}
-\end{table}
-
-The honest reading: on \emph{explicit} teardown, cleanup separates \sys{} from the raw baseline, not
-from a real multiplexer---\code{tmux} reaps its subtrees too. This is the kind of result the claims
-discipline exists to surface.
+task). Ten seconds later we count survivors from the owned set. The raw baseline strands every child
+it spawned---its teardown kills only the roots, orphaning the grandchildren---and the leak grows with
+the fleet: one process and 30.6\,MiB at $N{=}1$, ten processes and 303\,MiB at $N{=}10$ (50\%
+reclaimed at every size). \code{tmux} and \sys{} both reap their full subtree at every size (0 leaked,
+100\% reclaimed). The honest reading, which the claims discipline exists to surface: on \emph{explicit}
+teardown, cleanup separates \sys{} from the raw baseline, not from a real multiplexer---\code{tmux}
+reaps its subtrees too.
 
 \subsection{H3: escaped-process visibility}
 
 We inject escapes: a stub forks an intermediate that spawns a memory-holding grandchild and then
 exits, reparenting the grandchild to \code{init} while it stays alive. The harness independently
-confirms the reparenting, then asks each launcher what it detected (Table~\ref{tab:h3}). \sys{}
-surfaces every escape---1/1, 5/5, 10/10---through events read from the daemon; the baselines have no
-mechanism to notice. This is a capability, not a tuning difference, and it is the cleanest
-separation from a real competitor.
-
-\begin{table}[t]
-\centering\small
-\begin{tabular}{@{}lrrl@{}}
-\toprule
-Launcher & Injected & Detected & Note \\
-\midrule
-raw-baseline & 10 & --- & unsupported \\
-tmux 3.4     & 10 & --- & unsupported \\
-\sys{} 0.8.0 & 1 / 5 / 10 & 1 / 5 / 10 & detected all, every $N$ \\
-\bottomrule
-\end{tabular}
-\caption{Escaped-process detection (\emph{escape}). ``---'' denotes no detection mechanism; it is
-never scored as zero-of-measured.}
-\label{tab:h3}
-\end{table}
+confirms the reparenting, then asks each launcher what it detected. \sys{} surfaces every
+escape---1/1, 5/5, 10/10---through events read from the daemon; the baselines have no mechanism to
+notice, so they are recorded as unsupported, never scored as zero-of-measured. This is a capability,
+not a tuning difference, and it is the cleanest separation from a real competitor.
 
 \subsection{H1 and H5: attribution and the cost of governance}
 
