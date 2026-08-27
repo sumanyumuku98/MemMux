@@ -334,10 +334,12 @@ escape---1/1, 5/5, 10/10---through events read from the daemon; the baselines ha
 notice, so they are recorded as unsupported, never scored as zero-of-measured. This is a capability,
 not a tuning difference, and it is the cleanest separation from a real competitor.
 
-\subsection{H1 and H5: attribution and the cost of governance}
+\subsection{H1 \& H5: what the attribution scan delivers, and what it costs}
 
-Across every run \sys{} attributed 100\% of each launched tree's proportional memory to its owning
-task (H1). The cost of governance in \emph{memory} is small and we report it plainly: the \sys{}
+We pair these two signals because they are the benefit and the price of a single mechanism: the
+always-on $1$\,Hz PSS scan produces the attribution guarantee (H1) and incurs the monitoring cost
+(H5). Across every run \sys{} attributed 100\% of each launched tree's proportional memory to its
+owning task (H1). The cost of governance in \emph{memory} is small and we report it plainly: the \sys{}
 daemon's own resident footprint is 4.6--5.4\,MiB (growing slightly with the fleet), against 2.4\,MiB
 for the \code{tmux} server and zero for the raw baseline. The cost in \emph{CPU} is the honest weak
 spot (H5): the always-on 1\,Hz full-tree PSS scan costs 0.6\% CPU at a single agent, 1.5\% at five,
