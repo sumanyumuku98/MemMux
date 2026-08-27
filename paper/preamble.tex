@@ -26,6 +26,12 @@
 \newcommand{\cmark}{{\color{syscol}\checkmark}}
 \newcommand{\xmark}{{\color{inkcol!40}\ensuremath{\times}}}
 
+% Named (arXiv) vs anonymized (workshop) build. The named wrapper sets \namedbuildtrue; the
+% anonymized build leaves it false, so runnable commands / the repo URL appear only where the reader
+% can actually act on them.
+\newif\ifnamedbuild
+\namedbuildfalse
+
 % ------- palette ----------------------------------------------------------
 \definecolor{rawcol}{HTML}{DC2626}   % raw baseline  (red)
 \definecolor{tmuxcol}{HTML}{D97706}  % tmux          (amber)
