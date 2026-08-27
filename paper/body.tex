@@ -115,7 +115,8 @@ organized around making each signal checkable (Figure~\ref{fig:arch}).
 
 \begin{figure}[t]
 \centering
-\begin{tikzpicture}[node distance=2.6mm and 15mm]
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[node distance=3mm and 16mm]
   % --- client ---
   \node[client] (client) {Terminal\\client};
   % --- daemon components ---
@@ -129,32 +130,33 @@ organized around making each signal checkable (Figure~\ref{fig:arch}).
   \end{scope}
   \node[font=\scriptsize\bfseries\color{syscol}, anchor=south] at (daemon.north)
         {\code{memmuxd} daemon};
-  % --- owned process trees ---
-  \node[root, right=of attr] (rA) {agent A};
-  \node[proc, below=6.5mm of rA, xshift=-10mm] (a1) {LSP};
-  \node[proc, below=6.5mm of rA, xshift=10mm]  (a2) {tests};
-  \node[root, below=20mm of rA] (rB) {agent B};
-  \node[proc, below=6.5mm of rB, xshift=-10mm] (b1) {shell};
-  \node[proc, below=6.5mm of rB, xshift=10mm]  (b2) {build};
+  % --- owned process trees (pushed right to give the edges room) ---
+  \node[root, right=34mm of attr] (rA) {agent A};
+  \node[proc, below=7mm of rA, xshift=-11mm] (a1) {LSP};
+  \node[proc, below=7mm of rA, xshift=11mm]  (a2) {tests};
+  \node[root, below=22mm of rA] (rB) {agent B};
+  \node[proc, below=7mm of rB, xshift=-11mm] (b1) {shell};
+  \node[proc, below=7mm of rB, xshift=11mm]  (b2) {build};
   \begin{scope}[on background layer]
     \node[taskbox, fit=(rA)(a1)(a2)(rB)(b1)(b2), inner sep=9pt] (trees) {};
   \end{scope}
   \node[font=\scriptsize\bfseries\color{inkcol}, anchor=south] at (trees.north)
         {owned process trees};
   % --- escaped child ---
-  \node[escaped, below=9mm of b2] (esc) {escaped child\\reparented to \code{init}};
+  \node[escaped, below=10mm of b2] (esc) {escaped child\\reparented to \code{init}};
   % --- tree edges ---
   \draw[flow] (rA) -- (a1); \draw[flow] (rA) -- (a2);
   \draw[flow] (rB) -- (b1); \draw[flow] (rB) -- (b2);
   \draw[esc]  (b2) -- (esc);
-  % --- control + measurement edges ---
+  % --- control + measurement edges (launch at agent-A level, scan dips to agent-B level) ---
   \draw[biflow] (client.east) -- node[above,font=\scriptsize]{UDS} (daemon.west|-client);
-  \draw[flow] (daemon.east|-rA) -- node[above,font=\scriptsize,align=center]{launch\\\& own} (rA.west);
+  \draw[flow] (daemon.east|-rA) -- node[above,font=\scriptsize]{launch \& own} (trees.west|-rA);
   \draw[scan] (attr.east) to[out=0,in=180]
-        node[above,font=\scriptsize,pos=0.55]{$1$\,Hz PSS scan} (trees.west|-attr);
-  \draw[esc] (esc.south) -- ++(0,-4mm) -|
+        node[below,font=\scriptsize,pos=0.62]{$1$\,Hz PSS scan} (trees.west|-rB);
+  \draw[esc] (esc.south) -- ++(0,-5mm) -|
         node[below,font=\scriptsize,pos=0.25]{reconcile $\to$ escaped event} (daemon.south);
-\end{tikzpicture}
+\end{tikzpicture}%
+}
 \caption{\sys{} architecture. A terminal client drives the \code{memmuxd} daemon over a Unix
 domain socket. The daemon launches and \emph{owns} each agent's process tree; a $1$\,Hz sampler sums
 proportional memory (PSS) across every owned subtree (H1), reconciliation flags any child that
@@ -253,35 +255,29 @@ footprint with the fleet.
 \subsection{H4: bounded footprint under overcommit}
 
 We give \sys{} a budget of 3000\,MiB---below the aggregate reservation of the larger fleets---and
-start all $N$ agents under each launcher. Figure~\ref{fig:vsn} plots peak total footprint against
+start all $N$ agents under each launcher. Table~\ref{tab:h4} reports peak total footprint against
 fleet size. The ungoverned launchers scale linearly: at ten agents they reach 2.1\,GB. \sys{} admits
 what fits (one agent at $N{=}1$; two at $N{=}5$ and $N{=}10$, deferring the rest with a visible
 reason---3 and 8 deferrals respectively) and holds peak footprint flat at 435\,MiB, a $4.9\times$
 separation at $N{=}10$. This is the sharpest result in the paper and the one that most directly
 motivates governance: without a budget, a fleet's footprint is simply the sum of its agents.
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}
-\begin{axis}[memmux,
-  width=0.82\linewidth, height=5.4cm,
-  xlabel={Fleet size $N$ (agents)}, ylabel={Peak footprint (MiB)},
-  xtick={1,5,10}, ymin=0, ymax=2450, legend pos=north west,
-]
-\addplot[rawcol,  mark=*]         coordinates {(1,215.3)(5,1073.7)(10,2146.2)}; \addlegendentry{raw baseline}
-\addplot[tmuxcol, mark=square*]   coordinates {(1,217.7)(5,1076.1)(10,2148.6)}; \addlegendentry{\code{tmux} 3.4}
-\addplot[syscol,  mark=triangle*, mark size=3pt] coordinates {(1,219.9)(5,434.8)(10,434.8)}; \addlegendentry{\sys{} 0.8.0}
-% annotate the separation at N=10
-\draw[{Stealth[length=5pt]}-{Stealth[length=5pt]}, accentcol, line width=0.9pt]
-  (axis cs:10,434.8) -- (axis cs:10,2146.2);
-\node[fill=white, inner sep=1.5pt, font=\footnotesize\bfseries, color=accentcol]
-  at (axis cs:10,1300) {$4.9\times$};
-\end{axis}
-\end{tikzpicture}
-\caption{Peak fleet footprint under a 3000\,MiB budget (\emph{overcommit}). Ungoverned tools scale
-linearly with the fleet; \sys{} stays flat by deferring admissions ($4.9\times$ lower at $N{=}10$).}
-\label{fig:vsn}
-\end{figure}
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Launcher & $N{=}1$ & $N{=}5$ & $N{=}10$ \\
+\midrule
+raw baseline & 215 & 1074 & 2146 \\
+\code{tmux} 3.4     & 218 & 1076 & 2149 \\
+\sys{} 0.8.0 & 220 & \textbf{435} & \textbf{435} \\
+\bottomrule
+\end{tabular}
+\caption{Peak fleet footprint (MiB) under a 3000\,MiB budget (\emph{overcommit}). The ungoverned
+launchers scale linearly with the fleet (raw and \code{tmux} track each other to within noise); \sys{}
+holds flat at 435\,MiB by deferring admissions---a $4.9\times$ separation at $N{=}10$.}
+\label{tab:h4}
+\end{table}
 
 The \emph{no-lost-work} half of H4 is a capability we verify but did not trigger here: because \sys{}
 defers at admission, the pressure ladder rarely needs to reclaim a running victim. A daemon-level test
@@ -293,33 +289,28 @@ launchers have no checkpoint mechanism, so this is reported as a capability they
 
 Each launcher starts a fleet whose agents each hold a memory-bearing child, then is torn down exactly
 as it normally would be (raw: kill the roots; \code{tmux}: \code{kill-server}; \sys{}: terminate each
-task). Ten seconds later we count survivors from the owned set (Figure~\ref{fig:h2}). The raw baseline
+task). Ten seconds later we count survivors from the owned set (Table~\ref{tab:h2}). The raw baseline
 strands every child it spawned---its teardown kills only the roots, orphaning the grandchildren---and
 the leak grows with the fleet, to ten processes and 303\,MiB at $N{=}10$. \code{tmux} and \sys{} both
 reap their full subtree at every size.
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}
-\begin{axis}[memmux,
-  width=0.82\linewidth, height=5.0cm,
-  ybar, bar width=8pt, enlarge x limits=0.28,
-  symbolic x coords={1,5,10}, xtick=data,
-  xlabel={Fleet size $N$ (agents)}, ylabel={Leaked memory (MiB)},
-  ymin=0, ymax=340, legend pos=north west,
-  nodes near coords, every node near coord/.append style={font=\tiny, color=inkcol},
-]
-\addplot[fill=rawcol!85,  draw=rawcol]  coordinates {(1,30.6)(5,151.8)(10,303.0)}; \addlegendentry{raw baseline}
-\addplot[fill=tmuxcol!85, draw=tmuxcol] coordinates {(1,0)(5,0)(10,0)};            \addlegendentry{\code{tmux}}
-\addplot[fill=syscol!85,  draw=syscol]  coordinates {(1,0)(5,0)(10,0)};            \addlegendentry{\sys{}}
-\end{axis}
-\end{tikzpicture}
-\caption{Memory stranded ten seconds after normal teardown (\emph{hold}). The raw baseline kills only
-the roots, so it leaks a grandchild per agent---half of every fleet, growing to 303\,MiB at $N{=}10$
-(50\% reclaimed). \code{tmux} and \sys{} reap their full subtree at every size (0 leaked, 100\%
-reclaimed).}
-\label{fig:h2}
-\end{figure}
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Launcher & Fleet $N$ & Leaked procs & Leaked MiB & Reclaimed \\
+\midrule
+raw baseline & 1  & 1  & 30.6  & 50.0\% \\
+raw baseline & 5  & 5  & 151.8 & 50.0\% \\
+raw baseline & 10 & 10 & 303.0 & 50.0\% \\
+\code{tmux} 3.4     & 10 & 0  & 0.0   & 100.0\% \\
+\sys{} 0.8.0 & 10 & 0  & 0.0   & 100.0\% \\
+\bottomrule
+\end{tabular}
+\caption{Survivors after normal teardown (\emph{hold}). The raw baseline leaks half of every fleet,
+growing to 303\,MiB at $N{=}10$; \code{tmux} and \sys{} reclaim 100\% at all $N$.}
+\label{tab:h2}
+\end{table}
 
 The honest reading: on \emph{explicit} teardown, cleanup separates \sys{} from the raw baseline, not
 from a real multiplexer---\code{tmux} reaps its subtrees too. This is the kind of result the claims
@@ -357,31 +348,9 @@ task (H1). The cost of governance in \emph{memory} is small and we report it pla
 daemon's own resident footprint is 4.6--5.4\,MiB (growing slightly with the fleet), against 2.4\,MiB
 for the \code{tmux} server and zero for the raw baseline. The cost in \emph{CPU} is the honest weak
 spot (H5): the always-on 1\,Hz full-tree PSS scan costs 0.6\% CPU at a single agent, 1.5\% at five,
-and 2.7\% at ten---over our 2\% target once the fleet reaches ten (Figure~\ref{fig:h5}). The scan is
-$O(\text{processes})$ and currently re-reads the whole tree each tick; incremental sampling that
-touches only changed pids is the obvious fix and is future work. We state the miss rather than bury
-it.
-
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}
-\begin{axis}[memmux,
-  width=0.82\linewidth, height=4.8cm,
-  xlabel={Fleet size $N$ (agents)}, ylabel={Monitor CPU (\%)},
-  xtick={1,5,10}, ymin=0, ymax=3.1, legend pos=north west,
-]
-\addplot[rawcol, dashed, line width=1pt, mark=none] coordinates {(1,2)(10,2)}; \addlegendentry{2\% target}
-\addplot[syscol, mark=*] coordinates {(1,0.6)(5,1.5)(10,2.7)}; \addlegendentry{\sys{} monitor}
-\node[font=\tiny, color=inkcol, anchor=south west] at (axis cs:1,0.6) {0.6};
-\node[font=\tiny, color=inkcol, anchor=south]      at (axis cs:5,1.5) {1.5};
-\node[font=\tiny, color=inkcol, anchor=south east] at (axis cs:10,2.7) {2.7};
-\end{axis}
-\end{tikzpicture}
-\caption{Cost of the always-on $1$\,Hz attribution scan (H5), the paper's honest weak spot. Overhead
-is linear in the process count and crosses the 2\% target between five and ten agents; incremental
-sampling is the planned fix. The baselines run no such monitor.}
-\label{fig:h5}
-\end{figure}
+and 2.7\% at ten---over our 2\% target once the fleet reaches ten. The scan is $O(\text{processes})$
+and currently re-reads the whole tree each tick; incremental sampling that touches only changed pids
+is the obvious fix and is future work. We state the miss rather than bury it.
 
 \subsection{Validation on real coding agents}
 \label{sec:realagent}
@@ -411,7 +380,7 @@ scenarios remain the setting in which the governance differentiators are exercis
 harness. Every launcher attributes the full real (Node-based) agent tree; \sys{}'s manager overhead
 is small. Footprint is steady-state provider$+$manager memory; at $N{=}3$ without an overcommit
 budget the totals are comparable across launchers---this run isolates \emph{attribution and overhead
-on real trees}, not the overcommit footprint differentiator of Figure~\ref{fig:vsn}.}
+on real trees}, not the overcommit footprint differentiator of Table~\ref{tab:h4}.}
 \label{tab:realagent}
 \begin{tabular}{lrrr}
 \toprule
@@ -443,7 +412,7 @@ and $N \le 10$. The harness sweeps to $N{=}20$ and the reproducer emits the full
 not run larger fleets, on which the CPU-overhead question (H5) becomes sharper.
 
 \paragraph{Conservative admission.} \sys{} reserves each task's class-predicted peak, which for our
-stub is well above its actual RSS---so the flat 435\,MiB in Figure~\ref{fig:vsn} reflects admission
+stub is well above its actual RSS---so the flat 435\,MiB in Table~\ref{tab:h4} reflects admission
 protecting against the \emph{reservation}, and \sys{} leaves headroom on the table (it deferred agents
 that would have fit). An exponentially-weighted predictor that tightens reservations toward observed
 peaks is designed and is future work. The bounded-footprint claim stands; the specific admit count
