@@ -11,8 +11,9 @@ of agent managers---were built to arrange windows, not to govern memory. When te
 language servers, test runners, and browsers, nothing on the machine can say how much memory belongs
 to which agent, guarantee that a terminated agent's descendants are actually gone, notice a child
 that has escaped its agent, or keep the machine off the swap cliff without an OOM kill silently
-discarding uncommitted work. We argue these are \emph{verification} problems: an agent-hosting
-substrate should continuously emit signals an operator (or an auditor) can check. We present \sys{},
+discarding uncommitted work. We argue these are \emph{runtime-verification} problems: an
+agent-hosting substrate should continuously emit observable signals that an operator---or an
+auditor---can monitor and check while agents run in production. We present \sys{},
 a local runtime that treats resource governance as a set of checkable guarantees---honest per-agent
 attribution, complete reclamation, escaped-process visibility, bounded footprint under overcommit,
 and low monitoring overhead---and a claims-disciplined benchmark that measures each guarantee against
@@ -55,6 +56,15 @@ process-level isolation, and treated monitoring as a first-class output~\citep{v
 bring that stance down to a single developer machine and to the specific failure modes of agent
 fleets.
 
+This reframes an infrastructure problem as a verification one, on an axis the agent-evaluation
+literature largely leaves open. Most work on verifying agents asks whether an agent's \emph{outputs}
+are trustworthy---did it resolve the issue, is the reward genuine, is the behaviour aligned. We ask a
+complementary question that only sharpens once agents run in parallel and unattended: does the
+\emph{substrate that hosts them} uphold checkable operational guarantees---honest accounting,
+complete reclamation, no silently lost work---that an operator can observe while the fleet runs?
+These are always-on signals over the live execution, not one-shot scores, and a fleet whose host
+cannot answer them is unverified no matter how capable each agent is.
+
 This paper contributes: (i) \textbf{five verification signals for agent fleets}
 (Section~\ref{sec:signals})---honest per-agent attribution, complete reclamation on teardown,
 escaped-process visibility, bounded footprint (and preserved work) under overcommit, and bounded
@@ -65,9 +75,8 @@ baseline through \emph{identical} deterministic workloads, tags every process as
 overhead, and never reports a number it did not measure---where a competitor cannot be driven
 honestly, it is recorded as skipped, not estimated. On a 32\,GB Linux reference host the guarantees
 hold and, under overcommit, separate \sys{} from the ungoverned tools by $\sim$5$\times$ at ten
-agents (Section~\ref{sec:eval}). We are candid about scope: the workload is a deterministic stub
-rather than live models, the fleets are modest ($N \le 10$), and the monitoring cost is not yet
-under 2\%---all discussed in Section~\ref{sec:limits}.
+agents (Section~\ref{sec:eval}); we are candid about the scope---a deterministic-stub workload,
+modest fleets ($N \le 10$), and an overhead target not yet met---in Section~\ref{sec:limits}.
 
 \section{Background and Related Work}
 
@@ -247,10 +256,9 @@ is worse than none.
 \paragraph{Setup.} The reference host is an AWS \code{m7i.2xlarge}: 8 vCPUs (Intel Xeon Platinum
 8488C), $\approx$31\,GiB RAM, an 8\,GiB swap file, Ubuntu 24.04 (Linux 6.17). Versions: \code{tmux}
 3.4, \sys{} 0.8.0. Each cell is two trials; we report mean\,$\pm$\,95\% CI. We swept fleet sizes
-$N \in \{1,5,10\}$ across three scenarios. A macOS cross-check (Apple M4 Max, 32\,GiB), which
-additionally exercised \code{herdr}, agreed qualitatively: \code{herdr}, like the other ungoverned
-managers, reaped its subtrees on teardown (100\% cleanup) but detected no escapes and grew its
-footprint with the fleet.
+$N \in \{1,5,10\}$ across three scenarios. A macOS cross-check (Apple M4 Max, 32\,GiB) that also
+exercised \code{herdr} agreed qualitatively: like the other ungoverned managers, \code{herdr} reaped
+its subtrees on teardown but saw no escapes and grew with the fleet.
 
 \subsection{H4: bounded footprint under overcommit}
 
@@ -259,8 +267,7 @@ start all $N$ agents under each launcher. Table~\ref{tab:h4} reports peak total 
 fleet size. The ungoverned launchers scale linearly: at ten agents they reach 2.1\,GB. \sys{} admits
 what fits (one agent at $N{=}1$; two at $N{=}5$ and $N{=}10$, deferring the rest with a visible
 reason---3 and 8 deferrals respectively) and holds peak footprint flat at 435\,MiB, a $4.9\times$
-separation at $N{=}10$. This is the sharpest result in the paper and the one that most directly
-motivates governance: without a budget, a fleet's footprint is simply the sum of its agents.
+separation at $N{=}10$: without a budget, a fleet's footprint is simply the sum of its agents.
 
 \begin{table}[t]
 \centering\small
@@ -454,7 +461,9 @@ where those guarantees do \emph{not} distinguish us. On a 32\,GB Linux host the 
 flat versus linear footprint under overcommit ($4.9\times$ at ten agents), complete cleanup where the
 raw baseline strands half a fleet, and full visibility into escaped processes that the alternatives
 cannot see---alongside an honest overhead cost we have not yet driven under 2\%. The path from here is
-a live-agent workload and larger fleets; the reproducer makes both a single command away.
+a live-agent workload and larger fleets; the reproducer makes both a single command away. Verifying
+an agent is not only checking what it produced---it is also checking that the system running it kept
+its promises; the signals and the claims discipline here are a step toward the latter.
 
 \small
 \bibliographystyle{plainnat}
