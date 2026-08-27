@@ -3,6 +3,8 @@
 % Shares preamble.tex + body.tex with the anonymized workshop build.
 % ==========================================================================
 \documentclass{article}
+% NeurIPS convention: numeric, compressed citations ([12], [3--5]). Must precede the class.
+\PassOptionsToPackage{numbers,sort&compress}{natbib}
 \usepackage[preprint]{neurips_2026} % preprint = named, arXiv-ready; loads natbib
 \input{preamble}
 

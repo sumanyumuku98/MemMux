@@ -3,6 +3,8 @@
 % Build: tectonic workshop.tex . Shares preamble.tex + body.tex with arxiv.tex.
 % ==========================================================================
 \documentclass{article}
+% NeurIPS convention: numeric, compressed citations ([12], [3--5]). Must precede the class.
+\PassOptionsToPackage{numbers,sort&compress}{natbib}
 \usepackage[dblblindworkshop]{neurips_2026} % double-blind workshop; loads natbib; anonymizes authors
 \input{preamble}
 
