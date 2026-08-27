@@ -404,13 +404,20 @@ Table~\ref{tab:realagent} gives the result. \sys{} attributes 100\% of every rea
 owning task---the H1 gate holds on live agents, not just the stub---and the manager cost stays small
 (7.2\,MiB resident, 0.012\% CPU at three agents, consistent with the small-fleet end of the H5
 curve). Three concurrent real sessions occupy $\sim$0.85\,GB ($\sim$290\,MiB each), confirming that
-the pressure the system governs is real and per-agent-substantial. We are deliberate about what this
-run does \emph{not} show: because these sessions ran to completion and exited cleanly, every launcher
-(including the raw baseline) reclaimed 100\% of its tree, so the cleanup and escaped-process
-\emph{differentiators} do not appear here---they require the forced-termination and double-fork
-conditions that the controlled H2 and H3 scenarios above isolate. This experiment validates that
-attribution and overhead generalize from the stub to real, multi-process agent trees; the controlled
-scenarios remain the setting in which the governance differentiators are exercised.
+the pressure the system governs is real and per-agent-substantial. Attribution and overhead thus
+generalize from the stub to real, multi-process agent trees.
+
+\paragraph{Cleanup on live agents.} That hold run let every session finish, so all launchers reclaimed
+cleanly. To check the cleanup \emph{mechanism} on \emph{live} agents we ran a second experiment (Linux,
+\code{m7i.xlarge}) in which three real Claude Code agents (v2.1.197) are \emph{forcibly torn down
+mid-work}, while their \code{node} process trees are still resident. The raw baseline strands
+\textbf{three real processes and 525\,MiB} of live agent memory (50\% reclaimed)---killing the root
+\code{node} orphans its children to \code{init}, exactly as with the stub---while both \code{tmux} and
+\sys{} reap the full subtree (0 leaked, 100\%). Consistent with H2, this is a \emph{raw}-versus-governed
+result, not a separation from \code{tmux}; its value is that the cleanup behaviour the stub isolates
+reproduces on real agent trees, and that the naive ``run it in a terminal'' baseline strands half a
+gigabyte of live agent memory. The escaped-process condition (H3) did not arise here, as Claude Code
+does not double-fork out of supervision.
 
 \begin{table}[t]
 \centering
@@ -440,10 +447,11 @@ memory-ballast stub, not live models. We trade realism for reproducibility and f
 workloads across launchers, which is what makes the comparison fair. The \emph{qualitative}
 guarantees---attribution, cleanup, escape visibility, admission---do not depend on the workload, but
 the specific megabytes for a real Claude- or GPT-driven session will differ. We take a first step in
-\S\ref{sec:realagent}, running real Claude Code sessions through the same harness and confirming that
-100\% attribution and low overhead hold on live, multi-process agent trees; a larger live-agent
-study---more agents, longer sessions, and the forced-termination conditions that expose the cleanup
-differentiator---remains the most important next step.
+\S\ref{sec:realagent}, running real Claude Code sessions through the same harness: 100\% attribution
+and low overhead hold on live, multi-process agent trees, and forcibly killing them mid-work reproduces
+the raw baseline's cleanup leak (525\,MiB) that the stub isolates. A larger live-agent study---more
+agents and longer sessions, and reproducing the H4 overcommit and H3 escape conditions on live
+trees---remains the most valuable next step.
 
 \paragraph{One host, modest fleets.} We evaluate a single 32\,GB Linux host (with a macOS cross-check)
 and $N \le 10$. The harness sweeps to $N{=}20$ and the reproducer emits the full curve; we simply did
