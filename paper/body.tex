@@ -481,6 +481,7 @@ command (e.g.\ \code{claude -p ...}) for the stub, so the real-agent validation 
 \S\ref{sec:realagent} is reproducible through the identical pipeline; that run's report and raw
 per-process series are archived under \code{paper/realagent-run/}.
 
+\ifnamedbuild
 \begin{lstlisting}[style=shell]
 memmux-bench paper --out paper-out              # full matrix
 MEMMUX_BENCH_HOLD_MIB=1400 memmux-bench paper \  # binding-budget H4 (Table 3)
@@ -494,6 +495,13 @@ memmux-bench run  --agents 3 --agent-cmd \
 a Markdown report, and per-cell \code{*.jsonl} / \code{*.procs.jsonl} time series (RSS, PSS, USS,
 swap, and page faults per process on Linux), plus the figures. The binding-budget H4 run above is
 archived under \code{paper/overcommit-run/}.
+\else
+\noindent Each run captures a host specification, a Markdown report, and per-cell time series (RSS,
+PSS, USS, swap, and page faults per process on Linux) plus the figures. We withhold the exact
+invocation and the repository here to preserve review anonymity; the engine, the benchmark, and the
+one-command reproducer---including the binding-budget H4 configuration used for Table~\ref{tab:h4}---are
+released with the code.
+\fi
 
 \section{Conclusion}
 
