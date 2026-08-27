@@ -8,9 +8,9 @@
 Developers increasingly run not one coding agent but a fleet of them side by side on a single
 workstation. The tools they reach for---terminal multiplexers like \code{tmux} and a new generation
 of agent managers---were built to arrange windows, not to govern memory. When ten agents each spawn
-language servers, test runners, and browsers, nothing on the machine can say how much memory belongs
-to which agent, guarantee that a terminated agent's descendants are actually gone, notice a child
-that has escaped its agent, or keep the machine off the swap cliff without an OOM kill silently
+language servers, test runners, and browsers, no standard tool in that stack can say how much memory
+belongs to which agent, guarantee that a terminated agent's descendants are actually gone, notice a
+child that has escaped its agent, or keep the machine off the swap cliff without an OOM kill silently
 discarding uncommitted work. We argue these are \emph{runtime-verification} problems: an
 agent-hosting substrate should continuously emit observable signals that an operator---or an
 auditor---can monitor and check while agents run in production. We present \sys{},
@@ -101,7 +101,10 @@ scheduling~\citep{hindman2011mesos}, and Kubernetes as the open-source lineage~\
 The enforcement primitives they use---Linux control groups~\citep{cgroupv2} and the OOM
 killer~\citep{linuxoom}---live in every modern kernel. \sys{} borrows the ideas (reserve, admit,
 reclaim before you thrash) but targets a single un-orchestrated laptop, and it deliberately avoids
-hard cgroup containment in favor of signal-based supervision so it runs unprivileged.
+hard cgroup containment in favor of signal-based supervision. This is an explicit trade-off: cgroups
+give hard, kernel-enforced limits but need privilege and per-machine setup, whereas signal-based
+supervision runs unprivileged and portably (macOS included) at the cost of best-effort rather than
+hard containment---a child can, for an instant, escape before reconciliation catches it (H3).
 
 \paragraph{Memory accounting.} Summing resident set size (RSS) over a process tree double-counts
 shared pages. The proportional set size (PSS) exposed through \code{/proc/<pid>/smaps\_rollup}
@@ -207,10 +210,19 @@ reason and evidence, which is what makes the system verifiable rather than merel
 \label{sec:signals}
 \label{sec:method}
 
-We frame governance as five monitors, each with a threshold (Table~\ref{tab:signals}). A benchmark
-harness drives every system under test through identical, deterministic workloads and evaluates the
-monitors from an external process sampler---the same accounting code the daemon uses, pointed at
-whatever root pids a launcher reports, so measurement is product-agnostic.
+We frame governance as runtime monitors over the fleet's execution. The observed \emph{trace} is the
+sequence of once-per-second process-tree samples and lifecycle events; each signal is an
+\emph{invariant} over that trace with an explicit threshold (Table~\ref{tab:signals}), and a breach is
+surfaced as a violation event rather than silently tolerated. Four are properties of the running system
+(H1--H4); H5 is the \emph{cost} of monitoring, not an invariant, and H4 bundles three
+sub-properties---admission, bounded footprint, and preservation of uncommitted work---which we report
+separately below. \sys{} both \emph{observes} these signals and \emph{enforces} them (admission,
+reclamation); the baselines can only be observed. These are empirical monitors with measured pass/fail
+behaviour, not machine-checked proofs, so we claim the signals are checkable and checked, not that the
+engine is sound and complete in the formal sense. A benchmark harness drives every launcher through
+identical, deterministic workloads and evaluates the monitors from one external process sampler---an
+\emph{oracle} using the daemon's own accounting code, pointed at whatever root pids a launcher reports,
+so measurement is product-agnostic.
 
 \begin{table}[t]
 \centering\small
@@ -248,7 +260,12 @@ the host; it tags every sampled process as agent or manager overhead so the two 
 separately; and it emits a number only for a monitor it actually measured. A launcher that cannot be
 driven contributes ``unsupported,'' never a fabricated zero. These rules are as much a contribution
 as the engine: fair comparison of agent-hosting tools has no accepted methodology, and an unfair one
-is worse than none.
+is worse than none. One consequence deserves care. Because the oracle can attribute \emph{any}
+launcher's tree after the fact, per-agent attribution is \emph{measurable} for all of them---the
+real-agent run reports 100\% for every launcher (Table~\ref{tab:realagent}). H1 as a signal is the
+stricter question of whether a launcher exposes that attribution \emph{natively and continuously} to an
+operator, which only \sys{} does; \code{tmux} and the raw baseline surface no such figure themselves.
+It is that native capability, not the oracle's coverage, that Table~\ref{tab:matrix} marks.
 
 \section{Evaluation}
 \label{sec:eval}
@@ -270,14 +287,17 @@ Launcher & Attrib. & Cleanup & Escaped & Footprint$_{N=10}$ & Ckpt. & Overhead \
 \midrule
 raw baseline    & \xmark & 50\%          & \xmark & 2146\,MiB          & \xmark & ---        \\
 \code{tmux} 3.4 & \xmark & \textbf{100\%}& \xmark & 2149\,MiB          & \xmark & $\approx$0 \\
-\sys{} 0.8.0    & \cmark & \textbf{100\%}& \cmark~10/10 & \textbf{435\,MiB} & \cmark & 2.7\% \\
+\sys{} 0.8.0    & \cmark & \textbf{100\%}& \cmark~10/10 & \textbf{435\,MiB} & \cmark$^\dagger$ & 2.7\% \\
 \bottomrule
 \end{tabular}
 \caption{Head-to-head on the five signals (Linux reference host). \sys{} is the only launcher that
 natively attributes per-agent memory (H1), surfaces escaped processes (H3), bounds the fleet's
-footprint under overcommit (H4), and checkpoints dirty work before any reclaim. It \emph{matches}
+footprint under overcommit (H4), and can checkpoint dirty work before a reclaim. It \emph{matches}
 \code{tmux} on teardown cleanup (H2) and---stated plainly---pays a monitoring cost the ungoverned
-tools do not (H5). Each cell is the headline result for that signal; the subsections give the detail.}
+tools do not (H5). Attribution is the \emph{native} capability, not the oracle's coverage
+(\S\ref{sec:method}). $^\dagger$Checkpoint-before-reclaim is confirmed by a daemon-level unit test; the
+pressure path was not triggered end-to-end in this benchmark (\S\ref{sec:eval}). Each cell is the
+headline result for that signal; the subsections give the detail.}
 \label{tab:matrix}
 \end{table}
 
@@ -332,20 +352,27 @@ exits, reparenting the grandchild to \code{init} while it stays alive. The harne
 confirms the reparenting, then asks each launcher what it detected. \sys{} surfaces every
 escape---1/1, 5/5, 10/10---through events read from the daemon; the baselines have no mechanism to
 notice, so they are recorded as unsupported, never scored as zero-of-measured. This is a capability,
-not a tuning difference, and it is the cleanest separation from a real competitor.
+not a tuning difference, and it is the cleanest separation from a real competitor. Detection is bounded
+by the sample interval: reconciliation runs at $1$\,Hz, so a child that both escapes \emph{and} exits
+within a second could slip between two samples. Our injected escapes hold memory for several
+seconds---comfortably longer than the interval---and shortening the interval trades detection latency
+for overhead (H5); a persistent leak, which is the case that matters, is caught on the next sample
+regardless.
 
 \subsection{H1 \& H5: what the attribution scan delivers, and what it costs}
 
 We pair these two signals because they are the benefit and the price of a single mechanism: the
 always-on $1$\,Hz PSS scan produces the attribution guarantee (H1) and incurs the monitoring cost
 (H5). Across every run \sys{} attributed 100\% of each launched tree's proportional memory to its
-owning task (H1). The cost of governance in \emph{memory} is small and we report it plainly: the \sys{}
-daemon's own resident footprint is 4.6--5.4\,MiB (growing slightly with the fleet), against 2.4\,MiB
-for the \code{tmux} server and zero for the raw baseline. The cost in \emph{CPU} is the honest weak
-spot (H5): the always-on 1\,Hz full-tree PSS scan costs 0.6\% CPU at a single agent, 1.5\% at five,
-and 2.7\% at ten---over our 2\% target once the fleet reaches ten. The scan is $O(\text{processes})$
-and currently re-reads the whole tree each tick; incremental sampling that touches only changed pids
-is the obvious fix and is future work. We state the miss rather than bury it.
+owning task \emph{natively}, and the external oracle independently confirmed the figure (H1). The cost
+of governance in \emph{memory} is small and we report it plainly: the \sys{} daemon's own resident
+footprint is 4.6--5.4\,MiB (growing slightly with the fleet), against 2.4\,MiB for the \code{tmux}
+server and zero for the raw baseline. The cost in \emph{CPU} is the honest weak spot (H5): the \sys{}
+daemon's total CPU---dominated by the always-on $1$\,Hz full-tree PSS scan, though we did not ablate
+the two---is 0.6\% at a single agent, 1.5\% at five, and 2.7\% at ten, over our 2\% target once the
+fleet reaches ten. The scan is $O(\text{processes})$ and currently re-reads the whole tree each tick;
+incremental sampling that touches only changed pids is the obvious fix and is future work. We state
+the miss rather than bury it.
 
 \subsection{Validation on real coding agents}
 \label{sec:realagent}
@@ -413,9 +440,9 @@ that would have fit). An exponentially-weighted predictor that tightens reservat
 peaks is designed and is future work. The bounded-footprint claim stands; the specific admit count
 would rise with a tighter predictor.
 
-\paragraph{Overhead not yet met; empirical, not formal.} Monitoring exceeds 2\% CPU by ten agents
-(above), and these are runtime monitors with measured pass/fail behavior, not machine-checked proofs.
-We claim the signals are checkable and checked, not that the engine is formally verified.
+\paragraph{Overhead not yet met.} Monitoring exceeds 2\% CPU by ten agents (above); incremental
+sampling is the planned fix. As stated in \S\ref{sec:method}, these are empirical monitors, not
+machine-checked proofs---checkable and checked, not formally verified.
 
 \section{Reproducibility}
 \label{sec:repro}
