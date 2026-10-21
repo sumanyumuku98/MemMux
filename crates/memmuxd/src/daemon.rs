@@ -2927,7 +2927,9 @@ mod tests {
                 .unwrap()
                 .success()
         };
-        if !git(&["init", "-q"]) {
+        // `-b main` matches the task's base_branch: without it the worktree cannot be cut on
+        // hosts whose git still defaults to `master`, and the test silently loses its worktree.
+        if !git(&["init", "-q", "-b", "main"]) {
             let _ = std::fs::remove_dir_all(&tmp);
             return; // git unavailable — skip rather than fail the suite.
         }
