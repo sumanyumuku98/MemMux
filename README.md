@@ -189,7 +189,7 @@ See the docs site: [Phase 0](https://sumanyumuku98.github.io/MemMux/phases/phase
 
 ## Status
 
-🚧 Early development (current release **v0.8.0**); APIs are unstable. **Phases 0–2 are complete and
+🚧 Early development (current release **v0.9.1**); APIs are unstable. **Phases 0–2 are complete and
 the daemon now actively *enforces* the memory contract:**
 
 - **Attribution (Phase 0):** real per-task memory sampling wired into the daemon — per-process
