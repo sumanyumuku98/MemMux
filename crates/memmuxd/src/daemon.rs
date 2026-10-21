@@ -916,7 +916,17 @@ impl DaemonState {
     /// Capture a checkpoint of a live task (§13.1 / SUM-90): repo state, transcript cursor, RSS
     /// baseline, and the provider's declared secret references.
     fn capture_checkpoint(&self, id: &str, task: &Task, now: u64) -> Checkpoint {
-        let repo = std::path::Path::new(&task.spec.repository_path);
+        // Hash the task's own worktree, not the source repository. The agent's uncommitted work
+        // lives in the isolated worktree (`ensure_worktree`); the source repo stays clean, so
+        // hashing it yields the empty-diff sentinel and the checkpoint preserves nothing. Tasks
+        // without a worktree (no git repo, or worktree creation failed) keep the repo-path
+        // behaviour.
+        let worktree = self
+            .worktrees
+            .get(id)
+            .map(|h| h.path.clone())
+            .unwrap_or_else(|| PathBuf::from(&task.spec.repository_path));
+        let repo = worktree.as_path();
         let git_head = git_head(repo).unwrap_or_default();
         let git_patch_hash = git_patch_hash(repo);
         let cursor = self.histories.get(id).map(|h| h.total_lines()).unwrap_or(0);
@@ -2904,7 +2914,7 @@ mod tests {
     /// non-empty-patch checkpoint was captured for the reclaimed victim (SUM-168 / H4b).
     #[cfg(unix)]
     #[test]
-    fn preserve_git_state_event_reports_dirty_patch_for_a_dirty_repo() {
+    fn preserve_git_state_event_reports_dirty_patch_for_a_dirty_worktree() {
         let tmp = std::env::temp_dir().join(format!("memmuxd-h4b-{}", std::process::id()));
         let repo = tmp.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -2926,7 +2936,6 @@ mod tests {
         std::fs::write(repo.join("work.txt"), b"baseline\n").unwrap();
         assert!(git(&["add", "work.txt"]));
         assert!(git(&["commit", "-q", "-m", "baseline"]));
-        std::fs::write(repo.join("work.txt"), b"baseline\ndirty edit\n").unwrap();
 
         let store = Store::open_in_memory().unwrap();
         let envelope = ResourceEnvelope::with_default_reserves(32 * GIB);
@@ -2951,6 +2960,16 @@ mod tests {
             Response::Task(_)
         ));
 
+        // Dirty the task's own worktree, which is where a real agent works -- the source repo
+        // stays clean. This also pins the regression where the checkpoint hashed the repository
+        // path instead of the worktree and so recorded the empty-diff sentinel.
+        let wt = s
+            .worktrees
+            .get(&created.id)
+            .map(|h| h.path.clone())
+            .expect("a started task should have an isolated worktree");
+        std::fs::write(wt.join("work.txt"), b"baseline\ndirty edit\n").unwrap();
+
         s.used_bytes = s.envelope.agent_budget_bytes + 1;
         s.pressure_tick(10_000);
 
@@ -2971,7 +2990,7 @@ mod tests {
             .expect("preserve event must carry a payload");
         assert!(
             payload.contains("\"git_dirty\":true"),
-            "dirty repo must report git_dirty:true, got {payload}"
+            "dirty worktree must report git_dirty:true, got {payload}"
         );
         assert!(
             payload.contains("\"git_patch_hash\""),

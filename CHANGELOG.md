@@ -5,6 +5,27 @@ All notable changes to MemMux are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Pre-1.0 releases (`v0.*`) are published
 as GitHub **pre-releases**; APIs are still unstable.
 
+## [0.9.1] — 2026-10-21
+
+A correctness fix for the H4b work-preservation path, found by running the
+emergency-termination flow end to end for the first time.
+
+### Fixed
+- **Checkpoint now captures the task's worktree, not the source repository.** `capture_checkpoint`
+  hashed `task.spec.repository_path`, but an agent's uncommitted work lives in the isolated git
+  worktree created by `ensure_worktree`. The source repo stays clean, so the checkpoint recorded
+  the empty-diff sentinel (`cbf29ce484222325`, the FNV-1a offset basis) and `git_dirty: false` —
+  preserving no patch. Checkpoints taken before an emergency termination now carry the victim's
+  real patch hash. Tasks without a worktree keep the previous repo-path behaviour.
+- **The regression test exercised the wrong directory.** `preserve_git_state_event_reports_dirty_patch`
+  dirtied the source repo rather than the task's worktree, so the suite passed while the shipped
+  path preserved nothing. It now dirties the worktree, and fails without the fix above.
+- README advertised `v0.8.0` as the current release.
+
+### Notes
+- Uncommitted work was never *lost* under the bug: dirty worktrees are retained and never deleted
+  (SUM-121/SUM-59), so the defect degraded checkpoint/resume fidelity rather than work safety.
+
 ## [0.9.0] — 2026-08-25
 
 The verification slice: the memory contract is now proven with numbers, and written up.
