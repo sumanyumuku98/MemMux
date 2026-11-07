@@ -1,4 +1,4 @@
-# MemMux paper — two builds
+# MemMux paper — three builds
 
 *"MemMux: Runtime Verification and Honest Resource Attribution for Fleets of Parallel Coding Agents"*
 (Sumanyu Muku, New York University).
@@ -10,6 +10,7 @@ only the thin wrapper differs:
 |---|---|---|---|
 | **arXiv preprint** | `arxiv.tex` | `neurips_2026` `[preprint]` | **named** (Sumanyu Muku, NYU) |
 | **NeurIPS workshop** | `workshop.tex` | `neurips_2026` `[dblblindworkshop]` | **anonymized** (double-blind) |
+| **Workshop camera-ready** | `camera_ready.tex` | `neurips_2026` `[final]` + workshop `\@noticestring` | **named** (Sumanyu Muku, Amira Learning) |
 
 Target: *"Who Verifies the Agents?"* NeurIPS 2026 workshop — regular paper (4–9 pp excl. refs/appendix),
 double-blind, non-archival, deadline **2026-08-29 AoE**.
@@ -21,6 +22,7 @@ double-blind, non-archival, deadline **2026-08-29 AoE**.
 ```sh
 tectonic arxiv.tex      # -> arxiv.pdf     (named preprint)
 tectonic workshop.tex   # -> workshop.pdf  (anonymized, double-blind)
+tectonic camera_ready.tex  # -> camera_ready.pdf (de-anonymized camera-ready)
 ```
 
 or classic TeX Live: `pdflatex <build> && bibtex <build> && pdflatex <build> && pdflatex <build>`
@@ -32,7 +34,7 @@ or classic TeX Live: `pdflatex <build> && bibtex <build> && pdflatex <build> && 
   files).
 - `preamble.tex` — shared preamble for both builds: packages, the colour palette, the reusable
   `pgfplots` chart style, the code-listing style, and the TikZ diagram styles + `\title`.
-- `arxiv.tex`, `workshop.tex` — the two thin wrappers (documentclass + `neurips_2026` option,
+- `arxiv.tex`, `workshop.tex`, `camera_ready.tex` — the thin wrappers (documentclass + `neurips_2026` option,
   `\input{preamble}`, author/`\repourl`).
 - `refs.bib` — 13 references, all real and verified.
 - `neurips_2026.sty` — the official NeurIPS 2026 style (bundled so the builds are self-contained).
@@ -47,6 +49,8 @@ Ubuntu 24.04 (Linux 6.17), `tmux` 3.4, MemMux 0.8.0. Regenerate on any host with
 (see the paper's Reproducibility section / Appendix A).
 
 ## Notes
+- Do not load a font package (e.g. `lmodern`) in `preamble.tex`: it overrides the Times face the
+  NeurIPS style sets, so the PDF no longer matches the unmodified style the camera-ready requires.
 - The workshop build withholds the repository URL to preserve double-blind review; the arXiv build
   links it. Nothing else in `body.tex` is de-anonymizing.
 - Non-archival + dual-submission is explicitly allowed, so the named arXiv preprint and the anonymized

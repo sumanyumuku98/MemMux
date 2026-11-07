@@ -6,14 +6,16 @@
 % ==========================================================================
 
 \usepackage[T1]{fontenc}
-\usepackage{lmodern}
 \usepackage{microtype}
 \usepackage{hyperref}
 \usepackage{url}
 \usepackage{booktabs}
+\usepackage{capt-of} % \captionof for the non-float table in Appendix B
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{xcolor}
+\usepackage{textcomp}
+\usepackage{upquote} % straight quotes in listings, so commands are copy-pasteable
 \usepackage{listings}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.17}
@@ -68,7 +70,7 @@
   frame=leftline, framerule=1.2pt, rulecolor=\color{syscol!55},
   xleftmargin=8pt, framexleftmargin=8pt, aboveskip=6pt, belowskip=2pt,
   breaklines=true, breakatwhitespace=true, columns=fullflexible,
-  keepspaces=true, showstringspaces=false,
+  keepspaces=true, showstringspaces=false, upquote=true,
 }
 
 % ------- architecture-diagram node styles ---------------------------------

@@ -1,0 +1,34 @@
+% ==========================================================================
+% MemMux — CAMERA-READY build (de-anonymized).
+% Workshop on Who Verifies the Agents? Toward Reliable Agent Development,
+% NeurIPS 2026.  Build: tectonic camera_ready.tex
+%
+% Per the organizers' camera-ready instructions: unmodified NeurIPS 2026
+% style file with the [final] option, and the conference notice in the
+% footer replaced with the workshop name.
+%
+% Shares preamble.tex + body.tex with the submission builds.
+% ==========================================================================
+\documentclass{article}
+% NeurIPS convention: numeric, compressed citations ([12], [3--5]). Must precede the class.
+\PassOptionsToPackage{numbers,sort&compress}{natbib}
+\usepackage[final]{neurips_2026} % final = camera-ready, de-anonymized; loads natbib
+\makeatletter
+\renewcommand{\@noticestring}{Workshop on Who Verifies the Agents? Toward Reliable Agent Development, NeurIPS 2026.}
+\makeatother
+\input{preamble}
+\namedbuildtrue % de-anonymized: show runnable commands + the repository URL
+
+% De-anonymized build: link the public repository.
+\newcommand{\repourl}{\footnote{\url{https://github.com/sumanyumuku98/MemMux}}}
+
+\author{%
+  Sumanyu Muku \\
+  Amira Learning \\
+  \texttt{mukusumanyu@gmail.com} \\
+}
+
+\begin{document}
+\maketitle
+\input{body}
+\end{document}
